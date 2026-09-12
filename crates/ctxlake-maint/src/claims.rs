@@ -416,6 +416,22 @@ pub async fn append_proposed(
     Ok(())
 }
 
+/// Parses [`ClaimEvent::at`] as an actual instant rather than comparing it as
+/// text. Every real writer (`ctxlake-mcp`'s `now_rfc3339`, `ctxlake-maint`'s
+/// own) formats via `time`'s RFC3339 well-known description, but that
+/// description does not pin fractional-second precision — one caller emits
+/// whole seconds (`...12:00:00Z`), another variable-length microseconds
+/// (`...12:00:00.976363Z`) — so two well-formed timestamps can disagree in
+/// length, and therefore in lexicographic order, even though one is plainly
+/// later than the other (`.` is `0x2E`, `Z` is `0x5A`, so a fractional
+/// timestamp text-sorts *before* a whole-second one for the same second).
+/// `None` on anything that fails to parse; [`list_events`] falls back to the
+/// old text comparison for those so a malformed record degrades no worse than
+/// it did before this function existed.
+fn parse_at(at: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+}
+
 /// List and parse every event under `claims/events/`, sorted so the fold in
 /// [`fold`] sees events in the right order.
 ///
@@ -434,12 +450,24 @@ pub async fn append_proposed(
 /// caller-declared business time (`ctx_at` in `gate::run`, `observed_at` on a
 /// proposal) rather than a per-thread physical write timestamp, so it orders a
 /// promotion after the proposal it necessarily followed regardless of which
-/// thread or host physically wrote which object first. Ties (same `at`, e.g.
-/// every event one `gate::run` call produces) fall back to the storage key,
-/// which is a real per-writer-thread order for events that actually share a
-/// writer. A single malformed or half-written object is skipped rather than
-/// failing the whole read, matching `roster::list_intents_directly`'s reasoning:
-/// a transient partial write should not take down every other claim's fold.
+/// thread or host physically wrote which object first.
+///
+/// `at` is compared via [`parse_at`] as a real instant, not as text — an
+/// earlier version compared the raw RFC3339 strings directly, which happens to
+/// agree with real time when both events share the same timestamp precision
+/// (every fixture in this crate's own tests, which is exactly why the bug went
+/// unnoticed here) but silently disagrees across precisions: a proposal
+/// stamped to the whole second and a promotion stamped moments later with
+/// fractional seconds text-sort with the fraction *first* (see [`parse_at`]'s
+/// doc), dropping the promotion in `fold` even on a single host writing keys
+/// in the correct order. Parsing to an instant makes the comparison agree with
+/// real time regardless of which precision either writer chose. Ties (equal
+/// parsed instants, e.g. every event one `gate::run` call produces, or two
+/// values that fail to parse) fall back to the storage key, which is a real
+/// per-writer-thread order for events that actually share a writer. A single
+/// malformed or half-written object is skipped rather than failing the whole
+/// read, matching `roster::list_intents_directly`'s reasoning: a transient
+/// partial write should not take down every other claim's fold.
 pub async fn list_events(store: &dyn ObjectStore) -> Result<Vec<ClaimEvent>, StoreError> {
     use futures::StreamExt;
     let prefix = ctxlake_store::layout::claims_events_prefix();
@@ -457,7 +485,16 @@ pub async fn list_events(store: &dyn ObjectStore) -> Result<Vec<ClaimEvent>, Sto
             entries.push((meta.location.to_string(), ev));
         }
     }
-    entries.sort_by(|a, b| a.1.at().cmp(b.1.at()).then_with(|| a.0.cmp(&b.0)));
+    entries.sort_by(|a, b| {
+        match (parse_at(a.1.at()), parse_at(b.1.at())) {
+            (Some(ta), Some(tb)) => ta.cmp(&tb),
+            // Unparseable on either side: no instant to compare against, so
+            // fall back to the previous text comparison rather than an
+            // arbitrary order.
+            _ => a.1.at().cmp(b.1.at()),
+        }
+        .then_with(|| a.0.cmp(&b.0))
+    });
     Ok(entries.into_iter().map(|(_, ev)| ev).collect())
 }
 
@@ -810,6 +847,66 @@ mod tests {
             ClaimStatus::Promoted,
             "a Promoted event minted with an earlier storage key than its own \
              Proposed event must still fold correctly, ordered by declared `at`"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_events_orders_mixed_timestamp_precision_by_real_time_not_text() {
+        // Regression test for a second bug in the same comparison: even with
+        // storage keys in the CORRECT append order (single writer, single
+        // host — no concurrency involved at all), comparing `at` as text
+        // rather than as a parsed instant still mis-orders two otherwise
+        // well-formed RFC3339 timestamps whenever they differ in
+        // fractional-second precision. `ctxlake-mcp`'s `now_rfc3339` and
+        // `ctxlake-maint`'s own both format via `time`'s RFC3339 well-known
+        // description, which does not pin how many fractional digits come
+        // out — so a whole-second proposal followed moments later by a
+        // sub-second promotion is exactly what real production traffic
+        // produces, not a contrived input.
+        let store = object_store::memory::InMemory::new();
+        let claim_id = "c1";
+        let mut proposal = proposed(claim_id, "s1");
+        if let ClaimEvent::Proposed(p) = &mut proposal {
+            p.observed_at = "2026-09-09T12:00:00Z".into();
+        }
+        let promoted = ClaimEvent::Promoted {
+            claim_id: claim_id.into(),
+            // Chronologically later than the proposal above, but — because
+            // '.' (0x2E) sorts before 'Z' (0x5A) — lexicographically EARLIER
+            // as text, even though `00.json` < `01.json` already reflects the
+            // true, correct append order.
+            at: "2026-09-09T12:00:00.123456Z".into(),
+            independent_count: 1,
+            confidence: 0.65,
+        };
+
+        let proposal_key =
+            object_store::path::Path::from("claims/events/dt=2026-09-09/agent=cc-01/00.json");
+        let promoted_key =
+            object_store::path::Path::from("claims/events/dt=2026-09-09/agent=cc-01/01.json");
+        store
+            .put(
+                &proposal_key,
+                PutPayload::from(serde_json::to_vec(&proposal).unwrap()),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &promoted_key,
+                PutPayload::from(serde_json::to_vec(&promoted).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let events = list_events(&store).await.unwrap();
+        let folded = fold(events.iter());
+        assert_eq!(
+            folded.get(claim_id).unwrap().status,
+            ClaimStatus::Promoted,
+            "a whole-second Proposed followed by a sub-second-precision \
+             Promoted must fold in real-time order even though the two \
+             timestamps text-sort the other way"
         );
     }
 

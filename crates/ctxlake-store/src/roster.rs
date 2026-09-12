@@ -21,8 +21,16 @@
 //! already contain. A reader following the pointer never sees a torn write either
 //! way — an earlier version of this design elected exactly one builder via a
 //! maintenance lease so that fleet-wide request volume stayed O(N) instead of
-//! O(N^2); see `ctxlake_sync::presence`'s module doc for how that cost is now
-//! controlled instead (a cheap per-daemon backoff, not a lock).
+//! O(N^2). That lease is gone, and *correctness* does not need it back — but
+//! naively letting every one of N daemons attempt this O(N) `build` on the same
+//! fixed schedule would silently bring the O(N^2) cost back too (N daemons ×
+//! O(N) work each, every interval), so [`BuildOutcome`] carries the *size* of
+//! every build attempt's freshly-listed snapshot — win or lose the CAS race —
+//! specifically so `ctxlake_sync::presence` can scale how often *this* daemon
+//! tries again by how many daemons it just learned are actually out there. See
+//! that module's doc for the arithmetic: the target is the same one build
+//! fleet-wide per base interval the lease used to guarantee, reached without
+//! ever agreeing on who's in charge.
 //!
 //! The only real fallback left is bootstrap: nobody has ever published
 //! `roster.json` yet (a fleet that just started, before any daemon's first
@@ -66,9 +74,16 @@ pub enum RosterSource {
 #[derive(Debug)]
 pub enum BuildOutcome {
     Published(RosterSnapshot),
-    /// Another builder's write landed first this cycle (its snapshot is from the
-    /// same instant, so nothing of value was lost) — not an error.
-    Skipped,
+    /// Another builder's write landed first this cycle — not an error, and not
+    /// an empty-handed result either: the snapshot carried here is this call's
+    /// own freshly-listed view (computed before the losing CAS attempt), so a
+    /// caller that only cares about *shape* — how many agents are out there
+    /// right now, say — has it regardless of which of two racing builders'
+    /// bytes actually landed. See `ctxlake_sync::presence`'s module doc for the
+    /// caller that relies on exactly this: it is how a daemon learns the
+    /// current fleet size to scale its own next rebuild attempt without ever
+    /// winning a race.
+    Skipped(RosterSnapshot),
 }
 
 /// List every `live/agents/*.json`, merge into a fresh snapshot. Best-effort per
@@ -133,7 +148,7 @@ pub async fn build(store: &dyn ObjectStore) -> Result<BuildOutcome, StoreError> 
     let payload = PutPayload::from(serde_json::to_vec(&snapshot)?);
     match store.put_opts(&path, payload, mode.into()).await {
         Ok(_) => Ok(BuildOutcome::Published(snapshot)),
-        Err(OsError::Precondition { .. }) => Ok(BuildOutcome::Skipped),
+        Err(OsError::Precondition { .. }) => Ok(BuildOutcome::Skipped(snapshot)),
         Err(e) => Err(e.into()),
     }
 }

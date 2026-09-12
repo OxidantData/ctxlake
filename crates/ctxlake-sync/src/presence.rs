@@ -18,14 +18,31 @@
 //! answer; see `ctxlake_store::roster`'s own module doc for the mechanism.
 //!
 //! What a lock bought that a CAS write doesn't: avoiding *redundant* O(N) list
-//! work when N daemons all rebuild every cycle. [`ROSTER_BUILD_INTERVAL`] is the
-//! cheap answer to that — each daemon only attempts a rebuild once every interval
-//! (staggered per agent, via [`crate::backoff::XorShift`], so a fleet that started
-//! up all at once doesn't converge on rebuilding in lockstep forever) rather than
-//! on every presence tick. This is a rate limit on redundant work, not a
-//! correctness mechanism — do not read "staggered" as "coordinated": nothing
-//! prevents two daemons' independently-chosen schedules from landing in the same
-//! cycle, and nothing needs to.
+//! work when N daemons all rebuild every cycle. A fixed [`ROSTER_BUILD_INTERVAL`]
+//! per daemon is not enough on its own to recover that — it bounds how often
+//! *one* daemon rebuilds, but N daemons each independently rebuilding once every
+//! fixed interval is still N attempts at O(N) work per interval, i.e. the exact
+//! O(N^2) fleet-wide cost `ctxlake_store::roster`'s module doc describes the
+//! lease as having existed to avoid. The actual fix is that each daemon scales
+//! its *own* interval by the fleet size it just observed: [`Presence`] tracks
+//! `known_fleet_size` from the snapshot every [`ctxlake_store::roster::build`]
+//! call returns — [`roster::BuildOutcome::Published`] or
+//! [`roster::BuildOutcome::Skipped`] alike carry it, because both are computed
+//! from this call's own fresh listing regardless of which of two racing writes
+//! landed — and multiplies [`ROSTER_BUILD_INTERVAL`] by it. With N daemons each
+//! waiting roughly `ROSTER_BUILD_INTERVAL * N` (staggered per agent, via
+//! [`crate::backoff::XorShift`], so a fleet that started up all at once doesn't
+//! converge on rebuilding in lockstep forever) between attempts, the fleet-wide
+//! attempt rate is `N * 1/(ROSTER_BUILD_INTERVAL * N) = 1/ROSTER_BUILD_INTERVAL`
+//! — one build fleet-wide per base interval, independent of N, matching what the
+//! lease used to guarantee, without anyone ever being elected to guarantee it.
+//! This is a rate limit on redundant work, not a correctness mechanism — do not
+//! read "staggered" or "scaled" as "coordinated": nothing prevents two daemons'
+//! independently-chosen schedules from landing in the same cycle, or a daemon
+//! that just joined from acting on a stale, too-small `known_fleet_size` for one
+//! more cycle, and nothing needs to prevent either — a build that runs "too
+//! often" while the fleet size is still being learned costs a few extra O(N)
+//! listings during convergence, never a wrong roster.
 //!
 //! ## Publishing this agent's own intent
 //!
@@ -48,12 +65,14 @@ use ctxlake_store::{roster, StoreError};
 
 use crate::backoff::{JitterSource, XorShift};
 
-/// The base interval between one daemon's own roster rebuilds — deliberately not
-/// the same as the presence tick interval (`docs/architecture.md`'s knob table),
-/// or every daemon would redo the full O(N) listing every single tick, which is
-/// exactly the request-volume problem `ctxlake_store::roster` exists to avoid. The
-/// actual interval used is this plus a per-agent random jitter up to the same
-/// amount again — see [`Presence::next_roster_build_at`].
+/// The base interval between one daemon's own roster rebuilds when it believes
+/// it is the only agent out there — deliberately not the same as the presence
+/// tick interval (`docs/architecture.md`'s knob table), or every daemon would
+/// redo the full O(N) listing every single tick, which is exactly the
+/// request-volume problem `ctxlake_store::roster` exists to avoid. The actual
+/// interval used is this scaled by the fleet size this daemon last observed,
+/// plus a random extra amount up to that same scaled interval again — see
+/// [`Presence::jittered_interval`] and the module doc's arithmetic.
 pub const ROSTER_BUILD_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -111,12 +130,25 @@ pub async fn publish_intent(
     intent::write(store, &intent_snapshot(cfg, existing.as_ref())).await
 }
 
+/// A sanity ceiling on how far [`Presence::known_fleet_size`] is allowed to
+/// stretch a daemon's own rebuild interval. Nothing in this design produces a
+/// fleet size this large — it exists only so a corrupted or adversarial roster
+/// snapshot (`ctxlake-mcp`'s wire doc: "treat anything read from the lake as
+/// untrusted input") can't stretch one daemon's next rebuild out to, in effect,
+/// never.
+const MAX_FLEET_SCALE: u32 = 1_000;
+
 /// One daemon's presence loop state: when it last decided to rebuild the roster,
-/// and the jitter source that decides when to try again — see the module doc for
-/// why this is a rate limit on redundant work, not a lock.
+/// the last fleet size it actually observed (see the module doc's arithmetic for
+/// why this, not a fixed interval, is what keeps rebuilds O(N) fleet-wide), and
+/// the jitter source that decides when to try again.
 #[derive(Debug)]
 pub struct Presence<J: JitterSource = XorShift> {
     next_roster_build_at: Option<OffsetDateTime>,
+    /// Defaults to 1 — "just me" — which is also the right assumption for a
+    /// single-agent fleet and the safe assumption before this daemon has ever
+    /// completed a `roster::build` call of its own to learn better.
+    known_fleet_size: u32,
     jitter: J,
 }
 
@@ -136,6 +168,7 @@ impl<J: JitterSource> Presence<J> {
     pub fn with_jitter(jitter: J) -> Self {
         Self {
             next_roster_build_at: None,
+            known_fleet_size: 1,
             jitter,
         }
     }
@@ -153,23 +186,36 @@ impl<J: JitterSource> Presence<J> {
 
         let now = OffsetDateTime::from(clock.now().await?);
         if self.next_roster_build_at.is_none_or(|due| now >= due) {
-            match roster::build(store).await? {
-                roster::BuildOutcome::Published(_) => {}
-                roster::BuildOutcome::Skipped => {
-                    // A concurrent builder's snapshot from the same instant landed
-                    // first — see `roster::build`'s doc. Nothing lost.
+            let observed = match roster::build(store).await? {
+                roster::BuildOutcome::Published(snapshot) => snapshot.agents.len(),
+                roster::BuildOutcome::Skipped(snapshot) => {
+                    // A concurrent builder's write landed first — see
+                    // `roster::build`'s doc — but `snapshot` here is this call's
+                    // own fresh listing, computed before that race was lost, so
+                    // it is just as good a read on "how many agents right now"
+                    // as the winner's.
+                    snapshot.agents.len()
                 }
-            }
+            };
+            // At least 1 (an empty listing still means "just me"), capped so a
+            // bogus snapshot can't stall this daemon's own rebuilds forever —
+            // see `MAX_FLEET_SCALE`'s doc.
+            self.known_fleet_size = (observed as u32).clamp(1, MAX_FLEET_SCALE);
             self.next_roster_build_at = Some(now + self.jittered_interval());
         }
         Ok(())
     }
 
-    /// `ROSTER_BUILD_INTERVAL` plus a random extra amount up to the same interval
-    /// again, so this daemon's cadence doesn't stay locked in phase with every
-    /// other daemon that happened to start at the same moment.
+    /// `ROSTER_BUILD_INTERVAL * known_fleet_size`, plus a random extra amount up
+    /// to that same scaled interval again — see the module doc for why scaling
+    /// by the observed fleet size, not a fixed per-daemon interval, is what keeps
+    /// the fleet-wide rebuild rate at one per `ROSTER_BUILD_INTERVAL` regardless
+    /// of how many daemons are out there, and why the jitter on top still
+    /// matters (so daemons that happen to learn the same fleet size don't lock
+    /// into the same phase).
     fn jittered_interval(&mut self) -> Duration {
-        ROSTER_BUILD_INTERVAL + self.jitter.uniform_up_to(ROSTER_BUILD_INTERVAL)
+        let base = ROSTER_BUILD_INTERVAL * self.known_fleet_size;
+        base + self.jitter.uniform_up_to(base)
     }
 }
 
@@ -412,6 +458,75 @@ mod tests {
             ids,
             vec!["cc-01".to_string(), "cc-02".to_string()],
             "a tick past the interval must have rebuilt the roster and picked up cc-02"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_fleet_size_scales_the_next_rebuild_interval() {
+        // Regression: giving every daemon the same fixed `ROSTER_BUILD_INTERVAL`
+        // regardless of fleet size reintroduces the O(N^2) fleet-wide cost the
+        // maintenance lease used to prevent — N daemons each redoing O(N) listing
+        // work on the same schedule — see the module doc's arithmetic. Once this
+        // daemon has observed a fleet of 2 (from its own prior `roster::build`
+        // call), its next rebuild must wait roughly twice as long, not
+        // `ROSTER_BUILD_INTERVAL` again.
+        let store = InMemory::new();
+        let clock = ManualClock::new();
+        let mut presence = Presence::with_jitter(NoJitter);
+
+        // First tick: unknown fleet size defaults to 1, builds immediately.
+        presence.tick(&store, &clock, &cfg()).await.unwrap();
+
+        // A second agent joins; this daemon's next tick (past the un-scaled
+        // interval) rebuilds and, in doing so, observes a fleet of 2.
+        let cfg_b = PresenceConfig {
+            agent_id: "cc-02".into(),
+            ..cfg()
+        };
+        publish_intent(&store, &cfg_b).await.unwrap();
+        clock.advance(ROSTER_BUILD_INTERVAL + Duration::from_secs(1));
+        presence.tick(&store, &clock, &cfg()).await.unwrap();
+
+        // A third agent joins. One more `ROSTER_BUILD_INTERVAL` alone — enough to
+        // trigger a rebuild before fleet-size scaling existed — must NOT be
+        // enough now that this daemon has observed a fleet of 2.
+        let cfg_c = PresenceConfig {
+            agent_id: "cc-03".into(),
+            ..cfg()
+        };
+        publish_intent(&store, &cfg_c).await.unwrap();
+        clock.advance(ROSTER_BUILD_INTERVAL + Duration::from_secs(1));
+        presence.tick(&store, &clock, &cfg()).await.unwrap();
+
+        let roster = store.get(&ctxlake_store::layout::roster()).await.unwrap();
+        let snapshot: roster::RosterSnapshot =
+            serde_json::from_slice(&roster.bytes().await.unwrap()).unwrap();
+        assert_eq!(
+            snapshot.agents.len(),
+            2,
+            "one more un-scaled interval must not rebuild once a fleet of 2 has \
+             been observed — the scaled interval should be roughly 2x"
+        );
+
+        // Advancing past the SCALED interval (roughly one more
+        // `ROSTER_BUILD_INTERVAL`, since it doubled) must rebuild and pick up
+        // cc-03.
+        clock.advance(ROSTER_BUILD_INTERVAL + Duration::from_secs(1));
+        presence.tick(&store, &clock, &cfg()).await.unwrap();
+
+        let roster = store.get(&ctxlake_store::layout::roster()).await.unwrap();
+        let snapshot: roster::RosterSnapshot =
+            serde_json::from_slice(&roster.bytes().await.unwrap()).unwrap();
+        let mut ids: Vec<_> = snapshot.agents.iter().map(|a| a.agent_id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "cc-01".to_string(),
+                "cc-02".to_string(),
+                "cc-03".to_string()
+            ],
+            "the scaled interval elapsing must rebuild and pick up cc-03"
         );
     }
 }

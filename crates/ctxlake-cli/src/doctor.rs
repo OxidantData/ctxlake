@@ -32,6 +32,37 @@ pub struct Report {
     pub llm: Option<LlmReport>,
     pub cache: CacheReport,
     pub spool_backlog: SpoolReport,
+    pub daemon: DaemonReport,
+    pub maint: MaintReport,
+    /// docs/summarization.md's three-tier spelling (`ctxlake.toml`'s own
+    /// `[summarize].mode`) — see `config.rs`'s `SummarizeMode::Display` impl.
+    pub summarize_mode: String,
+    /// How many sessions currently show a fired Tier 1 nudge marker (`nudge.rs`)
+    /// under this fleet's cache dir. Not a health signal by itself — just
+    /// visibility into whether Tier 1 (docs/summarization.md's default) is
+    /// actually firing for this operator's agents.
+    pub nudged_sessions: usize,
+}
+
+/// Is `ctxlake sync` running (a pidfile whose pid is still alive — see
+/// `sync_cmd::read_running_pid`), and, separately, when did maintenance last
+/// publish a snapshot.
+pub struct DaemonReport {
+    pub pid: Option<u32>,
+}
+
+pub struct MaintReport {
+    /// Age since `snapshot/latest.json` was last published, read straight from
+    /// the store's own `last_modified` for that object (never this host's clock
+    /// for anything CAS-related — AGENTS.md invariant 6 — though this is a plain
+    /// read for display, not a lease decision). `None` when the store is
+    /// unreachable or nothing has ever published a snapshot.
+    ///
+    /// This is a **proxy**, not a real completion marker: `ctxlake-maint` (the
+    /// crate that would publish one) is an empty scaffold as of this wave — see
+    /// `maint_cmd.rs`'s module doc — so "last snapshot publish" is the closest
+    /// honest answer to "when did maintenance last complete" available today.
+    pub last_snapshot_age: Option<Duration>,
 }
 
 pub struct RuntimeReport {
@@ -146,6 +177,30 @@ impl Report {
             self.spool_backlog.byte_count,
             self.spool_backlog.path.display()
         );
+        match self.daemon.pid {
+            Some(pid) => println!("  process: running (pid {pid})"),
+            None => println!("  process: not running — `ctxlake sync` (see docs/cli.md) starts it"),
+        }
+
+        println!("\nmaintenance");
+        match self.maint.last_snapshot_age {
+            Some(age) => println!(
+                "  last snapshot published {}s ago (proxy for last completion — see \
+                 docs/summarization.md)",
+                age.as_secs()
+            ),
+            None => println!(
+                "  never — ctxlake-maint has not published a snapshot yet (optional: \
+                 `ctxlake maint` from cron/systemd, or run it by hand; see docs/cli.md)"
+            ),
+        }
+
+        println!("\nsummarization");
+        println!("  mode: {}", self.summarize_mode);
+        println!(
+            "  tier 1 nudges fired: {} session(s) (see docs/summarization.md)",
+            self.nudged_sessions
+        );
     }
 }
 
@@ -190,11 +245,14 @@ pub async fn run(cfg: &Config) -> Result<Report> {
     // them propagating as a hard `Result::Err` out of `doctor` and the other
     // showing up in the printed report.
     let connected = store_ctx::connect(cfg, &cfg.agent_id);
-    let (reachable, reachable_detail, probes) = match connected {
+    let mut maint = MaintReport {
+        last_snapshot_age: None,
+    };
+    let (reachable, reachable_detail, probes) = match &connected {
         Err(e) => (false, format!("{e:#}"), Vec::new()),
         Ok(ctx) => {
             let probe_key = full_path(
-                &ctx,
+                ctx,
                 &object_store::path::Path::from("_meta")
                     .join("doctor-probe")
                     .join(format!("{}.json", cfg.agent_id)),
@@ -207,6 +265,20 @@ pub async fn run(cfg: &Config) -> Result<Report> {
                 Ok(_) => {
                     let _ = ctx.store.delete(&probe_key).await;
                     let probes = ctxlake_store::probe::run(ctx.store.as_ref(), &cfg.agent_id).await;
+
+                    // Best-effort: absent (`NotFound`) is the overwhelmingly common
+                    // case for now (see `MaintReport::last_snapshot_age`'s doc) and
+                    // any other error just leaves this `None` rather than failing
+                    // the whole report over a display-only field.
+                    let snapshot_key = full_path(ctx, &ctxlake_store::layout::snapshot_latest());
+                    if let Ok(meta) = ctx.store.head(&snapshot_key).await {
+                        if let Ok(age) =
+                            SystemTime::now().duration_since(SystemTime::from(meta.last_modified))
+                        {
+                            maint.last_snapshot_age = Some(age);
+                        }
+                    }
+
                     (true, "ok".to_string(), probes)
                 }
                 Err(e) => (false, e.to_string(), Vec::new()),
@@ -262,6 +334,13 @@ pub async fn run(cfg: &Config) -> Result<Report> {
 
     let spool_backlog = scan_spool(&paths::spool_root());
 
+    let daemon = DaemonReport {
+        pid: crate::sync_cmd::read_running_pid(&paths::pid_file(&cfg.fleet_id)),
+    };
+    // Not fleet-scoped: the marker directory keys by session id alone (see
+    // `nudge.rs`'s doc), so this counts every fleet's fired nudges on this host.
+    let nudged_sessions = crate::nudge::count_nudged(&ctxlake_core::paths::cache_root());
+
     Ok(Report {
         store_url: cfg.store.clone(),
         reachable,
@@ -271,6 +350,10 @@ pub async fn run(cfg: &Config) -> Result<Report> {
         llm,
         cache,
         spool_backlog,
+        daemon,
+        maint,
+        summarize_mode: cfg.summarize.mode.to_string(),
+        nudged_sessions,
     })
 }
 
@@ -355,6 +438,12 @@ mod tests {
                 file_count: 0,
                 byte_count: 0,
             },
+            daemon: DaemonReport { pid: None },
+            maint: MaintReport {
+                last_snapshot_age: None,
+            },
+            summarize_mode: "agent".into(),
+            nudged_sessions: 0,
         };
         assert!(!report.breaks_capture());
     }
@@ -401,5 +490,63 @@ mod tests {
     fn llm_check_is_skipped_when_the_mode_never_needs_a_batch_key() {
         let cfg = Config::new("file:///tmp/lake", "myteam", "cc-01");
         assert!(!cfg.summarize.mode.needs_batch());
+    }
+
+    #[tokio::test]
+    async fn reports_no_daemon_running_without_a_pidfile() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(
+            format!("file://{}", store_dir.path().display()),
+            "doctor-test-fleet-no-daemon",
+            "cc-01",
+        );
+        let report = run(&cfg).await.unwrap();
+        assert_eq!(report.daemon.pid, None);
+    }
+
+    #[tokio::test]
+    async fn reports_the_daemon_pid_when_its_pidfile_is_live() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let fleet_id = "doctor-test-fleet-live-daemon";
+        let cfg = Config::new(
+            format!("file://{}", store_dir.path().display()),
+            fleet_id,
+            "cc-01",
+        );
+        let pid_path = paths::pid_file(fleet_id);
+        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        // This test process's own pid is guaranteed alive for the test's duration.
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+        let report = run(&cfg).await.unwrap();
+        assert_eq!(report.daemon.pid, Some(std::process::id()));
+
+        std::fs::remove_file(&pid_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_the_configured_summarize_mode() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::new(
+            format!("file://{}", store_dir.path().display()),
+            "myteam",
+            "cc-01",
+        );
+        assert_eq!(run(&cfg).await.unwrap().summarize_mode, "agent");
+
+        cfg.summarize.mode = crate::config::SummarizeMode::None;
+        assert_eq!(run(&cfg).await.unwrap().summarize_mode, "none");
+    }
+
+    #[tokio::test]
+    async fn reports_no_snapshot_published_yet_for_a_fresh_store() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(
+            format!("file://{}", store_dir.path().display()),
+            "myteam",
+            "cc-01",
+        );
+        let report = run(&cfg).await.unwrap();
+        assert_eq!(report.maint.last_snapshot_age, None);
     }
 }

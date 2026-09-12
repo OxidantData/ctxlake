@@ -17,8 +17,18 @@ ctxlake-core = { path = "../ctxlake-core" }
 ctxlake-store = { path = "../ctxlake-store" }
 ctxlake-maint = { path = "../ctxlake-maint" }
 ctxlake-mcp = { path = "../ctxlake-mcp" }
+# The daemon library behind `ctxlake sync` (upload/cache/presence loops) — see
+# `sync_cmd.rs`'s module doc. Not a dependency before this wave: nothing here
+# called `ctxlake sync` until now.
+ctxlake-sync = { path = "../ctxlake-sync" }
 clap.workspace = true
-tokio.workspace = true
+# Adds the "signal" feature on top of the workspace default so `ctxlake sync
+# --foreground` can catch SIGTERM/SIGINT for graceful shutdown
+# (`tokio::signal::unix`, `tokio::signal::ctrl_c`). This is an additive feature on
+# an existing workspace dependency, merged via Cargo's normal feature unification —
+# not a new crate (AGENTS.md: "don't add a dependency without saying why" is about
+# new crates; this changes no dependency tree).
+tokio = { workspace = true, features = ["signal"] }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

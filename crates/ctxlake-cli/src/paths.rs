@@ -75,6 +75,26 @@ pub fn hermes_config_path() -> PathBuf {
     home_dir().join(".hermes").join("config.yaml")
 }
 
+/// Where `ctxlake sync`'s background pidfile lives, scoped per fleet — two fleets
+/// running on one host each get their own daemon slot rather than fighting over
+/// (or silently sharing) a single pidfile. See `sync_cmd.rs`.
+pub fn pid_file(fleet_id: &str) -> PathBuf {
+    home_dir()
+        .join(".ctxlake")
+        .join("run")
+        .join(format!("{fleet_id}.pid"))
+}
+
+/// Where a backgrounded `ctxlake sync`'s stdout/stderr are redirected — see
+/// `sync_cmd.rs`'s daemonization doc for why this isn't a true detached daemon with
+/// no controlling output at all.
+pub fn sync_log_file(fleet_id: &str) -> PathBuf {
+    home_dir()
+        .join(".ctxlake")
+        .join("run")
+        .join(format!("{fleet_id}.log"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +109,14 @@ mod tests {
     fn cache_is_scoped_per_fleet() {
         assert_ne!(cache_dir("fleet-a"), cache_dir("fleet-b"));
         assert!(cache_dir("myteam").ends_with("cache/myteam"));
+    }
+
+    #[test]
+    fn pid_and_log_files_are_scoped_per_fleet() {
+        assert_ne!(pid_file("fleet-a"), pid_file("fleet-b"));
+        assert_ne!(sync_log_file("fleet-a"), sync_log_file("fleet-b"));
+        assert!(pid_file("myteam").ends_with("run/myteam.pid"));
+        assert!(sync_log_file("myteam").ends_with("run/myteam.log"));
     }
 
     #[test]

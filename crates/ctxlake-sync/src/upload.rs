@@ -36,11 +36,51 @@ use crate::codec;
 use crate::watermark::{self, SessionUploadState};
 
 /// Static configuration the upload loop needs and never mutates.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UploadConfig {
     pub fleet_id: String,
     pub agent_id: String,
     pub spool_root: PathBuf,
+    /// Produces the sibling enrichment object for a session being sealed, if this
+    /// runtime has a source for one. `None` on a daemon that has no enricher wired,
+    /// which is every configuration that existed before this seam.
+    ///
+    /// A trait rather than a direct call because the only source today is the Claude
+    /// Code session transcript, and reading it needs the redactor and the adapter
+    /// helpers that live in crates this one deliberately does not depend on. The
+    /// implementation lives with those; the decision of *when* stays here, with seal.
+    pub enricher: Option<Arc<dyn SessionEnricher>>,
+}
+
+impl std::fmt::Debug for UploadConfig {
+    /// Hand-rolled because a `dyn SessionEnricher` cannot derive `Debug`, and the one
+    /// thing worth seeing about it in a log is whether it is wired at all.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadConfig")
+            .field("fleet_id", &self.fleet_id)
+            .field("agent_id", &self.agent_id)
+            .field("spool_root", &self.spool_root)
+            .field("enricher", &self.enricher.is_some())
+            .finish()
+    }
+}
+
+/// Turns a sealed session into the bytes of its [`layout::session_enrichment`] object.
+///
+/// Implemented in `ctxlake-cli` over the Claude Code transcript — see
+/// `import::claude_code`. Returning `None` is the normal case, not a failure: Cursor and
+/// Hermes have no transcript, the sentinel may carry no path, and a transcript that has
+/// been rotated away is simply gone. In every one of those the session seals exactly as
+/// it did before and the digest is the thinner one it would have been anyway.
+pub trait SessionEnricher: Send + Sync {
+    /// `done_sentinel` is the `<session_id>.done` file the hook wrote at `SessionEnd`;
+    /// it carries `transcript_path` when the runtime had one.
+    fn enrichment_for(
+        &self,
+        runtime: Runtime,
+        session_id: &str,
+        done_sentinel: &Path,
+    ) -> Option<Vec<u8>>;
 }
 
 /// One `(runtime, session_id)` pair found under the spool root.
@@ -422,6 +462,34 @@ async fn maybe_seal_and_cleanup(
         state.sealed_in_store = true;
         watermark::write(state_path, state)?;
         just_sealed = true;
+
+        // Attach what the transcript knows, while the sentinel that names it still
+        // exists — it is deleted a few lines below with the rest of the spool.
+        //
+        // Deliberately after `_SEALED` and deliberately non-fatal. Sealing is the
+        // durable fact; enrichment is an improvement to a digest that has been
+        // computable without it all along. An unreadable or rotated transcript must
+        // cost a thinner digest, never an unsealed session — an unsealed session is
+        // never compacted, never digested, and never extracted.
+        if let Some(enricher) = &cfg.enricher {
+            if let Some(bytes) = enricher.enrichment_for(runtime, &key.session_id, &done_marker) {
+                let path = ctxlake_store::layout::session_enrichment(
+                    &date,
+                    &cfg.fleet_id,
+                    runtime,
+                    &cfg.agent_id,
+                    &key.session_id,
+                );
+                match store.put(&path, PutPayload::from(bytes)).await {
+                    Ok(_) => tracing::debug!(session = %key.session_id, "wrote session enrichment"),
+                    Err(e) => tracing::warn!(
+                        session = %key.session_id,
+                        error = %e,
+                        "could not write session enrichment; the digest will be thinner"
+                    ),
+                }
+            }
+        }
     }
 
     // Sizes must be read before deletion — there is nothing left to stat after.
@@ -523,6 +591,7 @@ mod tests {
             fleet_id: "oxidant".into(),
             agent_id: "cc-01".into(),
             spool_root: spool_root.to_path_buf(),
+            enricher: None,
         }
     }
 

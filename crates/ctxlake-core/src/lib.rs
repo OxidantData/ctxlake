@@ -4,6 +4,7 @@
 //! must stay under 5ms. Nothing here may pull in an async runtime, an HTTP stack, or
 //! an object store — see AGENTS.md invariant 2.
 
+pub mod enrichment;
 pub mod envelope;
 pub mod hash;
 pub mod paths;

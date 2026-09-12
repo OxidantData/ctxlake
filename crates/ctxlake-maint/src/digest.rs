@@ -137,6 +137,10 @@ pub struct SessionDigest {
     pub commits: Vec<String>,
     pub git_sha_before: Option<String>,
     pub git_sha_after: Option<String>,
+    /// The git branch this session ran on, from the transcript. No hook payload
+    /// carries it, so this is `None` for any session sealed without enrichment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub usage: TokenUsage,
     pub outcome: Outcome,
     pub friction: Vec<Friction>,
@@ -253,6 +257,62 @@ pub fn compute(
     envelopes: &[Envelope],
     thresholds: &FrictionThresholds,
 ) -> SessionDigest {
+    compute_with(
+        session_id, fleet_id, agent_id, runtime, envelopes, thresholds, None,
+    )
+}
+
+/// [`compute`], with whatever the session's transcript contributed.
+///
+/// **This is where the digest stopped being empty.** Every field below except duration
+/// reads something no hook payload carries — `tool.exit_code`, `tool.result`,
+/// `tool.paths` for a shell-driven edit, `usage`, `branch`. Measured on a live lake
+/// before this existed: 26 digests, every one of them `turns=1 files=0 cmds=0 tests=0
+/// commits=0 friction=0 cost=0`, while `docs/memory.md` advertised all seven.
+///
+/// The join is by `message_id`, which the hook already writes from the runtime's
+/// tool-use id and the transcript already keys results by. `None` is the honest
+/// pre-enrichment case — an older session, a runtime with no transcript, a machine
+/// whose transcript had rotated away — and produces exactly the digest it used to.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_with(
+    session_id: &str,
+    fleet_id: &str,
+    agent_id: &str,
+    runtime: Runtime,
+    envelopes: &[Envelope],
+    thresholds: &FrictionThresholds,
+    enrichment: Option<&ctxlake_core::enrichment::Enrichment>,
+) -> SessionDigest {
+    // Applied to a local copy: `envelopes` is borrowed from immutable bronze, and
+    // enrichment is a derived view of it rather than a correction to it.
+    let owned: Vec<Envelope> = match enrichment {
+        Some(e) => envelopes
+            .iter()
+            .cloned()
+            .map(|mut env| {
+                if let (Some(mid), Some(tool)) = (env.message_id.clone(), env.tool.as_mut()) {
+                    if let Some(outcome) = e.tools.get(&mid) {
+                        if tool.result.is_none() {
+                            tool.result.clone_from(&outcome.result);
+                        }
+                        if tool.exit_code.is_none() {
+                            tool.exit_code = outcome.exit_code;
+                        }
+                        for p in &outcome.paths {
+                            if !tool.paths.contains(p) {
+                                tool.paths.push(p.clone());
+                            }
+                        }
+                    }
+                }
+                env
+            })
+            .collect(),
+        None => envelopes.to_vec(),
+    };
+    let envelopes: &[Envelope] = &owned;
+
     let mut sorted: Vec<&Envelope> = envelopes.iter().collect();
     sorted.sort_by(|a, b| a.event_id.cmp(&b.event_id));
 
@@ -275,7 +335,20 @@ pub fn compute(
 
     let mut files_touched: std::collections::BTreeSet<String> = Default::default();
     let mut commands: Vec<CommandRun> = Vec::new();
-    let mut usage = TokenUsage::default();
+    // Seeded from the transcript, because no hook payload carries usage and the
+    // per-envelope fold below therefore always summed to zero. The fold still runs so a
+    // runtime that *does* report usage on its envelopes (the Hermes importer does) is
+    // not ignored.
+    let mut usage = enrichment
+        .and_then(|e| e.usage.as_ref())
+        .map(|u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_tokens: u.cache_read_tokens,
+            cache_write_tokens: u.cache_write_tokens,
+            cost_usd: u.cost_usd.unwrap_or(0.0),
+        })
+        .unwrap_or_default();
     let mut git_sha_before: Option<String> = None;
     let mut git_sha_after: Option<String> = None;
 
@@ -405,6 +478,10 @@ pub fn compute(
         commits,
         git_sha_before,
         git_sha_after,
+        // Session-level, so it comes straight from the enrichment rather than from the
+        // per-envelope fold above — no hook event carries usage at all, and the
+        // transcript reports it per assistant turn, already summed.
+        branch: enrichment.and_then(|e| e.branch.clone()),
         usage,
         outcome,
         friction,
@@ -474,13 +551,36 @@ pub async fn run_for_session(
     }
 
     let envelopes = read_session_segments(store, sealed_marker).await?;
-    let digest = compute(
+
+    // Written by the agent's own daemon at seal time, because the transcript it comes
+    // from is a local file only that machine could read. Absent for every session
+    // sealed before enrichment existed, for runtimes that keep no transcript, and for a
+    // machine whose transcript had already rotated — all of which produce exactly the
+    // digest this function produced before, rather than an error.
+    let enrichment_key = ctxlake_store::layout::session_enrichment(
+        &partition.date,
+        &partition.fleet_id,
+        partition.runtime,
+        &partition.agent_id,
+        &partition.session_id,
+    );
+    let enrichment: Option<ctxlake_core::enrichment::Enrichment> =
+        match store.get(&enrichment_key).await {
+            Ok(res) => match res.bytes().await {
+                Ok(bytes) => serde_json::from_slice(&bytes).ok(),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+
+    let digest = compute_with(
         &partition.session_id,
         &partition.fleet_id,
         &partition.agent_id,
         partition.runtime,
         &envelopes,
         thresholds,
+        enrichment.as_ref(),
     );
     // Plain overwrite, not CAS: a digest is a pure function of immutable sealed
     // data, so a concurrent recompute (two maintenance hosts racing over the same
@@ -500,6 +600,177 @@ pub async fn run_for_session(
 mod tests {
     use super::*;
     use ctxlake_core::envelope::{Redaction, Usage};
+
+    /// A tool-call envelope shaped exactly like live capture produces: an identity and
+    /// an input, and nothing else. No result, no exit code, no usage — that is the
+    /// whole reason enrichment exists.
+    fn captured_tool_call(session: &str, n: u32, tool: &str, input: &str, id: &str) -> Envelope {
+        let mut e = base(session, n, EventType::ToolCall, Runtime::ClaudeCode);
+        e.message_id = Some(id.to_string());
+        e.tool = Some(ctxlake_core::envelope::ToolCall {
+            name: tool.to_string(),
+            input: Some(input.to_string()),
+            ..Default::default()
+        });
+        e
+    }
+
+    #[test]
+    fn without_enrichment_a_real_capture_digests_to_almost_nothing() {
+        // The measured before-state, pinned so the after-state below means something.
+        // 26 sessions on a live lake produced exactly this: a duration and no content.
+        let envs = vec![
+            captured_tool_call("s1", 1, "Bash", "cargo test --workspace", "tu-1"),
+            captured_tool_call("s1", 2, "Bash", "cargo test --workspace", "tu-2"),
+        ];
+        let d = compute(
+            "s1",
+            "f",
+            "a",
+            Runtime::ClaudeCode,
+            &envs,
+            &FrictionThresholds::default(),
+        );
+        assert!(d.commands.is_empty(), "no exit code means no command");
+        assert!(d.files_touched.is_empty());
+        assert!(d.friction.is_empty());
+        assert_eq!(d.usage.input_tokens, 0);
+        assert!(d.branch.is_none());
+    }
+
+    #[test]
+    fn enrichment_turns_a_bare_capture_into_the_digest_the_docs_promise() {
+        // `docs/memory.md` advertises "files touched, commands and exit codes, tests,
+        // commits, duration, cost, friction signals". Every one of those below comes
+        // from the transcript; none of it is in any hook payload.
+        use ctxlake_core::enrichment::{Enrichment, ToolOutcome};
+        use std::collections::BTreeMap;
+
+        let envs = vec![
+            captured_tool_call("s1", 1, "Bash", "cargo test -p ctxlake-core", "tu-1"),
+            captured_tool_call("s1", 2, "Bash", "cargo test -p ctxlake-core", "tu-2"),
+            captured_tool_call("s1", 3, "Bash", "sed -i '' s/a/b/ src/lib.rs", "tu-3"),
+        ];
+
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "tu-1".to_string(),
+            ToolOutcome {
+                result: Some("error: test failed".into()),
+                exit_code: Some(1),
+                paths: vec![],
+            },
+        );
+        tools.insert(
+            "tu-2".to_string(),
+            ToolOutcome {
+                result: Some("error: test failed".into()),
+                exit_code: Some(1),
+                paths: vec![],
+            },
+        );
+        // The row no hook can produce: a file edited through a shell command.
+        tools.insert(
+            "tu-3".to_string(),
+            ToolOutcome {
+                result: Some("".into()),
+                exit_code: Some(0),
+                paths: vec!["src/lib.rs".to_string()],
+            },
+        );
+
+        let enrichment = Enrichment {
+            schema_version: 1,
+            tools,
+            usage: Some(Usage {
+                input_tokens: 1200,
+                output_tokens: 340,
+                ..Default::default()
+            }),
+            branch: Some("feat/memory".into()),
+            redaction_status: "clean".into(),
+        };
+
+        let d = compute_with(
+            "s1",
+            "f",
+            "a",
+            Runtime::ClaudeCode,
+            &envs,
+            &FrictionThresholds::default(),
+            Some(&enrichment),
+        );
+
+        assert_eq!(
+            d.commands.len(),
+            3,
+            "commands need an exit code to exist at all"
+        );
+        assert_eq!(
+            d.tests_run.len(),
+            2,
+            "cargo test is recognised: {:?}",
+            d.tests_run
+        );
+        assert_eq!(
+            d.files_touched,
+            vec!["src/lib.rs".to_string()],
+            "a shell-driven edit must be attributed — no hook can see this"
+        );
+        assert!(
+            !d.friction.is_empty(),
+            "two identical failures is the friction signal the docs call the most \
+             useful line in a briefing: {:?}",
+            d.friction
+        );
+        assert_eq!(d.usage.input_tokens, 1200);
+        assert_eq!(d.branch.as_deref(), Some("feat/memory"));
+    }
+
+    #[test]
+    fn enrichment_never_overwrites_what_the_runtime_already_reported() {
+        // Cursor and Hermes populate result and exit code on the hook path. Enrichment
+        // fills gaps; it is not a second opinion.
+        use ctxlake_core::enrichment::{Enrichment, ToolOutcome};
+        use std::collections::BTreeMap;
+
+        let mut e = captured_tool_call("s1", 1, "Bash", "true", "tu-1");
+        if let Some(t) = e.tool.as_mut() {
+            t.exit_code = Some(0);
+            t.result = Some("from the runtime".into());
+        }
+
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "tu-1".to_string(),
+            ToolOutcome {
+                result: Some("from the transcript".into()),
+                exit_code: Some(1),
+                paths: vec![],
+            },
+        );
+        let enrichment = Enrichment {
+            schema_version: 1,
+            tools,
+            redaction_status: "clean".into(),
+            ..Default::default()
+        };
+
+        let d = compute_with(
+            "s1",
+            "f",
+            "a",
+            Runtime::ClaudeCode,
+            &[e],
+            &FrictionThresholds::default(),
+            Some(&enrichment),
+        );
+        assert_eq!(
+            d.commands[0].exit_code,
+            Some(0),
+            "the runtime's own answer wins"
+        );
+    }
 
     fn base(session: &str, n: u32, event_type: EventType, runtime: Runtime) -> Envelope {
         let mut e = Envelope::new(

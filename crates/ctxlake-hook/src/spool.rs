@@ -38,7 +38,7 @@
 //! order*: the order in which processes reach [`append_event_at`] for a given
 //! session's file, not `event_id`'s sort order.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -205,14 +205,40 @@ fn write_tracked_size(dir: &Path, size: u64) {
 /// Write the `.done` sentinel marking a session's spool file as finished. The daemon
 /// (a later wave) uses this to know a session's ndjson file is safe to ship without
 /// racing a writer that might still append to it.
-pub fn mark_session_done_at(root: &Path, runtime: &str, session_id: &str) -> Result<(), String> {
+pub fn mark_session_done_at(
+    root: &Path,
+    runtime: &str,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Result<(), String> {
     validate_session_id(session_id)?;
     let dir = root.join(runtime);
     fs::create_dir_all(&dir).map_err(|e| format!("create spool dir {}: {e}", dir.display()))?;
     let path = dir.join(format!("{session_id}.done"));
-    File::create(&path)
-        .map(|_| ())
-        .map_err(|e| format!("write done sentinel {}: {e}", path.display()))
+    // The sentinel used to be an empty file; its existence was the whole signal. It now
+    // also carries `transcript_path`, which is the only thing on the machine that knows
+    // where this session's transcript lives — and the daemon needs it at seal time to
+    // attach results, exit status, usage and branch, none of which any hook payload
+    // carries.
+    //
+    // Written here rather than on every event because `SessionEnd` happens once, and
+    // Claude Code shares a 1.5s budget across every hook it runs for it. This is still
+    // one local file create, now with a few hundred bytes in it.
+    //
+    // Absent or unreadable is not an error anywhere downstream: enrichment is skipped
+    // and the digest is the thinner one it would have been anyway.
+    let body = match transcript_path {
+        Some(t) => format!("{{\"transcript_path\":{}}}", json_string(t)),
+        None => "{}".to_string(),
+    };
+    fs::write(&path, body).map_err(|e| format!("write done sentinel {}: {e}", path.display()))
+}
+
+/// Minimal JSON string escaping, so the sentinel stays valid for a path containing a
+/// quote or a backslash. `serde_json` is already a dependency; this exists only because
+/// building one field by hand keeps this function allocation-light on a budgeted path.
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// Append a timestamped line to a local error log. Best-effort: if even this fails,
@@ -255,8 +281,12 @@ pub fn append_event(runtime: &str, session_id: &str, line: &str) -> Result<(), S
     append_event_at(&spool_root(), runtime, session_id, line)
 }
 
-pub fn mark_session_done(runtime: &str, session_id: &str) -> Result<(), String> {
-    mark_session_done_at(&spool_root(), runtime, session_id)
+pub fn mark_session_done(
+    runtime: &str,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Result<(), String> {
+    mark_session_done_at(&spool_root(), runtime, session_id, transcript_path)
 }
 
 pub fn log_error(msg: &str) {
@@ -324,10 +354,60 @@ mod tests {
     }
 
     #[test]
+    fn the_done_sentinel_carries_the_transcript_path_when_there_is_one() {
+        // The daemon seals a session from the spool alone, long after the hook exited.
+        // This sentinel is the only place the transcript's location survives, and
+        // without it there is no result, exit status, usage or branch to attach.
+        let dir = tempfile::tempdir().unwrap();
+        mark_session_done_at(
+            dir.path(),
+            "claude_code",
+            "sess-1",
+            Some("/Users/alice/.claude/projects/-Users-alice-proj/sess-1.jsonl"),
+        )
+        .unwrap();
+        let body =
+            std::fs::read_to_string(dir.path().join("claude_code").join("sess-1.done")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            v["transcript_path"].as_str(),
+            Some("/Users/alice/.claude/projects/-Users-alice-proj/sess-1.jsonl")
+        );
+    }
+
+    #[test]
+    fn a_sentinel_without_a_transcript_path_is_still_valid_json() {
+        // Cursor and Hermes have no transcript, and a Claude Code payload can lack the
+        // field. The sentinel's existence is still the seal signal, so it must parse.
+        let dir = tempfile::tempdir().unwrap();
+        mark_session_done_at(dir.path(), "claude_code", "sess-2", None).unwrap();
+        let body =
+            std::fs::read_to_string(dir.path().join("claude_code").join("sess-2.done")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(v.get("transcript_path").is_none());
+    }
+
+    #[test]
+    fn a_path_containing_a_quote_does_not_break_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_session_done_at(
+            dir.path(),
+            "claude_code",
+            "sess-3",
+            Some(r#"/tmp/a"b\c.jsonl"#),
+        )
+        .unwrap();
+        let body =
+            std::fs::read_to_string(dir.path().join("claude_code").join("sess-3.done")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["transcript_path"].as_str(), Some(r#"/tmp/a"b\c.jsonl"#));
+    }
+
+    #[test]
     fn mark_session_done_writes_a_sentinel_next_to_the_ndjson() {
         let dir = tempfile::tempdir().unwrap();
         append_event_at(dir.path(), "claude_code", "sess-1", "line").unwrap();
-        mark_session_done_at(dir.path(), "claude_code", "sess-1").unwrap();
+        mark_session_done_at(dir.path(), "claude_code", "sess-1", None).unwrap();
         assert!(dir.path().join("claude_code").join("sess-1.done").exists());
     }
 
@@ -460,7 +540,7 @@ mod tests {
         let escape_target = dir.path().parent().unwrap().join("pwned.done");
         let _ = fs::remove_file(&escape_target);
 
-        let result = mark_session_done_at(dir.path(), "claude_code", "../../pwned");
+        let result = mark_session_done_at(dir.path(), "claude_code", "../../pwned", None);
 
         assert!(result.is_err());
         assert!(!escape_target.exists());

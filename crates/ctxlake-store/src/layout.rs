@@ -143,6 +143,28 @@ pub fn session_digest(
     session_dir(date, fleet, runtime, agent, session_id).join("digest.json")
 }
 
+/// What the session transcript knows that the hook could not capture.
+///
+/// Written once at seal time by the agent's own daemon, because the transcript is a
+/// local file that only that machine can read — and read back by `ctxlake maint` on any
+/// host, which is why it lives in the lake beside the segments rather than staying on
+/// disk.
+///
+/// It exists because the capture path cannot see this data at all. Tool results, exit
+/// status, token usage, git branch and Bash-driven file edits are absent from every hook
+/// payload; `docs/memory.md` promised all of them and the digest delivered duration
+/// alone. A sibling object rather than a rewrite of the segments: `sessions/` is
+/// append-only, and enrichment arriving later must not mean rewriting immutable bronze.
+pub fn session_enrichment(
+    date: &str,
+    fleet: &str,
+    runtime: Runtime,
+    agent: &str,
+    session_id: &str,
+) -> Path {
+    session_dir(date, fleet, runtime, agent, session_id).join("transcript.json")
+}
+
 /// One output file of a compaction run over a `(date, fleet)` partition — see
 /// `ctxlake_maint::compact`. Deliberately a *sibling* prefix to `sessions/dt=.../`
 /// rather than a rewrite of it in place: bronze (the per-session `seg-*.parquet`
@@ -427,6 +449,20 @@ mod tests {
             cp.as_ref().matches('/').count(),
             2,
             "an extra path separator survived encoding: {cp}"
+        );
+    }
+
+    #[test]
+    fn enrichment_sits_beside_the_segments_it_enriches() {
+        let d = session_dir("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1");
+        assert_eq!(
+            session_enrichment("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1"),
+            d.join("transcript.json")
+        );
+        // Must not collide with the digest computed from it, nor with a segment.
+        assert_ne!(
+            session_enrichment("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1"),
+            session_digest("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1")
         );
     }
 

@@ -332,6 +332,90 @@ fn write_unit(path: &Path, contents: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The `--config` path recorded in an already-installed unit.
+///
+/// The unit is the only place that knows which config the daemon was installed for —
+/// it may not be the default, and `ctxlake update` deliberately loads no config at all,
+/// since a machine whose `ctxlake.toml` is broken is one you most want to be able to
+/// update out of. Both templates write `--config` immediately before the path, in a
+/// form this reads back: quoted on one line for systemd, in its own `<string>` element
+/// for launchd.
+fn config_path_from_unit(contents: &str) -> Option<PathBuf> {
+    // systemd: ExecStart="…/ctxlake" --config "/path/to/ctxlake.toml" sync run …
+    if let Some(rest) = contents.split("--config \"").nth(1) {
+        if let Some(path) = rest.split('"').next() {
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    // launchd: <string>--config</string> then <string>/path/to/ctxlake.toml</string>
+    let rest = contents.split("<string>--config</string>").nth(1)?;
+    let open = rest.find("<string>")? + "<string>".len();
+    let close = rest[open..].find("</string>")?;
+    let path = rest[open..open + close].trim();
+    (!path.is_empty()).then(|| PathBuf::from(unxml_escape(path)))
+}
+
+/// Undo [`xml_escape`], for a path read back out of a rendered plist.
+fn unxml_escape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Re-render an installed unit against this binary and this environment.
+///
+/// `ctxlake update` calls this after replacing the binaries, and it is the difference
+/// between an upgrade that works and one that needs a step the user has to remember.
+/// Two things in a unit go stale on an upgrade and neither is visible until the daemon
+/// is already dead:
+///
+/// - **The binary path.** A package manager that installs into a version-stamped
+///   directory deletes the old one, so a unit written before the upgrade names a file
+///   that no longer exists.
+/// - **`PATH`.** A provider binary installed after `sync install` ran is not on the
+///   `PATH` the unit pinned.
+///
+/// Deliberately does *not* re-run the pre-install checks. Those exist to stop someone
+/// installing a daemon that cannot work; refusing to refresh an already-installed unit
+/// because a store is briefly unreachable would leave it pointing at a deleted binary,
+/// which is worse than either outcome the checks were protecting against.
+///
+/// Returns `Ok(false)` when there is no unit to refresh.
+pub fn refresh_installed_unit() -> Result<bool> {
+    let manager = match Manager::detect() {
+        Ok(m) => m,
+        Err(_) => return Ok(false),
+    };
+    let home = home_dir();
+    let unit_path = manager.unit_path(&home);
+    let Ok(existing) = std::fs::read_to_string(&unit_path) else {
+        return Ok(false);
+    };
+    let config_path = config_path_from_unit(&existing).with_context(|| {
+        format!(
+            "{} does not record a --config path — reinstall with `ctxlake sync install`",
+            unit_path.display()
+        )
+    })?;
+
+    // The same directory `install` uses — `paths::sync_log_file`'s parent, which is
+    // fleet-independent. Created here because launchd refuses to start a job whose
+    // StandardOutPath directory does not exist.
+    let log_dir = home.join(".ctxlake").join("run");
+    std::fs::create_dir_all(&log_dir).with_context(|| format!("creating {}", log_dir.display()))?;
+    let contents = render(
+        manager,
+        &exec_path()?,
+        &config_path,
+        &home,
+        &log_dir,
+        &service_path(),
+    );
+    write_unit(&unit_path, &contents)
+}
+
 /// `ctxlake sync install` — render the unit and hand the daemon to the supervisor.
 ///
 /// Idempotent: re-running against an unchanged host rewrites nothing and re-loads the
@@ -1195,6 +1279,57 @@ mod tests {
             tail_lines(&dir.path().join("absent"), 5).is_empty(),
             "a missing log is the normal case before a first run, not an error"
         );
+    }
+
+    #[test]
+    fn the_config_path_survives_a_round_trip_through_either_unit() {
+        // `ctxlake update` re-renders an installed unit, and the unit is the only
+        // place that records which config the daemon was installed for — it is not
+        // necessarily the default, and `update` loads no config of its own.
+        for (m, home) in [
+            (Manager::Systemd, "/home/alice"),
+            (Manager::Launchd, "/Users/alice"),
+        ] {
+            let cfg = format!("{home}/.config/ctxlake/ctxlake.toml");
+            let rendered = render_t(
+                m,
+                Path::new("/usr/local/bin/ctxlake"),
+                Path::new(&cfg),
+                Path::new(home),
+                Path::new("/l"),
+            );
+            assert_eq!(
+                config_path_from_unit(&rendered),
+                Some(PathBuf::from(&cfg)),
+                "{m:?} unit must give its config path back"
+            );
+        }
+    }
+
+    #[test]
+    fn an_escaped_path_comes_back_unescaped() {
+        // A home directory containing `&` is legal, and the plist stores it as
+        // `&amp;`. Reading it back raw would hand the re-render a path that does not
+        // exist, and the unit would be rewritten pointing at nothing.
+        let cfg = "/Users/a&b/.config/ctxlake/ctxlake.toml";
+        let rendered = render_t(
+            Manager::Launchd,
+            Path::new("/usr/local/bin/ctxlake"),
+            Path::new(cfg),
+            Path::new("/Users/a&b"),
+            Path::new("/l"),
+        );
+        assert!(rendered.contains("a&amp;b"), "fixture must actually escape");
+        assert_eq!(config_path_from_unit(&rendered), Some(PathBuf::from(cfg)));
+    }
+
+    #[test]
+    fn a_unit_with_no_config_path_is_reported_rather_than_guessed() {
+        // Guessing the default here would silently repoint a daemon that was
+        // deliberately installed against a different config — one host running two
+        // agent identities is a documented setup.
+        assert_eq!(config_path_from_unit("nothing like a unit file"), None);
+        assert_eq!(config_path_from_unit("<string>--config</string>"), None);
     }
 
     #[test]

@@ -51,6 +51,12 @@ a Cellar leaves Homebrew's manifest describing a file that is no longer there:
 `brew list --versions` reports the old version and the next `brew upgrade` silently
 overwrites the update.
 
+**The service unit is re-rendered before the restart.** Two things in a unit go stale on
+an upgrade, and neither is visible until the daemon is already dead: the binary path,
+when a package manager's version-stamped directory is deleted, and the pinned `PATH`,
+when a provider binary was installed after `sync install` ran. Refreshing costs nothing
+when neither is true.
+
 **Replacement is by rename, never in place.** `ctxlake-hook` fires on every tool call in
 every live agent session on the machine; writing over it in place would mean some
 session's hook executes a half-written file. A rename is atomic, and a process that

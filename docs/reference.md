@@ -36,7 +36,7 @@ ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force] [--daemon]
 |---|---|
 | `--store` | Required. Verified by a real put/get round trip, not a URL parse |
 | `--fleet` | Required. The boundary of who sees whom |
-| `--agent-id` | Defaults to a sanitized hostname, stable across re-runs on the same host |
+| `--agent-id` | This machine's identity within the fleet. Defaults to a sanitized hostname, stable across re-runs on the same host. **Two hosts sharing one id merge into a single roster entry and a single claim author**, so give each machine its own |
 | `--force` | Required to overwrite an existing config; without it `init` refuses and changes nothing |
 | `--daemon` | Also install and start the sync daemon as a service, so it survives a reboot — equivalent to `ctxlake sync install` afterwards |
 | `--llm` | Configure Tier 2 with `claude-cli`, `anthropic`, `openrouter`, `gemini`, `openai-compatible` or `ollama`, and **verify it with a real call before writing the config**. `claude-cli` needs no key: it uses the `claude` binary's own subscription |

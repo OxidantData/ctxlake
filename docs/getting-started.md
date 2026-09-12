@@ -33,13 +33,24 @@ Prebuilt `.tar.xz` archives for `{aarch64,x86_64}-apple-darwin` and
 ## 2. Point it at a store
 
 ```sh
-ctxlake init --store s3://my-bucket/ctxlake --fleet myteam
+ctxlake init --store s3://my-bucket/ctxlake --fleet myteam --agent-id vamsi-mbp
 ctxlake init --store file://~/ctxlake-demo --fleet local   # no cloud account needed
 ```
 
-`--fleet` is the boundary of who sees whom. Map it to a team genuinely collaborating,
-not to a company. The `file://` form runs roster and briefings fine; what you lose is a
-second machine joining, so use it to evaluate, not to run a fleet.
+| Flag | What it decides |
+|---|---|
+| `--fleet` | **The boundary of who sees whom.** Everyone sharing it sees each other's roster and briefings. Map it to a team genuinely collaborating, not to a company |
+| `--agent-id` | **This machine's identity in that fleet.** Defaults to the hostname |
+
+> **Give every machine a distinct `--agent-id`.** Two hosts sharing one merge into a
+> single roster entry, and their claims are attributed to the same agent — which also
+> makes the independence gate treat two separate observations as one. The default is
+> derived from the hostname, so collisions are unlikely, but a hostname of `Mac` or
+> `localhost` is worth replacing with something you would recognise in
+> `ctxlake status`. Change it later with `--agent-id <name> --force`.
+
+The `file://` form runs roster and briefings fine; what you lose is a second machine
+joining, so use it to evaluate, not to run a fleet.
 
 ## 3. Check your backend — before you install
 

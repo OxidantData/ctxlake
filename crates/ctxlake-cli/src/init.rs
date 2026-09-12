@@ -84,6 +84,25 @@ fn default_agent_id() -> String {
             return sanitize(v);
         }
     }
+    // `hostname(1)`, last. On macOS none of the above ever resolves — interactive
+    // zsh does not export `HOSTNAME`, `COMPUTERNAME` is a Windows convention, and
+    // there is no `/etc/hostname` — so every Mac fell through to a hard-coded
+    // `unnamed-agent`. That is worse than ugly: `agent_id` is the fleet identity,
+    // and two hosts sharing one merges their roster entries and their claims'
+    // attribution, so an entire fleet of Macs would have looked like a single agent.
+    //
+    // A subprocess is fine *here* and nowhere near the hook: `init` runs once,
+    // interactively, while the hook has a 5ms budget per event and gets its agent id
+    // handed to it by `ctxlake install` as an environment variable anyway.
+    if let Ok(out) = std::process::Command::new("hostname").arg("-s").output() {
+        if out.status.success() {
+            let v = String::from_utf8_lossy(&out.stdout);
+            let v = v.trim();
+            if !v.is_empty() {
+                return sanitize(v);
+            }
+        }
+    }
     "unnamed-agent".to_string()
 }
 
@@ -394,6 +413,21 @@ mod tests {
         assert!(
             !config_path.exists(),
             "must not write a config for an unreachable store"
+        );
+    }
+
+    #[test]
+    fn the_default_agent_id_is_never_the_placeholder_on_a_real_machine() {
+        // `agent_id` is the fleet identity: two hosts sharing one merges their roster
+        // entries and their claims' attribution. On macOS every env source this looks
+        // at is unset and there is no /etc/hostname, so the default used to be a
+        // hard-coded `unnamed-agent` — meaning an entire fleet of Macs presented as a
+        // single agent. Any machine with a working `hostname` must do better.
+        let id = default_agent_id();
+        assert!(!id.is_empty());
+        assert_ne!(
+            id, "unnamed-agent",
+            "a host with a resolvable hostname must not fall through to the placeholder"
         );
     }
 

@@ -108,9 +108,7 @@ use object_store::{ObjectStore, PutMode, PutPayload};
 use serde::{Deserialize, Serialize};
 
 use crate::claims::{self, ClaimEvent, ClaimState, ClaimStatus, ClaimType};
-use crate::gate::{
-    self, CONTRADICTION_LEXICAL_OVERLAP_THRESHOLD, CONTRADICTION_SIMILARITY_THRESHOLD,
-};
+use crate::gate::{self, CONTRADICTION_SIMILARITY_THRESHOLD};
 
 /// Below this many resolved (correct + incorrect — expired never counts,
 /// see the module doc) predictions, a score is closer to a coin flip's worth
@@ -180,24 +178,83 @@ impl Resolution {
     }
 }
 
-/// Does `outcome`'s claim text agree with `hypothesis`'s? Reuses exactly the
-/// same "same subject, similar text" proxy `crate::gate`'s contradiction
-/// check uses for promoted claims (cosine over embeddings when both have
-/// one, lexical overlap otherwise) — not a second, possibly-drifting
-/// definition of "these two claims agree." There is no NLI model here any
-/// more than there is one in the contradiction gate; see that module's own
-/// doc for why this coarse proxy is the deliberate, documented trade rather
-/// than an oversight.
+/// Negation cue words/tokens whose presence flips a claim's polarity.
+///
+/// Not an exhaustive linguistic list — there is no NLI model here any more
+/// than there is one in the contradiction gate (see the module doc) — just
+/// enough to catch the single most damaging failure mode of a bag-of-words
+/// overlap score: a flat denial of a hypothesis shares almost every word
+/// with it (`"the flake is a colima scheduling artifact"` vs. `"the flake is
+/// NOT a colima scheduling artifact"`), so word overlap alone cannot tell a
+/// denial from an echo. Checked below as whole lowercased tokens (after
+/// stripping surrounding punctuation), never a substring search — a
+/// substring search would misfire on ordinary words like "known" or
+/// "container".
+const NEGATION_WORDS: &[&str] = &[
+    "not", "no", "never", "none", "nobody", "nothing", "nowhere", "neither", "cannot",
+];
+
+/// Does `text` contain a negation cue, as a whole word? Contractions
+/// (`isn't`, `didn't`, `won't`, ...) are caught by the `n't` suffix check
+/// rather than enumerated one by one — every English negative contraction
+/// ends in it.
+fn has_negation(text: &str) -> bool {
+    text.to_lowercase().split_whitespace().any(|tok| {
+        let bare = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'');
+        NEGATION_WORDS.contains(&bare) || bare.ends_with("n't")
+    })
+}
+
+/// Does `outcome`'s claim text agree with `hypothesis`'s?
+///
+/// This is **not** "reuse `gate::find_contradiction`'s similarity check and
+/// read a hit as agreement instead of conflict" — that was this function's
+/// original, buggy shape, and it inverted the one property that matters: a
+/// bag-of-words overlap score cannot distinguish "X" from "not X" (a
+/// negation shares nearly every word with what it refutes), so treating high
+/// `lexical_overlap` as *agreement* scored a flat denial of a hypothesis as
+/// *confirming* it. That is exactly backwards, and backwards in the
+/// direction that matters most: it inflates a wrong agent's trust
+/// multiplier rather than merely docking a right one — see
+/// `AgentScore::trust_multiplier` and docs/memory.md's honest-limitations
+/// section for the residual risk this still carries even after the fix
+/// below.
+///
+/// Agreement requires one of:
+/// - identical normalized claim text (`claims::normalize_claim_text`) — the
+///   same "these are literally the same claim" case `gate::find_contradiction`
+///   treats as corroboration, never a conflict; or
+/// - real embedding cosine similarity at or above the contradiction gate's
+///   own threshold, *with* no lopsided negation between the two texts (one
+///   negated, the other not) — a coarse guard against the same failure mode
+///   even a real embedding is not immune to.
+///
+/// Everything else — including high *lexical* overlap alone with no
+/// embedding on either side — resolves to disagreement (`Incorrect`), never
+/// agreement. That is the deliberately safe direction to be wrong in: an
+/// outcome that truly confirms a hypothesis but is phrased very differently
+/// costs the agent unearned credit, which a later, better-worded outcome (or
+/// a later resolution) can still recover; the reverse — a refutation
+/// misread as confirmation — inflates a track record with nothing to walk it
+/// back later.
 fn outcome_agrees(hypothesis: &ClaimState, outcome: &ClaimState) -> bool {
-    let sim = match (&hypothesis.embedding, &outcome.embedding) {
-        (Some(a), Some(b)) if a.len() == b.len() => gate::cosine(a, b),
-        _ => 0.0,
-    };
-    if sim >= CONTRADICTION_SIMILARITY_THRESHOLD {
+    if claims::normalize_claim_text(&hypothesis.claim)
+        == claims::normalize_claim_text(&outcome.claim)
+    {
         return true;
     }
-    gate::lexical_overlap(&hypothesis.claim, &outcome.claim)
-        >= CONTRADICTION_LEXICAL_OVERLAP_THRESHOLD
+    if has_negation(&hypothesis.claim) != has_negation(&outcome.claim) {
+        // Exactly one side is negated relative to the other. Whatever the
+        // similarity score below would say, a lopsided negation IS the
+        // disagreement here, not a data point to weigh against one.
+        return false;
+    }
+    match (&hypothesis.embedding, &outcome.embedding) {
+        (Some(a), Some(b)) if a.len() == b.len() => {
+            gate::cosine(a, b) >= CONTRADICTION_SIMILARITY_THRESHOLD
+        }
+        _ => false,
+    }
 }
 
 /// Join every still-open `hypothesis` in `hypotheses` against the `outcome`
@@ -213,11 +270,33 @@ fn outcome_agrees(hypothesis: &ClaimState, outcome: &ClaimState) -> bool {
 /// function reports nothing for it — "still pending" is not a `Resolution`
 /// variant on purpose, there is nothing yet to score or audit.
 ///
+/// An outcome only qualifies as "reality" for this join if it clears two
+/// bars this function enforces itself, never left to a caller to remember:
+///
+/// - **`ClaimStatus::Promoted`.** An ungated `Candidate` outcome is exactly
+///   the self-reported assertion this whole module refuses to trust at face
+///   value elsewhere (see the module doc's "confidence is derived, not
+///   claimed") — accepting one here would mean `memory_propose("outcome",
+///   ...)` from any agent (`crates/ctxlake-mcp/src/memory.rs`) is on its own
+///   enough to manufacture a resolution, with no gate ever having looked at
+///   it.
+/// - **A different `observed_by` than the hypothesis it would resolve.**
+///   Without this, one agent can grade its own homework: propose
+///   `hypothesis` X, then propose `outcome` X under its own identity, and
+///   score itself `Correct` against nothing but its own say-so. This is
+///   AGENTS.md invariant 9 ("agents propose, only the gate promotes")
+///   reopened through the confidence channel if left unchecked — an agent's
+///   identity is fixed per session by its adapter, not a field a tool call
+///   can spoof (`ctxlake-mcp`'s `ctx.agent_id`), so requiring a different one
+///   here is a real barrier, not a checkbox a caller can talk itself past.
+///
 /// Callers are expected to have already filtered `hypotheses` to claims
 /// still worth resolving (`ClaimStatus::Candidate` — see
 /// [`run_calibration`]); a hypothesis already `Retired` by a previous
 /// calibration run is not re-resolved simply because this function does not
-/// itself check status, it just does not expect to be handed one.
+/// itself check its status, it just does not expect to be handed one. The
+/// two bars above are the opposite: enforced here, in the shared join, so no
+/// future caller can bypass them by forgetting to pre-filter `outcomes`.
 pub fn resolve(hypotheses: &[ClaimState], outcomes: &[ClaimState], now: &str) -> Vec<Resolution> {
     let mut out = Vec::new();
     for h in hypotheses {
@@ -230,6 +309,8 @@ pub fn resolve(hypotheses: &[ClaimState], outcomes: &[ClaimState], now: &str) ->
                 o.claim_type == ClaimType::Outcome
                     && o.subject == h.subject
                     && o.observed_at.as_str() >= h.observed_at.as_str()
+                    && o.status == ClaimStatus::Promoted
+                    && o.observed_by != h.observed_by
             })
             .collect();
         candidates.sort_by(|a, b| a.observed_at.cmp(&b.observed_at));
@@ -642,6 +723,18 @@ pub struct CalibrationSummary {
 /// nothing the second time, the same "nothing left to do" idempotency
 /// `crate::compact` and `crate::digest` already rely on elsewhere in this
 /// crate.
+///
+/// `outcomes` below is deliberately handed to [`resolve`] unfiltered by
+/// status — [`resolve`] itself is where "must be `Promoted`, must come from
+/// a different agent than the hypothesis" is enforced (see its own doc), so
+/// this function does not duplicate that filter and cannot silently drift
+/// out of sync with it. The practical consequence for a caller wiring this
+/// into a maintenance cycle: an `outcome` claim proposed in the same batch
+/// this run reads is only usable to resolve a hypothesis once a `gate::run`
+/// has actually promoted it — running the gate before calibration in the
+/// same cycle (or trusting a prior cycle's promotion) is what makes a
+/// same-cycle outcome resolve anything at all, not a requirement this
+/// function can enforce on its caller's ordering by itself.
 pub async fn run_calibration(
     store: &dyn ObjectStore,
     lease: &LeaseHandle,
@@ -789,6 +882,13 @@ mod tests {
         }
     }
 
+    /// `status: Promoted` and `observed_by: "ci"` on purpose: `resolve()` now
+    /// refuses an outcome that is still an ungated `Candidate` or that shares
+    /// the hypothesis's own observer (see its doc), so the default fixture
+    /// here is the one shape that actually qualifies as "reality" — tests
+    /// that specifically want to exercise one of those two refusals build
+    /// their own `ClaimState` (or override a field on this one) rather than
+    /// silently getting a fixture that would make the refusal untestable.
     fn outcome(claim_id: &str, subject: &str, claim: &str, observed_at: &str) -> ClaimState {
         ClaimState {
             claim_id: claim_id.into(),
@@ -799,7 +899,7 @@ mod tests {
             observed_by: "ci".into(),
             observed_at: observed_at.into(),
             evidence: vec![evidence("s2")],
-            status: ClaimStatus::Candidate,
+            status: ClaimStatus::Promoted,
             independent_count: 0,
             confidence: 0.0,
             embedding: None,
@@ -901,6 +1001,179 @@ mod tests {
         assert!(
             resolutions.is_empty(),
             "a hypothesis not yet due must not be reported as expired or otherwise resolved: {resolutions:?}"
+        );
+    }
+
+    // ---- outcome_agrees(): a negation must never read as agreement (bug: it did) ----
+
+    #[test]
+    fn a_flatly_negated_outcome_never_resolves_a_hypothesis_as_correct() {
+        // The exact adversarial case that broke the old implementation: the
+        // outcome shares every single word with the hypothesis plus "not",
+        // which used to clear the lexical-overlap threshold and read as
+        // agreement. It must resolve Incorrect, never Correct.
+        let h = hypothesis(
+            "h1",
+            "cc-01",
+            "flake-theory",
+            "the flake is a colima scheduling artifact",
+            "2026-09-01T00:00:00Z",
+            Some("2026-09-08T00:00:00Z"),
+        );
+        let o = outcome(
+            "o1",
+            "flake-theory",
+            "the flake is not a colima scheduling artifact",
+            "2026-09-05T00:00:00Z",
+        );
+        let resolutions = resolve(&[h], &[o], "2026-09-06T00:00:00Z");
+        assert_eq!(
+            resolutions,
+            vec![Resolution::Incorrect {
+                hypothesis_id: "h1".into(),
+                outcome_id: "o1".into(),
+                agent_id: "cc-01".into(),
+            }],
+            "a hypothesis refuted by its own negation must score Incorrect, \
+             never Correct: {resolutions:?}"
+        );
+    }
+
+    #[test]
+    fn a_verbose_refutation_that_echoes_the_hypothesis_words_never_resolves_correct() {
+        // A terser hypothesis refuted by a wordier outcome that happens to
+        // repeat most of its vocabulary — the other shape of the same bug,
+        // since the old lexical_overlap check was asymmetric (fraction of
+        // the HYPOTHESIS's words found in the outcome).
+        let h = hypothesis(
+            "h1",
+            "cc-01",
+            "ci-theory",
+            "CI will pass",
+            "2026-09-01T00:00:00Z",
+            Some("2026-09-08T00:00:00Z"),
+        );
+        let o = outcome(
+            "o1",
+            "ci-theory",
+            "CI did not pass because the lint step failed",
+            "2026-09-05T00:00:00Z",
+        );
+        let resolutions = resolve(&[h], &[o], "2026-09-06T00:00:00Z");
+        assert_eq!(
+            resolutions,
+            vec![Resolution::Incorrect {
+                hypothesis_id: "h1".into(),
+                outcome_id: "o1".into(),
+                agent_id: "cc-01".into(),
+            }],
+            "a verbose refutation must not be misread as agreement just \
+             because it echoes the hypothesis's own words: {resolutions:?}"
+        );
+    }
+
+    #[test]
+    fn outcome_agrees_still_accepts_genuine_semantic_agreement_via_embeddings() {
+        // The fix above must not overcorrect into "nothing but identical
+        // text ever agrees" — real embedding similarity, with no lopsided
+        // negation, must still count as agreement even when the wording
+        // differs completely.
+        let mut h = hypothesis(
+            "h1",
+            "cc-01",
+            "flake-theory",
+            "the flake is a colima scheduling artifact",
+            "2026-09-01T00:00:00Z",
+            Some("2026-09-08T00:00:00Z"),
+        );
+        h.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let mut o = outcome(
+            "o1",
+            "flake-theory",
+            "confirmed: scheduling inside colima is what caused the flake",
+            "2026-09-05T00:00:00Z",
+        );
+        o.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let resolutions = resolve(&[h], &[o], "2026-09-06T00:00:00Z");
+        assert_eq!(
+            resolutions,
+            vec![Resolution::Correct {
+                hypothesis_id: "h1".into(),
+                outcome_id: "o1".into(),
+                agent_id: "cc-01".into(),
+            }],
+            "genuine embedding agreement with no negation mismatch must still \
+             resolve Correct: {resolutions:?}"
+        );
+    }
+
+    // ---- resolve(): an outcome must be gated and independent, not self-served ----
+
+    #[test]
+    fn resolve_refuses_an_outcome_still_stuck_as_an_ungated_candidate() {
+        // An outcome nobody's gate has ever looked at is exactly the
+        // self-reported assertion this module refuses to trust — see
+        // resolve()'s own doc. Past its due date with only an unpromoted
+        // outcome on file, the hypothesis must expire unresolved, never
+        // read the candidate as an answer.
+        let h = hypothesis(
+            "h1",
+            "cc-01",
+            "flake-theory",
+            "the flake is a colima scheduling artifact",
+            "2026-09-01T00:00:00Z",
+            Some("2026-09-08T00:00:00Z"),
+        );
+        let mut o = outcome(
+            "o1",
+            "flake-theory",
+            "the flake is a colima scheduling artifact",
+            "2026-09-05T00:00:00Z",
+        );
+        o.status = ClaimStatus::Candidate;
+        let resolutions = resolve(&[h], &[o], "2026-09-10T00:00:00Z");
+        assert_eq!(
+            resolutions,
+            vec![Resolution::Expired {
+                hypothesis_id: "h1".into(),
+                agent_id: "cc-01".into(),
+            }],
+            "an ungated Candidate outcome must never resolve a hypothesis, \
+             gated or not: {resolutions:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_refuses_an_outcome_observed_by_the_hypothesis_own_agent() {
+        // Same agent proposing both the hypothesis and the "reality" that
+        // confirms it is an agent grading its own homework — see resolve()'s
+        // own doc on why AGENTS.md invariant 9 requires this even though the
+        // outcome here is otherwise perfectly well-formed (Promoted, correct
+        // subject, agreeing text).
+        let h = hypothesis(
+            "h1",
+            "cc-01",
+            "flake-theory",
+            "the flake is a colima scheduling artifact",
+            "2026-09-01T00:00:00Z",
+            Some("2026-09-08T00:00:00Z"),
+        );
+        let mut o = outcome(
+            "o1",
+            "flake-theory",
+            "the flake is a colima scheduling artifact",
+            "2026-09-05T00:00:00Z",
+        );
+        o.observed_by = "cc-01".into();
+        let resolutions = resolve(&[h], &[o], "2026-09-10T00:00:00Z");
+        assert_eq!(
+            resolutions,
+            vec![Resolution::Expired {
+                hypothesis_id: "h1".into(),
+                agent_id: "cc-01".into(),
+            }],
+            "an agent must never be able to resolve its own hypothesis with \
+             its own self-reported outcome: {resolutions:?}"
         );
     }
 
@@ -1626,6 +1899,25 @@ mod tests {
         claims::append_proposed(&store, "2026-09-05", &out)
             .await
             .unwrap();
+        // `resolve()` refuses an outcome still stuck as an ungated
+        // `Candidate` (see its own doc) — a real maintenance cycle runs
+        // `gate::run` before calibration for exactly this reason. Fake that
+        // promotion directly here rather than pulling in the whole gate,
+        // since this test's own subject is the calibration orchestration,
+        // not gate mechanics (covered end to end in `gate.rs`'s own tests).
+        append_event(
+            &store,
+            "2026-09-05T00:01:00Z",
+            "ci",
+            &ClaimEvent::Promoted {
+                claim_id: "out-1".into(),
+                at: "2026-09-05T00:01:00Z".into(),
+                independent_count: 1,
+                confidence: 0.6,
+            },
+        )
+        .await
+        .unwrap();
 
         let summary = run_calibration(&store, &lease, "2026-09-06T00:00:00Z")
             .await
@@ -1656,6 +1948,107 @@ mod tests {
         assert_eq!(
             summary_again.resolved, 0,
             "a second run must not re-resolve an already-retired hypothesis"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_calibration_end_to_end_refuses_a_self_manufactured_track_record() {
+        // The exact exploit the review demonstrated: one agent proposes a
+        // hypothesis, then proposes its own agreeing "outcome" under its own
+        // identity, and promotes that outcome too — trying to manufacture a
+        // perfect track record with no independent gate ever having checked
+        // anything against reality. `resolve()`'s same-observer refusal must
+        // hold even when the self-served outcome is otherwise a completely
+        // well-formed, Promoted claim.
+        let store = object_store::memory::InMemory::new();
+        let lease = test_maintenance_lease(&store).await;
+
+        let hyp = ProposedClaim {
+            claim_id: "hyp-self".into(),
+            claim: "the flake is a colima scheduling artifact".into(),
+            claim_type: ClaimType::Hypothesis,
+            subject: "self-serve-theory".into(),
+            scope: Scope::Agent,
+            observed_by: "cc-01".into(),
+            observed_at: "2026-09-01T00:00:00Z".into(),
+            evidence: vec![evidence("s1")],
+            embedding: None,
+            resolves_at: Some("2026-09-08T00:00:00Z".into()),
+        };
+        claims::append_proposed(&store, "2026-09-01", &hyp)
+            .await
+            .unwrap();
+
+        let out = ProposedClaim {
+            claim_id: "out-self".into(),
+            claim: "the flake is a colima scheduling artifact".into(),
+            claim_type: ClaimType::Outcome,
+            subject: "self-serve-theory".into(),
+            scope: Scope::Agent,
+            // The same agent as the hypothesis above — the whole point of
+            // this test.
+            observed_by: "cc-01".into(),
+            observed_at: "2026-09-05T00:00:00Z".into(),
+            evidence: vec![evidence("s2")],
+            embedding: None,
+            resolves_at: None,
+        };
+        claims::append_proposed(&store, "2026-09-05", &out)
+            .await
+            .unwrap();
+        // Promote it too, so this test isolates the independence refusal
+        // specifically — even a fully gate-cleared self-outcome must not
+        // count.
+        append_event(
+            &store,
+            "2026-09-05T00:01:00Z",
+            "cc-01",
+            &ClaimEvent::Promoted {
+                claim_id: "out-self".into(),
+                at: "2026-09-05T00:01:00Z".into(),
+                independent_count: 1,
+                confidence: 0.6,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Before the hypothesis's due date: must still be silently pending,
+        // not resolved by the self-served outcome.
+        let summary_before_due = run_calibration(&store, &lease, "2026-09-06T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            summary_before_due.resolved, 0,
+            "a self-served outcome from the same agent must never resolve the \
+             hypothesis, even though a genuine independent one would have"
+        );
+
+        // Past the due date, with only the self-served outcome on file: the
+        // hypothesis must expire unresolved, never score Correct.
+        let summary_after_due = run_calibration(&store, &lease, "2026-09-10T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(summary_after_due.resolved, 1);
+        assert_eq!(summary_after_due.correct, 0);
+        assert_eq!(
+            summary_after_due.expired, 1,
+            "it must expire unresolved rather than be scored Correct by its \
+             own author's say-so"
+        );
+
+        let events = claims::list_events(&store).await.unwrap();
+        let scores = fold_scores(events.iter());
+        let cc01 = scores.get("cc-01").unwrap();
+        assert_eq!(
+            cc01.correct_count, 0,
+            "cc-01 must gain no correct-resolution credit from grading its own hypothesis"
+        );
+        assert_eq!(
+            cc01.trust_multiplier(),
+            1.0,
+            "expired-only history must stay neutral, never boosted by a \
+             self-manufactured Correct"
         );
     }
 

@@ -60,16 +60,27 @@ someone else acquired it in between, your write loses with `412 Precondition Fai
 and you back off — you never overwrite a lease you didn't win.
 
 **Leases are never put-if-absent.** `resource_key(repo, resource)` (see
-[`hash.rs`](../crates/ctxlake-core/src/hash.rs)) is deterministic, so the *first* time a
-resource is touched, someone has to create its lease object before anyone can
-compare-and-swap it — and MinIO rejects the `If-None-Match: *` primitive that a naive
-"create if it doesn't exist yet" design would reach for
-([minio/minio#20346](https://github.com/minio/minio/issues/20346), closed "working as
-intended"). `ctxlake init` (or the first `doctor` run against a fresh bucket) seeds
-every lease object a fleet might need as `free` up front, so acquisition is *always* a
-CAS update against an existing object, never a create against an absent one, on every
-backend ctxlake supports. See [storage.md](storage.md) for the full capability matrix
-behind that decision.
+[`hash.rs`](../crates/ctxlake-core/src/hash.rs)) hashes whatever string a human types at
+claim time — `crates/oxidant-loom/**` today, something nobody has typed yet tomorrow.
+That rules out pre-seeding: `ctxlake init` cannot write a `free` lease object for a
+resource that has no identity until someone runs `ctxlake claim` on it, so bootstrap
+has to happen lazily, on first touch, not up front at init time.
+
+Bootstrap is a plain, unconditional `PUT`, not a CAS write: a `GET` on
+`live/leases/<resource_key>.json` that comes back `404` is followed by writing
+`{status: free}` with no condition attached, then a re-read to obtain a version before
+attempting the real acquire. It can't lean on put-if-absent either — MinIO rejects the
+`If-None-Match: *` primitive a naive "create if it doesn't exist yet" design would
+reach for ([minio/minio#20346](https://github.com/minio/minio/issues/20346), closed
+"working as intended") — so the unconditional `PUT` is the only move left, and it works
+only because an overwrite here is harmless: two agents racing to be first on the same
+never-claimed resource may both take this branch and both `PUT`, but both write
+identical content (`free`, no owner), so whichever write lands last is
+indistinguishable from the other and nothing is lost by losing that race. The write
+that actually matters — flipping `free` to `held` — is still the CAS update described
+above, from a version just read, so two agents can never both come away believing they
+hold the same lease. Bootstrap tolerates a race that acquisition does not. See
+[storage.md](storage.md) for the full capability matrix behind that split.
 
 Renewal is the same CAS write repeated before `expires_at`, at a shorter interval than
 the TTL (60s renewal against a 5-minute TTL by default — see the knob table in

@@ -37,16 +37,32 @@ specifically on the one that ships as everyone's local dev and CI environment.
 
 `If-Match`/`ifGenerationMatch`/rename+flock is the row every backend has in common. So
 ctxlake's lease protocol (AGENTS.md invariant 4, detailed in
-[coordination.md](coordination.md)) is built entirely on CAS: every lease object is
-seeded to `free` at init time and acquired by *updating* it, never by *creating* it.
-"A lease object always exists; its contents say free or held" is not a stylistic
-choice — it's the direct consequence of this table having no row where put-if-absent
-is universal.
+[coordination.md](coordination.md)) is built entirely on CAS for acquisition: a lease
+is always *updated*, never *created*, once it exists. "A lease object always exists;
+its contents say free or held" is not a stylistic choice — it's the direct consequence
+of this table having no row where put-if-absent is universal.
 
-The same reasoning governs `live/agents/*.json` (roster heartbeats, also CAS-updated
-after first creation by `ctxlake init`) and the `snapshot/*/current.json` pointer swap
-(also CAS — the content-addressed blob underneath it is written once and never
-touched again, so it needs no conditional write at all).
+That still leaves a question this table doesn't answer by itself: how does a lease
+object's *first* version come to exist, given that `resource_key(repo, resource)`
+(`crates/ctxlake-core/src/hash.rs`) hashes an arbitrary string a human supplies at
+claim time? `ctxlake init` cannot pre-seed a resource nobody has named yet — the space
+of possible resources is unbounded user input, not a fixed set. The answer is that
+bootstrap uses neither primitive in the matrix above: the first time a `GET` on the key
+comes back `404`, the client writes `{status: free}` with a plain, unconditional `PUT`
+— no condition attached — and re-reads it to get a version before the real, CAS-guarded
+acquire. Two agents can race that first `PUT` and both "win," harmlessly, because
+either one writes identical content; see [coordination.md](coordination.md) for why
+that race costs nothing while the CAS-guarded acquire that follows still admits exactly
+one winner.
+
+`live/agents/*.json` (roster heartbeats) bootstraps the same unconditional-`PUT` way,
+for a different reason: an agent's own roster key has exactly one writer, ever
+(invariant 3), so its first heartbeat has no peer to race against, and every later one
+CASes off the version last read as a self-consistency check rather than as protection
+from a writer that was never going to show up. The `snapshot/*/current.json` pointer
+swap is the one object in this section that really is seeded once, at publish time by
+`ctxlake maint` — its content-addressed blob is written once and never touched again,
+so it needs no conditional write at all.
 
 ## `doctor` executes the primitives, it does not assume them
 

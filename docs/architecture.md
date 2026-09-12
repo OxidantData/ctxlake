@@ -113,7 +113,7 @@ twice at once rather than being made atomic.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Free: seeded at ctxlake init (never put-if-absent — storage.md)
+    [*] --> Free: lazily created on first claim\n(unconditional PUT, not put-if-absent — storage.md)
     Free --> Held: CAS PutMode::Update(version)\ncontents: {status: held, owner, expires_at}
     Held --> Held: renew before expiry\nCAS from the version last read
     Held --> Free: explicit release\nCAS write back to free
@@ -121,11 +121,14 @@ stateDiagram-v2
     Expired --> Held: any agent may CAS-acquire\n(advisory — no fencing check on the old holder)
 ```
 
-Every arrow in this diagram is the *same* primitive: a CAS write against a version you
-just read. There is no separate "lock" API — a lease is just a JSON object whose
-contents happen to mean something, and the whole reason it can be reasoned about this
-simply is that nothing here ever uses put-if-absent (storage.md) or a local clock
-(invariant 6).
+Every arrow *after* bootstrap is the same primitive: a CAS write against a version you
+just read. The `[*] --> Free` arrow is the one exception — an unconditional `PUT`, not
+a CAS write, because there is nothing yet to hold a version to compare against (see
+[storage.md](storage.md) for why that's still safe). Past that first write, there is no
+separate "lock" API — a lease is just a JSON object whose contents happen to mean
+something, and the whole reason the rest of the machine can be reasoned about this
+simply is that acquisition, renewal, and release never use put-if-absent (storage.md)
+or a local clock (invariant 6).
 
 ## Where does my data actually go — a worked trace
 

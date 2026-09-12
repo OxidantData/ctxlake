@@ -40,14 +40,15 @@ cost/day  = LISTs × $0.005/1000  +  GETs × $0.0004/1000
 
 | Fleet size | `LIST`s/day | `GET`s/day | Cost/day |
 |---|---|---|---|
-| 5 agents | 86,400 | 345,600 | $0.43 + $0.14 ≈ **$0.60/day** |
-| 20 agents | 345,600 | 6,566,400 | $1.73 + $2.63 ≈ **$4.49/day** |
-| 50 agents | 864,000 | 42,336,000 | $4.32 + $16.93 ≈ **$21.6/day** (~$650/mo) |
+| 5 agents | 86,400 | 345,600 | $0.43 + $0.14 ≈ **$0.57/day** |
+| 20 agents | 345,600 | 6,566,400 | $1.73 + $2.63 ≈ **$4.35/day** |
+| 50 agents | 864,000 | 42,336,000 | $4.32 + $16.93 ≈ **$21.25/day** (~$640/mo) |
 
-(The discovery math alone lands a few percent under these figures — $0.57, $4.35,
-$21.25 — with the rest coming from the roster heartbeat `PUT`s every agent issues
-regardless of discovery strategy. The table above is the total observed cost, since
-that's the number that shows up on a bill.)
+(This is LIST-then-GET discovery traffic only — the sum of the two columns to its
+left, nothing more. Each agent's own heartbeat `PUT` is `O(N)` under either discovery
+strategy on this page, naive or fan-in, so it is excluded from both totals rather than
+folded into one and not the other; the fan-in section below makes the same exclusion
+explicitly, for the same reason.)
 
 The `N(N-1)` term is the problem, not the constant factor: doubling the fleet
 roughly quadruples the discovery cost, because everyone is now checking on everyone.
@@ -59,27 +60,33 @@ consumer fetch every producer directly — fan the producers **in** to one share
 and have every consumer read that one object instead.
 
 Concretely: agents still each write their own heartbeat (that traffic is `O(N)` either
-way, and is not part of this comparison). Once per poll cycle, one aggregation step
-does a single `LIST` of `live/agents/`, `GET`s each of the `N` heartbeats to merge them,
-and `PUT`s one merged roster snapshot. Every agent then reads *that one snapshot*
-instead of its `N-1` peers directly — one `GET` each.
+way, and is not part of this comparison — same exclusion as the naive total above).
+Once per poll cycle, one aggregation step does a single `LIST` of `live/agents/`,
+`GET`s each of the `N` heartbeats to merge them, and `PUT`s one merged roster snapshot.
+Every agent then reads *that one snapshot* instead of its `N-1` peers directly — one
+`GET` each. That merged-snapshot `PUT` is cost the naive scheme never pays — it exists
+only because fan-in introduces an aggregation step — so unlike the heartbeat traffic
+excluded above, it belongs in this model.
 
 ```text
-LISTs/day (aggregation, once/cycle) = 17,280
+LISTs/day (aggregation, once/cycle)     = 17,280
+PUTs/day  (merged snapshot, once/cycle) = 17,280
 GETs/day  = 2N × 17,280   (N to build the snapshot, N for agents to read it)
 
-cost/day  = LISTs × $0.005/1000  +  GETs × $0.0004/1000
-          = $0.0864  +  N × $0.0138
+cost/day  = (LISTs + PUTs) × $0.005/1000  +  GETs × $0.0004/1000
+          = $0.0864 + $0.0864  +  N × $0.0138
+          = $0.1728  +  N × $0.0138
 ```
 
 | Fleet size | Cost/day |
 |---|---|
-| 5 agents | $0.0864 + 5 × $0.0138 ≈ **$0.16/day** |
-| 20 agents | $0.0864 + 20 × $0.0138 ≈ **$0.36/day** |
-| 50 agents | $0.0864 + 50 × $0.0138 ≈ **$0.78/day** (~$23/mo) |
+| 5 agents | $0.1728 + 5 × $0.0138 ≈ **$0.24/day** |
+| 20 agents | $0.1728 + 20 × $0.0138 ≈ **$0.45/day** |
+| 50 agents | $0.1728 + 50 × $0.0138 ≈ **$0.86/day** (~$26/mo) |
 
-Same fleet, same freshness interval, **28x cheaper at 50 agents** — because discovery
-went from `O(N²)` GETs to `O(N)`. This is the entire justification for the roster
+Same fleet, same freshness interval, **~25x cheaper at 50 agents** — because discovery
+went from `O(N²)` GETs to `O(N)`, even after counting the aggregation `PUT` that fan-in
+adds and the naive scheme never pays. This is the entire justification for the roster
 being a fanned-in snapshot in `live/` rather than something every agent's daemon
 reconstructs independently.
 

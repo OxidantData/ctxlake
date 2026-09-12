@@ -1,9 +1,12 @@
 # Claude Code — hook mapping, injection, blocking, coexistence
 
-Claude Code is the reference implementation: every row in this doc is verified against
-a real install, and every other runtime's doc measures itself against this one. If a
-capability here is missing on another runtime, that runtime's doc says so explicitly
-rather than implying parity it doesn't have.
+Claude Code is the reference runtime: every other runtime's doc measures itself against
+this one. **Nothing below is implemented yet** — `ctxlake-hook` is still the Wave 1
+scaffold (`crates/ctxlake-hook/src/main.rs` prints "not yet implemented" and exits 0) —
+so this is a specification written from Claude Code's published hook documentation,
+not a report of a working install. Re-verify every row here against a real install
+once the adapter lands; until then, "reference" says which runtime the other two are
+compared to, not that this page has been tested.
 
 ## Config file and mechanism
 
@@ -69,8 +72,9 @@ followed by `ctxlake uninstall` exact rather than "close enough" (invariant 8).
 
 ## Known gaps
 
-None that affect the capability matrix above — this is the reference implementation.
-Two narrower things worth knowing:
+None known from reading Claude Code's hook documentation — but see the status note at
+the top: "none known" means "none found on paper," not "none found by running it,"
+since nothing above has run yet. Two narrower things worth knowing regardless:
 
 - Hooks see only the *final* result of a tool call, not intermediate streaming output —
   a long-running `Bash` command's captured `tool.result` is what Claude Code itself

@@ -11,15 +11,24 @@ authors.workspace = true
 [dependencies]
 ctxlake-core = { path = "../ctxlake-core" }
 ctxlake-store = { path = "../ctxlake-store" }
+# ctxlake-sync already owns the one definition of the Envelope<->Parquet codec
+# (see its codec.rs doc comment); extraction reads sealed `sessions/` segments to
+# build a session's transcript and reuses that decoder rather than growing a
+# second, driftable copy of the same Arrow/Parquet schema in this crate.
+ctxlake-sync = { path = "../ctxlake-sync" }
+object_store.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 rusqlite.workspace = true
 reqwest.workspace = true
 time.workspace = true
+futures.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

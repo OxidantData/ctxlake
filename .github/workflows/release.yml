@@ -185,7 +185,8 @@ jobs:
 
       # `gh release view` first rather than assuming either state: this is
       # what makes the workflow safe to dispatch again for the same tag
-      # (uploads `--clobber` onto the existing release) and, on a repo with no
+      # (tops up a partially-uploaded release, never replacing what is already
+      # published) and, on a repo with no
       # release at all yet, takes the `create` branch with no special case —
       # the "must not fail on a repo with no release yet" requirement this
       # workflow carries.
@@ -193,8 +194,28 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "release $TAG already exists — uploading (clobbering same-named assets)"
-            gh release upload "$TAG" dist/* --repo "${{ github.repository }}" --clobber
+            # Published artifacts are immutable. This workflow can legitimately run
+            # twice for one tag — a tag push and an explicit dispatch both fire it,
+            # and the concurrency group serialises rather than dedupes them — and Rust
+            # builds are not byte-reproducible, so the second run's archives differ
+            # from the first's. `--clobber` therefore replaced archives that were
+            # already published, which broke every checksum anyone had read in the
+            # meantime: the Homebrew formula rendered by run A pointed at bytes run B
+            # had overwritten, and `brew install` failed on a checksum mismatch for a
+            # release that looked complete and green.
+            #
+            # So: if the release already carries a full set, this run has nothing to
+            # add and says so. A *partial* set — a run that died mid-upload — still
+            # gets topped up, which is the case re-running is actually for.
+            have=$(gh release view "$TAG" --repo "${{ github.repository }}" \
+                     --json assets --jq '[.assets[].name] | length')
+            want=$(ls dist | wc -l | tr -d ' ')
+            if [ "$have" -ge "$want" ]; then
+              echo "::notice::release $TAG already has $have/$want assets — leaving them alone"
+              exit 0
+            fi
+            echo "release $TAG has $have/$want assets — uploading the missing ones"
+            gh release upload "$TAG" dist/* --repo "${{ github.repository }}"
           else
             echo "creating release $TAG"
             gh release create "$TAG" dist/* \

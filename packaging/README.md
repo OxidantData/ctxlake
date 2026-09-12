@@ -47,3 +47,20 @@ for t in aarch64-apple-darwin x86_64-apple-darwin \
 done
 bash packaging/render-formula.sh 0.1.0 /tmp/shas | ruby -c -
 ```
+
+## Releasing twice for one tag is safe, and used not to be
+
+Both a tag push and `gh workflow run release.yml` fire this workflow, and the
+concurrency group serialises them rather than deduping — so one tag can genuinely
+produce two builds. Rust builds are not byte-reproducible, so those two builds
+produce different archives.
+
+The release job used to upload with `--clobber`, which meant the second run replaced
+archives the first had already published. Anything that read the release in between
+was then wrong about its contents: for v0.1.4 the Homebrew formula was rendered from
+run A's checksums, run B overwrote the archives, and `brew install` failed with a
+checksum mismatch against a release that looked complete and green.
+
+Published artifacts are now immutable. A run that finds a complete asset set exits
+saying so; one that finds a partial set — a previous run that died mid-upload — tops
+up only what is missing. Re-running a release is a no-op rather than a rewrite.

@@ -276,7 +276,7 @@ Everything below `agent_id` is optional and defaults exactly as shown. A file wi
 
 ### Credentials
 
-Resolved in this order, first match wins:
+Resolved the way the AWS CLI resolves them, first match wins:
 
 | Source | Notes |
 |---|---|
@@ -290,8 +290,20 @@ Resolved in this order, first match wins:
 > mechanism when it spots one instead of reporting an unhelpful "store unreachable".
 
 The daemon installed by `ctxlake sync install` has no shell, so it never sees an
-exported variable — it reads `~/.aws/credentials` under the `HOME` the unit pins.
-That is the case worth checking before you rely on a supervised daemon.
+exported variable — it reads `~/.aws/credentials` under the `HOME` the unit pins. If
+your `default` profile is not the identity that owns the bucket, set `AWS_PROFILE`
+somewhere the service will see it, or make the right profile the default.
+
+`ctxlake doctor` prints which identity it resolved, on success and on failure, and
+tells a `403` apart from a network error — on a machine with more than one account
+configured those look identical otherwise:
+
+```text
+backend: AWS S3
+  credentials: profile "default" from ~/.aws/credentials (the default, since AWS_PROFILE is not set)
+  UNREACHABLE: ... 403 Forbidden ... AccessDenied
+      -> this is an authorization failure, not a network one — the request was signed and refused.
+```
 
 ### `[summarize]`
 

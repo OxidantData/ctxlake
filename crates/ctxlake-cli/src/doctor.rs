@@ -162,12 +162,32 @@ impl Report {
         println!("store   {}", self.store_url);
         if let Some(backend) = &self.backend {
             println!("backend: {}", backend.kind);
+            if self.store_url.starts_with("s3://") || self.store_url.starts_with("s3a://") {
+                // Printed whether or not the store is reachable: knowing which
+                // identity ctxlake will use is the thing you want *before* it fails,
+                // and the thing nobody can otherwise find out.
+                println!(
+                    "  credentials: {}",
+                    ctxlake_store::aws_profile::describe_source()
+                );
+            }
             for caveat in &backend.caveats {
                 println!("  caveat: {caveat}");
             }
         }
         if !self.reachable {
             println!("  UNREACHABLE: {}", self.reachable_detail);
+            // A 403 means the request was signed and refused, which is a completely
+            // different problem from a network failure and has a completely different
+            // fix — but the raw error looks like neither. Say which identity signed
+            // it, because on a machine with more than one AWS account configured
+            // "Access Denied" and "wrong profile" are indistinguishable.
+            if let Some(d) = ctxlake_store::aws_profile::diagnose(&self.reachable_detail) {
+                println!("      -> {d}");
+            }
+            if let Some(h) = ctxlake_store::aws_profile::unsupported_profile_hint() {
+                println!("      -> {h}");
+            }
         } else {
             for p in &self.probes {
                 let status = if p.passed { "ok" } else { "FAIL" };

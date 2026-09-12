@@ -146,6 +146,66 @@ pub fn unsupported_profile_hint() -> Option<String> {
     None
 }
 
+/// Which credential source ctxlake will actually use, in words, for `doctor`.
+///
+/// The single most useful line in a failed S3 diagnosis, and the one that was
+/// missing: a 403 tells you the request was signed and rejected, but not *whose*
+/// identity signed it. On a machine with more than one AWS account configured —
+/// which is most machines — "Access Denied" and "you are using the wrong profile"
+/// look identical.
+pub fn describe_source() -> String {
+    if std::env::var_os("AWS_ACCESS_KEY_ID").is_some() {
+        return "environment variables (AWS_ACCESS_KEY_ID)".to_string();
+    }
+    let profile = profile_name();
+    let via = if std::env::var_os("AWS_PROFILE").is_some() {
+        "AWS_PROFILE"
+    } else {
+        "the default, since AWS_PROFILE is not set"
+    };
+    if load().is_some() {
+        format!("profile {profile:?} from ~/.aws/credentials ({via})")
+    } else {
+        format!(
+            "no static credentials found for profile {profile:?} ({via}) — \
+             falling back to an instance or container role"
+        )
+    }
+}
+
+/// Turn a store error into an actionable sentence when it is recognisably about
+/// credentials rather than the network.
+///
+/// Returns `None` for anything it cannot confidently classify: a wrong guess here
+/// sends someone to fix the thing that was not broken, which is worse than the raw
+/// error they would otherwise have read.
+pub fn diagnose(detail: &str) -> Option<String> {
+    let source = describe_source();
+    if detail.contains("403") || detail.contains("AccessDenied") {
+        return Some(format!(
+            "this is an authorization failure, not a network one — the request was \
+             signed and refused.\n      Signed with: {source}\n      Either that \
+             identity lacks s3:PutObject/GetObject/ListBucket on this bucket, or it is \
+             the wrong account. Credentials resolve the way the AWS CLI resolves them: \
+             environment first, then ~/.aws/credentials, then an instance role."
+        ));
+    }
+    if detail.contains("169.254.169.254") {
+        return Some(format!(
+            "no credentials were found, so it tried the EC2 instance metadata service \
+             and timed out.\n      Looked for: {source}"
+        ));
+    }
+    if detail.contains("NoSuchBucket") || detail.contains("404") {
+        return Some(
+            "the bucket does not exist, or is in a different region than the \
+                     one resolved."
+                .to_string(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +241,31 @@ mod tests {
         // error that looks nothing like its cause.
         let c = parse_ini("[default]\naws_secret_access_key = abc/def+ghi=\n");
         assert_eq!(c["default"]["aws_secret_access_key"], "abc/def+ghi=");
+    }
+
+    #[test]
+    fn a_403_is_diagnosed_as_authorization_not_as_a_network_problem() {
+        let d = diagnose("Server returned non-2xx status code: 403 Forbidden: AccessDenied")
+            .expect("a 403 must be classified");
+        assert!(d.contains("authorization failure"), "{d}");
+        assert!(
+            d.contains("~/.aws/credentials"),
+            "it must name where credentials come from: {d}"
+        );
+    }
+
+    #[test]
+    fn an_imds_timeout_is_diagnosed_as_missing_credentials() {
+        let d = diagnose("Error performing PUT http://169.254.169.254/latest/api/token")
+            .expect("an IMDS timeout must be classified");
+        assert!(d.contains("no credentials were found"), "{d}");
+    }
+
+    #[test]
+    fn an_unrecognised_error_is_left_alone() {
+        // Guessing sends someone to fix what was not broken.
+        assert_eq!(diagnose("connection reset by peer"), None);
+        assert_eq!(diagnose(""), None);
     }
 
     #[test]

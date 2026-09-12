@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for the ctxlake sync daemon.
+
+  Rendered by `ctxlake sync install` into
+  ~/Library/LaunchAgents/com.oxidantdata.ctxlake-sync.plist.
+  Placeholders: {{EXEC}} {{HOME}} {{FLEET_ID}} {{AGENT_ID}} {{LOG_DIR}}
+
+  A LaunchAgent, not a LaunchDaemon: agents run as the logged-in user, which is whose
+  spool and credentials this needs. A daemon runs as root and would reach neither.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.oxidantdata.ctxlake-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{EXEC}}</string>
+    <string>sync</string>
+    <string>run</string>
+    <!-- launchd owns supervision, so the daemon must not fork away from it. -->
+    <string>--foreground</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CTXLAKE_FLEET_ID</key><string>{{FLEET_ID}}</string>
+    <key>CTXLAKE_AGENT_ID</key><string>{{AGENT_ID}}</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>{{HOME}}</string>
+
+  <!-- Start at login. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart on crash but NOT after a clean exit, so `ctxlake sync stop` stays
+       stopped. A bare <true/> here would make stopping the daemon impossible. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- launchd's default is 10s, which turns a persistent failure into a tight loop
+       that floods the log. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/sync.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

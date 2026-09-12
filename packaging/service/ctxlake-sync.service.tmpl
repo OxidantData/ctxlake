@@ -1,0 +1,48 @@
+# systemd user unit for the ctxlake sync daemon.
+#
+# Rendered by `ctxlake sync install` into ~/.config/systemd/user/ctxlake-sync.service.
+# Placeholders: {{EXEC}} {{HOME}} {{FLEET_ID}} {{AGENT_ID}}
+#
+# A USER unit, not a system one: the daemon reads this user's spool and writes with
+# this user's store credentials. A system unit would run as root and reach neither.
+#
+# Reboot survival needs `loginctl enable-linger <user>`. Without it a user manager
+# stops at logout, so on a headless host the service would silently not come back —
+# `ctxlake sync install` checks lingering and says so rather than leaving you to find
+# out after a reboot.
+
+[Unit]
+Description=ctxlake sync — ships the local spool to the lake and refreshes the cache
+Documentation=https://ctxlake.oxidantdata.com/cli.html
+After=network-online.target
+Wants=network-online.target
+# The daemon backs off on its own; systemd's start limiter would fight that and give
+# up permanently after a handful of restarts during, say, a long network outage.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# --foreground: systemd owns supervision, so the daemon must not fork away from it.
+ExecStart={{EXEC}} sync run --foreground
+WorkingDirectory={{HOME}}
+Environment="CTXLAKE_FLEET_ID={{FLEET_ID}}"
+Environment="CTXLAKE_AGENT_ID={{AGENT_ID}}"
+
+# on-failure, not always: `ctxlake sync stop` exits 0 and must stay stopped.
+Restart=on-failure
+RestartSec=5
+# 78 is EX_CONFIG — a missing or invalid ctxlake.toml. Restarting cannot fix that, and
+# a restart loop would bury the real error in the journal.
+RestartPreventExitStatus=78
+
+KillMode=mixed
+KillSignal=SIGTERM
+# The daemon flushes its spool and releases its presence entry on SIGTERM. Cutting it
+# short costs the flush, so give it room.
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,154 @@
+{
+  "$comment": [
+    "Shared redaction test vectors, consumed by BOTH implementations:",
+    "  - Rust:   crates/ctxlake-core/src/redact.rs",
+    "  - Python: adapters/hermes/_redact.py",
+    "",
+    "Why this file exists. The Hermes adapter runs in-process in Python and cannot call",
+    "the Rust redactor, so the logic is necessarily written twice. Two copies of a",
+    "security control with no shared test is a silent-divergence machine: the Python",
+    "half could stop catching a pattern and every Hermes session would leak it while",
+    "Claude Code sessions stayed clean, with nothing failing anywhere.",
+    "",
+    "So the expectations here are stated at the SPEC level — an outcome and the rule",
+    "family that produced it — not captured from either implementation's output. If they",
+    "were generated from the Rust side, Rust would define truth by construction and",
+    "drift in that direction would be invisible.",
+    "",
+    "Adding a case: add it here first, then make both sides pass. A case that only one",
+    "language can satisfy is a spec disagreement worth resolving, not a vector to split.",
+    "",
+    "Keep credential vectors obviously synthetic. The redactor matches on the prefix, so",
+    "a realistic body buys nothing — and a realistic one trips GitHub push protection,",
+    "which blocked this file on its first push. AKIAIOSFODNN7EXAMPLE stays because it is",
+    "AWS's own published example and scanners allowlist it."
+  ],
+  "outcomes": {
+    "clean": "no rule matched; content is stored verbatim",
+    "redacted": "spans were replaced; the surviving content is safe to store",
+    "quarantined": "the whole value is withheld and routed to quarantine/"
+  },
+  "vectors": [
+    {
+      "name": "plain_prose",
+      "input": "I refactored the Glue catalog to stop shelling out to the AWS CLI.",
+      "is_tool_output": true,
+      "expect": "clean",
+      "why": "Ordinary work description. Over-redacting this guts the episodic layer."
+    },
+    {
+      "name": "anthropic_key",
+      "input": "export ANTHROPIC_API_KEY=sk-ant-api03-NOTAREALKEY",
+      "is_tool_output": true,
+      "expect": "quarantined",
+      "rule_family": "marker",
+      "why": "Known key prefix. The whole value goes, because guessing where a secret ends is how redactors leak."
+    },
+    {
+      "name": "aws_access_key_id",
+      "input": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+      "is_tool_output": true,
+      "expect": "quarantined",
+      "rule_family": "marker",
+      "why": "AWS's own documentation example value; shape is what matters, not the value."
+    },
+    {
+      "name": "github_pat",
+      "input": "token: ghp_NOTAREALTOKEN_SYNTHETIC_FIXTURE",
+      "is_tool_output": true,
+      "expect": "quarantined",
+      "rule_family": "marker"
+    },
+    {
+      "name": "pem_header",
+      "input": "-----BEGIN RSA PRIVATE KEY-----",
+      "is_tool_output": true,
+      "expect": "quarantined",
+      "rule_family": "marker",
+      "why": "The header alone is enough; we never need to see key material to act."
+    },
+    {
+      "name": "authorization_header",
+      "input": "Authorization: Bearer abc.def.ghi",
+      "is_tool_output": true,
+      "expect": "quarantined",
+      "rule_family": "marker",
+      "why": "A curl echoing its own headers is a common real-world leak path."
+    },
+    {
+      "name": "slack_bot_token",
+      "input": "SLACK=xoxb-NOT-A-REAL-TOKEN-SYNTHETIC-FIXTURE",
+      "is_tool_output": true,
+      "expect": "quarantined",
+      "rule_family": "marker"
+    },
+    {
+      "name": "high_entropy_in_tool_output",
+      "input": "DB_PASS=k3Jx9QfZ2mNpR7vTbY4wL8sH1dG6cV0aE5uI3oP9zXrK",
+      "is_tool_output": true,
+      "expect": "redacted",
+      "rule_family": "entropy",
+      "why": "No known prefix, so only entropy catches it. This is the cat-.env case."
+    },
+    {
+      "name": "high_entropy_in_prose_is_left_alone",
+      "input": "DB_PASS=k3Jx9QfZ2mNpR7vTbY4wL8sH1dG6cV0aE5uI3oP9zXrK",
+      "is_tool_output": false,
+      "expect": "clean",
+      "why": "Same bytes, different channel. Entropy applies to tool output only: prose false-positives silently destroy the content that makes a briefing useful. Having both directions of this pair in the corpus is the point — an implementation that applies entropy everywhere passes the case above and fails this one."
+    },
+    {
+      "name": "git_sha_survives",
+      "input": "commit a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+      "is_tool_output": true,
+      "expect": "clean",
+      "why": "Long and hex, but the episodic layer is built out of these."
+    },
+    {
+      "name": "file_path_survives",
+      "input": "crates/oxidant-loom/src/catalog_bridge.rs",
+      "is_tool_output": true,
+      "expect": "clean"
+    },
+    {
+      "name": "cargo_command_survives",
+      "input": "running cargo test -p oxidant-connect --all-features",
+      "is_tool_output": true,
+      "expect": "clean",
+      "why": "Friction detection reads commands like this; redacting them blinds it."
+    },
+    {
+      "name": "empty_input",
+      "input": "",
+      "is_tool_output": true,
+      "expect": "clean",
+      "why": "Must not panic or throw. A hook that dies takes the user's turn with it."
+    },
+    {
+      "name": "multibyte_only",
+      "input": "ééééééééééééééééééééééééééééééééééééééééééé",
+      "is_tool_output": true,
+      "expect": "clean",
+      "why": "Scan caps slice the input; slicing through a multi-byte character must not panic."
+    }
+  ],
+  "denied_paths": {
+    "$comment": "Reading OR writing these has its value withheld. The write direction matters: a Write tool call puts the secret in tool.input, not tool.result.",
+    "denied": [
+      "/home/alice/.aws/credentials",
+      "/home/alice/.aws/config",
+      "/home/alice/.ssh/id_ed25519",
+      "/home/alice/.netrc",
+      "/home/alice/.npmrc",
+      "/home/alice/.docker/config.json",
+      "/home/alice/.kube/config",
+      "/etc/secrets/token",
+      "/var/vault/approle"
+    ],
+    "allowed": [
+      "/home/alice/projects/ctxlake/README.md",
+      "/home/alice/projects/ctxlake/crates/ctxlake-core/src/redact.rs",
+      "/tmp/build.log"
+    ]
+  }
+}

@@ -24,25 +24,21 @@ pub fn config_home() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".config"))
 }
 
-/// `$XDG_DATA_HOME`, or `~/.local/share` — where the spool and cache live
-/// (docs/architecture.md's component table).
-pub fn data_home() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".local").join("share"))
-}
-
 /// Where `ctxlake init` writes `ctxlake.toml` by default, and where every other
 /// subcommand looks for it unless `--config` overrides the path.
 pub fn default_config_path() -> PathBuf {
     config_home().join("ctxlake").join("ctxlake.toml")
 }
 
-/// `~/.local/share/ctxlake/cache/<fleet_id>/` — refreshed by `ctxlake sync`'s
-/// store-to-cache leg. `ctxlake-hook` and `ctxlake-mcp` read it; nothing in this
-/// crate writes to it, only reads, since populating it is the daemon's job.
+/// One fleet's cache slice, resolved by [`ctxlake_core::paths`] so this crate cannot
+/// drift from the daemon that writes it or the MCP server that also reads it.
+///
+/// This used to resolve to `~/.local/share/ctxlake/cache/<fleet_id>/` while every other
+/// crate used `~/.ctxlake/cache/`. Both were self-consistent, nothing failed, and
+/// `ctxlake status` would have reported "no cache" forever against a cache the daemon
+/// was faithfully writing a few directories away.
 pub fn cache_dir(fleet_id: &str) -> PathBuf {
-    data_home().join("ctxlake").join("cache").join(fleet_id)
+    ctxlake_core::paths::fleet_cache_dir(fleet_id)
 }
 
 /// The spool root `ctxlake-hook` actually appends to and `ctxlake sync` drains:

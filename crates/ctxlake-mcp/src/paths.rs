@@ -10,8 +10,7 @@
 //! `ctxlake-hook` already established `~/.ctxlake/spool` (overridable with
 //! `CTXLAKE_SPOOL_DIR`) as the real, implemented spool root — see
 //! `crates/ctxlake-hook/src/spool.rs`. This module points at that same root rather
-//! than the fleet-scoped `~/.local/share/ctxlake/...` path `architecture.md`
-//! describes as the target layout: a daemon that eventually drains both the hook's
+//! than a second, separately-resolved root: a daemon that eventually drains both the hook's
 //! and this crate's spool output needs one tree, not two, and the hook's tree is
 //! the one that already exists on disk. `docs/mcp.md` says so plainly, since
 //! papering over a gap between docs and the actual on-disk layout is exactly the
@@ -31,19 +30,11 @@
 
 use std::path::PathBuf;
 
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 /// Where write-shaped tool calls (`fleet_claim`, `fleet_release`, `fleet_handoff`,
 /// `memory_propose`) queue their output for `ctxlake sync` to apply. Same root and
 /// same env var `ctxlake-hook` uses, so one daemon drains one tree.
 pub fn spool_root() -> PathBuf {
-    std::env::var_os("CTXLAKE_SPOOL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".ctxlake").join("spool"))
+    ctxlake_core::paths::spool_root()
 }
 
 /// Where read-shaped tool calls (`fleet_status`, `fleet_history`, `memory_search`,
@@ -51,9 +42,7 @@ pub fn spool_root() -> PathBuf {
 /// most recently refreshed. Nothing writes here yet in this codebase — every
 /// reader must treat a missing file as "not synced yet," not as a bug.
 pub fn cache_root() -> PathBuf {
-    std::env::var_os("CTXLAKE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".ctxlake").join("cache"))
+    ctxlake_core::paths::cache_root()
 }
 
 /// Logical fleet identity, stable across restarts. `ctxlake-core`'s envelope

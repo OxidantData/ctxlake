@@ -51,11 +51,10 @@ happens (AGENTS.md invariant 5); a tool that can't even complete the round trip 
 more careful about its claims, not less.
 
 The on-disk root is `~/.ctxlake/{spool,cache}` (override with `CTXLAKE_SPOOL_DIR` /
-`CTXLAKE_CACHE_DIR`), the same spool root `ctxlake-hook` already writes to — not the
-fleet_id/agent_id-scoped `~/.local/share/ctxlake/...` path `architecture.md` describes as
-the eventual target layout. One daemon will need to drain both the hook's and this
-server's output; pointing at two different trees today would just mean rebuilding that
-merge later for no benefit now.
+`CTXLAKE_CACHE_DIR`), resolved through `ctxlake_core::paths` — the single definition every
+crate shares. Cache reads are scoped per fleet (`<cache_root>/<fleet_id>/`), because one
+host can legitimately run agents in more than one fleet and an unscoped roster would have
+them overwrite each other's view of who is active.
 
 ## Wiring it up
 

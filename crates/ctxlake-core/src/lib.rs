@@ -6,8 +6,10 @@
 
 pub mod envelope;
 pub mod hash;
+pub mod paths;
 pub mod redact;
 
 pub use envelope::{Envelope, EventType, Runtime, SCHEMA_VERSION};
 pub use hash::content_hash;
+pub use paths::{cache_root, fleet_cache_dir, spool_root};
 pub use redact::{RedactionOutcome, Redactor};

@@ -56,20 +56,32 @@ Python plugins first, then shell hooks, and the first valid directive wins.
 # ~/.hermes/config.yaml
 hooks:
   on_session_start:
-    - command: ctxlake-hook on_session_start hermes
+    - command: env CTXLAKE_FLEET_ID=myteam CTXLAKE_AGENT_ID=herm-01 ctxlake-hook on_session_start hermes
   pre_llm_call:
-    - command: ctxlake-hook pre_llm_call hermes
+    - command: env CTXLAKE_FLEET_ID=myteam CTXLAKE_AGENT_ID=herm-01 ctxlake-hook pre_llm_call hermes
   pre_tool_call:
-    - command: ctxlake-hook pre_tool_call hermes
+    - command: env CTXLAKE_FLEET_ID=myteam CTXLAKE_AGENT_ID=herm-01 ctxlake-hook pre_tool_call hermes
       timeout: 5
       fail_closed: false
   post_tool_call:
-    - command: ctxlake-hook post_tool_call hermes
+    - command: env CTXLAKE_FLEET_ID=myteam CTXLAKE_AGENT_ID=herm-01 ctxlake-hook post_tool_call hermes
   post_llm_call:
-    - command: ctxlake-hook post_llm_call hermes
+    - command: env CTXLAKE_FLEET_ID=myteam CTXLAKE_AGENT_ID=herm-01 ctxlake-hook post_llm_call hermes
   on_session_end:
-    - command: ctxlake-hook on_session_end hermes
+    - command: env CTXLAKE_FLEET_ID=myteam CTXLAKE_AGENT_ID=herm-01 ctxlake-hook on_session_end hermes
 ```
+
+Three details in that command line, none of them decorative:
+
+- **The event and runtime are positional**, `ctxlake-hook <event> <runtime>`. There is no
+  flag parsing in the binary at all.
+- **The event is Hermes's own name**, passed through verbatim. Each runtime's adapter
+  dispatches on that runtime's vocabulary (`PostToolUse`, `postToolUse`,
+  `post_tool_call`); the envelope is where they converge, not the argv.
+- **The env prefix is required.** No hook schema of the three has an `env` key, so a
+  shell-style `VAR=value` prefix is the only way to reach the hook's environment lookup.
+  Without it, events capture fine but land attributed to `unconfigured-fleet` /
+  `unconfigured-agent`.
 
 Each `command:` is `ctxlake-hook <hermes event name> hermes` — positional, matching
 `main.rs`'s `argv[1]` (event) / `argv[2]` (runtime id) contract exactly, not the

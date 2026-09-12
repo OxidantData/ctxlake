@@ -16,7 +16,7 @@ Every process that touches ctxlake data, what it reads, and what it writes:
 | `ctxlake maint` | A subcommand run periodically (cron, systemd timer, or manually). Compacts small Parquet files, runs the claims promotion gate, publishes `snapshot/`. | `sessions/`, `claims/events/`, `live/leases/` | `sessions/` (compacted files), `claims/fleet/`, `snapshot/` | Yes. |
 | `ctxlake-mcp` | The MCP tool server, run as `ctxlake mcp`, a **stdio child process** spawned directly by the coding agent (Claude Code / Cursor's MCP client). One instance per session. | The local **cache** only | Local **spool** (for `memory_propose` and similar write-shaped tool calls — never `live/` or `claims/fleet/` directly) | Never — same discipline as the hook, for the same reason: it's on a path the agent is waiting on. |
 | Local **spool** | `~/.ctxlake/spool/<runtime>/<session_id>.ndjson` | — | Appended to by `ctxlake-hook` and `ctxlake-mcp`; drained by `ctxlake sync` | n/a |
-| Local **cache** | `~/.ctxlake/cache/{briefing,roster,leases}.json` | — | Refreshed by `ctxlake sync`'s store→cache leg; read by `ctxlake-hook` and `ctxlake-mcp` | n/a |
+| Local **cache** | `~/.ctxlake/cache/<fleet_id>/{briefing,roster,leases}.json` | — | Refreshed by `ctxlake sync`'s store→cache leg; read by `ctxlake-hook` and `ctxlake-mcp` | n/a |
 | `live/` | Bucket prefix, control plane | Everyone (roster/lease checks) | `ctxlake sync` (CAS, on behalf of its own host's agent) | — |
 | `sessions/`, `claims/events/` | Bucket prefix, data plane | `ctxlake maint`, any query engine | `ctxlake sync` (single-writer append, one writer per key) | — |
 | `snapshot/` | Bucket prefix, serving plane | Every `ctxlake sync` (store→cache leg) | `ctxlake maint` only | — |
@@ -172,7 +172,7 @@ You run an `Edit` on `crates/foo/src/lib.rs` in a Claude Code session. Fleet is
    `snapshot/briefing/current.json` to point at it.
 9. Back on your laptop, `ctxlake sync`'s store→cache leg notices the pointer changed
    (a conditional GET against `current.json`), fetches the new blob, and writes it to
-   `~/.ctxlake/cache/briefing.json`.
+   `~/.ctxlake/cache/<fleet_id>/briefing.json`.
 10. Next time anyone in `myteam` starts a session, `ctxlake-hook`'s `SessionStart`
     handler reads that exact file — never the store — and injects it as additional
     context.
@@ -184,7 +184,7 @@ either agent's hook process ever making a network call.
 
 | Symptom | First thing to check | Why |
 |---|---|---|
-| Empty briefing at session start | Is `ctxlake sync` running (`ctxlake status`)? Then check the mtime of `~/.ctxlake/cache/briefing.json` | The hook only ever reads the local cache. If the daemon isn't running or hasn't completed a first refresh yet, the file may not exist — the hook fails *open* (no briefing) rather than blocking the session. |
+| Empty briefing at session start | Is `ctxlake sync` running (`ctxlake status`)? Then check the mtime of `~/.ctxlake/cache/<fleet_id>/briefing.json` | The hook only ever reads the local cache. If the daemon isn't running or hasn't completed a first refresh yet, the file may not exist — the hook fails *open* (no briefing) rather than blocking the session. |
 | Peers show up as invisible / roster looks empty | Confirm your own `live/agents/<agent_id>.json` exists and hasn't passed `expires_at`; check the cache's roster refresh timestamp | Presence is inferred from CAS objects under `live/agents/`, mirrored into the local cache on a poll cycle. A peer whose heartbeat hasn't renewed within its TTL is legitimately gone — and a stale local cache produces the identical symptom for a peer that's actually still there. |
 | Local spool keeps growing | `ctxlake status` for the daemon; `ctxlake doctor` for store connectivity; spool directory size | A spool line is only removed after its store write is *confirmed*. A crashed daemon, a network partition, or a store outage all present as unbounded spool growth, because deleting unacknowledged data would break the one durability guarantee this design has. |
 | Hook adds noticeable latency to a tool call | Manually time `ctxlake-hook` against a captured payload; check whether the tool's output is unusually large | Budget is 5ms p99, and a hook that opens a socket is a bug (invariant 1). Slowness is almost always a huge tool-output payload interacting with `MAX_SCAN_BYTES`, a full local disk making the spool append block, or — as an actual bug — network I/O that snuck into the hook path. |

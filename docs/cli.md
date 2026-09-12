@@ -99,7 +99,7 @@ runtimes
   hermes       not found
 
 daemon
-  no cache at /Users/you/.local/share/ctxlake/cache/myteam/roster.json yet — daemon not running, or hasn't completed a first refresh
+  no cache at /Users/you/.ctxlake/cache/myteam/roster.json yet — daemon not running, or hasn't completed a first refresh
   spool backlog: 0 file(s), 0 bytes — /Users/you/.ctxlake/spool
 ```
 
@@ -144,7 +144,7 @@ is enforced by there being nothing to print.
 
 Neither of these can be checked by asking a running process (there isn't one yet to
 ask, in this wave) — `doctor` instead reports what the filesystem shows: the local
-cache's freshness (`~/.local/share/ctxlake/cache/<fleet_id>/roster.json`'s mtime, if it
+cache's freshness (`~/.ctxlake/cache/<fleet_id>/roster.json`'s mtime, if it
 exists at all) and the spool's backlog (file count and total bytes under
 `$CTXLAKE_SPOOL_DIR`, or `~/.ctxlake/spool` if that's unset — the exact root
 `ctxlake-hook` itself appends to, **not** fleet-scoped: the hook has no reliable
@@ -194,8 +194,7 @@ tool via long shell commands with env-var prefixes):
   but not a bare substring search: a command line counts as ctxlake's own only when a
   whitespace-delimited token is exactly `ctxlake-hook` (or ends `/ctxlake-hook`)
   *and* is followed two tokens later by one of the three real runtime args
-  (`claude_code`, `cursor`, `hermes`) — the exact tail `ctxlake-hook <event>
-  <runtime>` this crate always writes. That survives a user's own wrapper around
+  (`claude_code`, `cursor`, `hermes`) — the exact tail `ctxlake-hook <event> <runtime>` this crate always writes. That survives a user's own wrapper around
   the line (`timeout 5 nice -n 19 env ... ctxlake-hook PostToolUse claude_code
   2>>...`) while refusing to touch a foreign tool that merely *mentions*
   `ctxlake-hook` — as an audit tool's own argument, say — which a bare substring
@@ -252,17 +251,12 @@ Each event name is passed as `ctxlake-hook`'s first argument exactly as shown in
 table above — the runtime's own vocabulary for that event, matching the contract in
 `crates/ctxlake-hook/src/main.rs` (argv[1] event, argv[2] runtime id).
 
-> **Hermes capture does not work yet.** `ctxlake install hermes` writes correct,
-> real shell-hook commands into `~/.hermes/config.yaml`, but `ctxlake-hook` itself
-> does not yet normalize a live Hermes payload — `crates/ctxlake-hook/src/adapters/mod.rs`
-> rejects `Runtime::Hermes` outright, and `main.rs`'s own module doc still describes
-> Hermes as the in-process Python plugin (`adapters/hermes/`), not a process
-> `ctxlake-hook` gets spawned for. Until that lands, every wired Hermes event spawns
-> `ctxlake-hook`, which captures nothing and appends a line to
-> `~/.ctxlake/hook-errors.log`. `install` prints this as a warning rather than
-> refusing to run, since the config it writes is already correct for the moment
-> normalization does land — but until then, do not expect `sessions/` to gain any
-> Hermes data from this.
+> **Hermes goes through the same binary.** `ctxlake install hermes` writes shell-hook
+> commands into `~/.hermes/config.yaml`, and `ctxlake-hook` normalizes the resulting
+> payloads via `crates/ctxlake-hook/src/adapters/hermes.rs`. The Python plugin that
+> used to sit in `adapters/hermes/` is gone — a second implementation of the redactor
+> was a divergence risk no test could cover. See
+> [runtimes/hermes.md](runtimes/hermes.md).
 
 
 
@@ -273,7 +267,7 @@ ctxlake status
 ```
 
 ```text
-fleet myteam · 2 agent(s) active · roster 4s old (/Users/you/.local/share/ctxlake/cache/myteam/roster.json)
+fleet myteam · 2 agent(s) active · roster 4s old (/Users/you/.ctxlake/cache/myteam/roster.json)
 
   cc-01  claude_code  github.com/OxidantData/ctxlake  14m
            touching crates/oxidant-catalog-glue/src/lib.rs

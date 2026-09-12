@@ -60,10 +60,18 @@ jobs:
           aws-region: us-east-1
       - run: aws s3 sync dist "s3://${{ vars.DOCS_S3_BUCKET }}" --delete
 
+      # `/*`, not `/docs/*`. The site is served at the distribution root —
+      # `/getting-started.html`, not `/docs/getting-started.html` — so the old path
+      # matched nothing and invalidated nothing. Every deploy reported success,
+      # synced to S3, and left CloudFront serving the previous copy until its TTL
+      # expired: pages were observed 12 hours stale, still documenting a command
+      # that had been removed that morning. A deploy that cannot be seen is not a
+      # deploy, and this one said "success" the whole time.
+      #
       # Conditional because the bucket can be publishing correctly before a
       # distribution is pointed at it. An unset id would otherwise fail the deploy
       # on an `--distribution-id ""` call and hide a successful sync.
       - if: vars.DOCS_CLOUDFRONT_ID != ''
         run: |
           aws cloudfront create-invalidation \
-            --distribution-id "${{ vars.DOCS_CLOUDFRONT_ID }}" --paths "/docs/*"
+            --distribution-id "${{ vars.DOCS_CLOUDFRONT_ID }}" --paths "/*"

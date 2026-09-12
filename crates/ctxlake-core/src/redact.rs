@@ -56,20 +56,23 @@ const SECRET_MARKERS: &[(&str, &str)] = &[
     ("eyJhbGciOi", "jwt"),
     ("Authorization:", "authorization_header"),
     ("authorization:", "authorization_header"),
-    ("Bearer ", "bearer_token"),
     ("aws_secret_access_key", "aws_secret_kv"),
     ("AWS_SECRET_ACCESS_KEY", "aws_secret_kv"),
     ("ANTHROPIC_API_KEY", "anthropic_key_kv"),
     ("PRIVATE KEY", "private_key"),
     // Added after a live audit found each of these reaching the spool untouched.
+    //
+    // `Bearer `, `hf_`, `npm_` and `SG.` are deliberately NOT here. As bare literals
+    // they quarantine ordinary English and ordinary code — "the API wants a Bearer
+    // token", `let hf_size = 32;`, `npm_config_prefix`, and `MSG.` (which contains
+    // `SG.`) all tripped them. A redactor that eats prose gets switched off, which
+    // protects nothing. They are matched by `redact_prefixed_tokens` below, which
+    // additionally requires something token-shaped to follow.
     ("gsk_", "groq_key"),
-    ("hf_", "huggingface_token"),
-    ("npm_", "npm_token"),
     ("xai-", "xai_key"),
     ("dop_v1_", "digitalocean_token"),
     ("shpat_", "shopify_access_token"),
     ("shpss_", "shopify_shared_secret"),
-    ("SG.", "sendgrid_key"),
     ("glrt-", "gitlab_runner_token"),
     ("xoxa-", "slack_app_token"),
     ("xoxr-", "slack_refresh_token"),
@@ -247,6 +250,14 @@ impl Redactor {
             }
         }
 
+        let (n, replaced, token_rules) = redact_prefixed_tokens(&out);
+        if n > 0 {
+            out = replaced;
+            for r in token_rules {
+                rules.push(r.to_string());
+            }
+        }
+
         if is_tool_output {
             let (n, replaced) = redact_high_entropy_runs(&out);
             if n > 0 {
@@ -307,6 +318,65 @@ fn redact_uri_credentials(s: &str) -> (usize, String) {
     }
     out.push_str(rest);
     (n, out)
+}
+
+/// Prefixes that only mean "secret" when a token actually follows them.
+///
+/// `Bearer `, `hf_`, `npm_` and `SG.` are far too common as plain English and as
+/// identifiers to quarantine on sight: "the API wants a Bearer token",
+/// `let hf_size = 32;`, `npm_config_prefix`, and `MSG.` — which contains `SG.` —
+/// every one of those was quarantined when these sat in the literal marker table.
+/// Requiring a long token-shaped run immediately after the prefix keeps the catch
+/// and drops the noise.
+const TOKEN_PREFIXES: &[(&str, &str, usize)] = &[
+    ("Bearer ", "bearer_token", 16),
+    ("hf_", "huggingface_token", 20),
+    ("npm_", "npm_token", 20),
+    ("SG.", "sendgrid_key", 16),
+];
+
+/// Replace `<prefix><token>` where the token is long enough to be credential-shaped.
+///
+/// One left-to-right pass with a cursor: every branch advances it, so this cannot
+/// loop on a prefix that is present but not followed by a token.
+fn redact_prefixed_tokens(s: &str) -> (usize, String, Vec<&'static str>) {
+    let mut out = String::with_capacity(s.len());
+    let mut rules: Vec<&'static str> = Vec::new();
+    let mut n = 0;
+    let mut i = 0;
+
+    'outer: while i < s.len() {
+        for (prefix, rule, min_len) in TOKEN_PREFIXES {
+            if !s[i..].starts_with(prefix) {
+                continue;
+            }
+            let after = i + prefix.len();
+            let tail_len: usize = s[after..]
+                .chars()
+                .take_while(|c| is_secret_charset(*c))
+                .map(char::len_utf8)
+                .sum();
+            if tail_len >= *min_len {
+                out.push_str(prefix);
+                out.push_str("[ctxlake:redacted]");
+                if !rules.contains(rule) {
+                    rules.push(rule);
+                }
+                n += 1;
+                i = after + tail_len;
+                continue 'outer;
+            }
+            // Prefix present, token absent: emit it and move past the prefix, so
+            // ordinary prose ("a Bearer token") is untouched.
+            out.push_str(prefix);
+            i = after;
+            continue 'outer;
+        }
+        let ch = s[i..].chars().next().expect("index is on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (n, out, rules)
 }
 
 /// Luhn check — what makes card detection precise enough to act on.
@@ -587,14 +657,11 @@ mod tests {
         let r = Redactor::new();
         for (s, why) in [
             ("GROQ_API_KEY=gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ01", "groq"),
-            ("hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ01234567", "huggingface"),
-            ("_authToken=npm_aBcDeFgHiJkLmNoPqRs", "npm"),
             (
                 "https://hooks.slack.com/services/T00/B00/XXXX",
                 "slack webhook",
             ),
             ("ya29.a0AfB_byC-secret", "google oauth"),
-            ("curl -H 'Bearer abcdefghijklmnop'", "bearer"),
             ("PGPASSWORD=correcthorse", "postgres password"),
         ] {
             let (o, out) = r.scrub(s, false);
@@ -603,6 +670,48 @@ mod tests {
                 "{why} must quarantine, got {o:?}"
             );
             assert!(out.contains("withheld"), "{why}: {out}");
+        }
+    }
+
+    #[test]
+    fn prefixed_tokens_are_redacted_only_when_a_token_actually_follows() {
+        // These four were plain markers first, and quarantined ordinary English and
+        // ordinary code on sight: "the API wants a Bearer token", `let hf_size = 32;`,
+        // `npm_config_prefix`, and `MSG.` — which contains `SG.`. A redactor that eats
+        // prose gets switched off, and then protects nothing.
+        let r = Redactor::new();
+
+        for (s, why) in [
+            ("curl -H 'Bearer abcdefghijklmnopqrstuvwxyz123'", "bearer"),
+            ("hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ01234567", "huggingface"),
+            ("_authToken=npm_aBcDeFgHiJkLmNoPqRsTuV", "npm"),
+            ("SG.aBcDeFgHiJkLmNoPqRsTuVwXyZ012345", "sendgrid"),
+        ] {
+            let (o, out) = r.scrub(s, false);
+            assert!(
+                matches!(o, RedactionOutcome::Redacted { .. }),
+                "{why} must be caught, got {o:?}"
+            );
+            assert!(!out.contains("aBcDeFgHiJkLmNoPqRs"), "{why} leaked: {out}");
+            assert!(!out.contains("abcdefghijklmnop"), "{why} leaked: {out}");
+        }
+
+        for (s, why) in [
+            (
+                "the API wants a Bearer token in the header",
+                "prose: bearer",
+            ),
+            ("see MSG.txt for the error output", "prose: MSG."),
+            ("let hf_size = 32; // half", "code: hf_"),
+            ("the npm_config_prefix variable", "code: npm_"),
+            ("ERROR MSG. Something failed", "prose: SG. inside MSG."),
+        ] {
+            let (o, out) = r.scrub(s, false);
+            assert!(
+                matches!(o, RedactionOutcome::Clean),
+                "{why} must stay clean, got {o:?}"
+            );
+            assert_eq!(out, s, "{why}: content must be untouched");
         }
     }
 

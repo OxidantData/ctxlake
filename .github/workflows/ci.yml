@@ -17,15 +17,6 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      # MinIO is a first-class backend, and it is the one that lacks
-      # `If-None-Match: *`. The CAS suite must pass here, not only on S3.
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports: ["9000:9000"]
     env:
       CTXLAKE_TEST_S3_ENDPOINT: http://localhost:9000
       AWS_ACCESS_KEY_ID: minioadmin
@@ -33,6 +24,32 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
+
+      # MinIO is a first-class backend, and it is the one that lacks
+      # `If-None-Match: *`, so the CAS suite has to pass here and not only on S3.
+      #
+      # Two non-obvious choices, both learned the hard way:
+      #
+      # - The image comes from quay.io, not Docker Hub. `minio/minio` on Docker Hub
+      #   now returns 401 with zero listed tags, and `bitnami/minio:latest` 404s.
+      #   quay.io/minio/minio is still public.
+      # - It is started with `docker run` rather than as a service container,
+      #   because the image needs `server /data` as its command and GitHub service
+      #   containers cannot override a command.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio:latest server /data
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
+              echo "minio ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::MinIO did not become ready"; docker logs minio; exit 1
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.90"

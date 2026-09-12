@@ -1,0 +1,17 @@
+{
+  "event": "on_session_start",
+  "payload": {
+    "hook_event_name": "on_session_start",
+    "session_id": "hs-1",
+    "cwd": "/repo",
+    "extra": { "platform": "vscode" }
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "session_start",
+    "session_id": "hs-1",
+    "cwd": "/repo",
+    "runtime_version": "vscode",
+    "redaction": { "status": "clean" }
+  }
+}

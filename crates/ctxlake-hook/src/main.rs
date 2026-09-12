@@ -1,25 +1,28 @@
-//! ctxlake-hook — the per-event capture binary for Claude Code and Cursor.
+//! ctxlake-hook — the per-event capture binary for Claude Code, Cursor, and Hermes.
 //!
-//! Hermes does not spawn this binary: it is an in-process Python plugin
-//! (`adapters/hermes/` at the repo root) that writes to the same spool directly,
-//! because spawning a subprocess per LLM call would itself blow the latency budget
-//! this binary exists to protect.
+//! Hermes reaches this binary through shell hooks it declares in
+//! `~/.hermes/config.yaml`, a wire contract deliberately Claude Code-compatible
+//! (`docs/runtimes/hermes.md`) — it spawns this same binary per event exactly like
+//! the other two runtimes, and no longer runs an in-process Python plugin
+//! (`adapters/hermes/`, deleted: see `adapters::hermes`'s module doc for why a
+//! second, hand-ported redactor was a liability rather than an optimization).
 //!
 //! Budget: 5ms p99, fired on every tool call (AGENTS.md invariant 2 — this crate
 //! links only `ctxlake-core`, `serde`, `serde_json`; CI's `hook-deps` job fails the
 //! build if that tree grows an async runtime, an HTTP stack, or an object store).
 //! AGENTS.md invariant 1: this binary never opens a socket or touches the object
-//! store — that is the daemon's job, several waves from now.
+//! store — that is `ctxlake-sync`'s (the daemon's) job.
 //!
 //! Contract with the caller: whatever goes wrong below, exit 0 and have already
 //! printed a valid response. A hook that fails the agent's turn is a worse bug than
 //! one that silently drops an event.
 //!
 //! argv[1] is the event name in the calling runtime's own vocabulary (e.g.
-//! `PreToolUse` for Claude Code, `preToolUse` for Cursor — each adapter owns its own
-//! event names, see `adapters/`). argv[2] is the runtime id (`claude_code` | `cursor`).
-//! Both are expected to come from the installer's hook command line (a later wave),
-//! not from stdin, which is exactly what makes the latency trick below possible.
+//! `PreToolUse` for Claude Code, `preToolUse` for Cursor, `post_tool_call` for
+//! Hermes — each adapter owns its own event names, see `adapters/`). argv[2] is the
+//! runtime id (`claude_code` | `cursor` | `hermes`). Both are expected to come from
+//! the installer's hook command line (a later wave), not from stdin, which is
+//! exactly what makes the latency trick below possible.
 
 use ctxlake_hook::{adapters, spool};
 use std::io::{self, Read, Write};

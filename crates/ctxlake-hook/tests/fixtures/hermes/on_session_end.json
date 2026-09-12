@@ -1,0 +1,12 @@
+{
+  "event": "on_session_end",
+  "payload": {
+    "hook_event_name": "on_session_end",
+    "session_id": "hs-1"
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "session_end",
+    "session_id": "hs-1"
+  }
+}

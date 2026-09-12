@@ -1,0 +1,13 @@
+{
+  "_comment": "docs/runtimes/hermes.md's event table lists this as a synonym for on_session_end — both collapse onto EventType::SessionEnd; the schema has one session-boundary variant, not three.",
+  "event": "on_session_finalize",
+  "payload": {
+    "hook_event_name": "on_session_finalize",
+    "session_id": "hs-1"
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "session_end",
+    "session_id": "hs-1"
+  }
+}

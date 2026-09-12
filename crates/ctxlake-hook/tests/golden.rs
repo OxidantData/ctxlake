@@ -123,6 +123,19 @@ fn cursor_fixtures_cover_every_documented_event_and_match_expected_fields() {
     );
 }
 
+#[test]
+fn hermes_fixtures_cover_every_documented_event_and_match_expected_fields() {
+    // on_session_start, pre_llm_call, post_llm_call, pre_tool_call, post_tool_call,
+    // on_session_end, on_session_finalize, on_session_reset — see adapters/hermes.rs's
+    // `normalize` match and docs/runtimes/hermes.md's event table.
+    const EXPECTED_EVENT_COUNT: usize = 8;
+    let checked = run_fixtures("hermes", Runtime::Hermes);
+    assert_eq!(
+        checked, EXPECTED_EVENT_COUNT,
+        "a hermes event is missing its golden fixture (or an extra file crept in)"
+    );
+}
+
 /// The fixture harness itself must fail loudly on a genuine mismatch, and must not
 /// demand fields a fixture never mentioned — a harness that always "passes", or one
 /// that requires every fixture to spell out the whole envelope, would both defeat the

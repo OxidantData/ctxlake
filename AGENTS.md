@@ -149,6 +149,42 @@ than once.
   intents are written by other agents and rendered into a context window. Sanitize at
   render time, not only at ingest.
 
+## The docs standard
+
+User docs and contributor rationale are different documents. Ours conflated them: 46% of
+`docs/` was dense prose, `cli.md` ran 576 lines for thirteen commands, and nearly every
+decision explained itself in place. A reader looking for a flag had to read an argument.
+
+**User docs answer "what do I do".** Contributor docs answer "why is it like this". When
+you want to write down why a design refuses something, it goes in a code comment or here
+— not on a page someone reads to get started.
+
+Concretely, for anything under `docs/`:
+
+| Page kind | Shape | Ceiling |
+|---|---|---|
+| Landing | What it is in two sentences, install, one example | ~40 lines |
+| Quickstart | The happy path only. No alternatives, no rationale | ~80 lines |
+| Guide | One task, start to finish | ~120 lines |
+| Reference (CLI, config) | Tables. One row per flag, one example per command | as needed, but tabular |
+| Concepts | Only what a user must hold in their head to use it correctly | ~100 lines |
+
+Rules that follow from that:
+
+- **A table beats a paragraph.** If you are describing a set of things — flags, events,
+  fields, backends — it is a table.
+- **One example beats three sentences about the example.**
+- **Cut every "we chose X because Y" from user pages.** The user did not choose.
+- **Do not narrate the implementation's history.** What a review found, which bug a
+  design avoids, what an earlier version did — none of it belongs on a user page.
+- **Keep honest limits, shortened.** "Advisory", "not verified", "needs a live install to
+  confirm" stay. Trimming rationale is the goal; trimming an operational fact a user
+  would otherwise hit by surprise is a regression, and `docs/checks/regression_checks.py`
+  fails on some of these deliberately.
+
+The test: open a page and ask what a reader is trying to do. If the next paragraph does
+not help them do it, it belongs somewhere else or nowhere.
+
 ## Commands
 
 ```sh

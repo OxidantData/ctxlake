@@ -55,6 +55,39 @@ pub struct SessionKey {
 struct SpoolFileRef {
     path: PathBuf,
     file_name: String,
+    /// Stable identity of the underlying inode (`"<dev>:<ino>"`), used as the
+    /// watermark key instead of `file_name` — see that field's replacement in
+    /// [`watermark::SessionUploadState::files`] for why a *name*-keyed watermark is
+    /// unsound across a rotation.
+    identity: String,
+}
+
+/// `"<dev>:<ino>"` for a file's metadata. POSIX guarantees `rename(2)` does not
+/// change a file's inode — the same guarantee `ctxlake-hook`'s own module doc
+/// already leans on for its rotation being safe against a concurrent writer's open
+/// handle (`spool.rs`'s `rotate_if_full` doc) — so this identity survives exactly
+/// the rename that a file *name* does not, which is the property this module needs:
+/// the file that was 90% uploaded under the name `sess.ndjson` is the *same* file,
+/// carrying the *same* confirmed offset, after `ctxlake-hook` renames it aside to
+/// `sess.ndjson.<ts>` mid-upload-cycle. A freshly-created canonical file after
+/// rotation gets a new inode and therefore correctly starts unconfirmed at offset 0
+/// — no code here has to special-case "this name looks like a rotation."
+///
+/// This crate targets the same platforms `ctxlake-hook`'s own spool already
+/// assumes (`spool.rs` reads `HOME`, leans on POSIX `O_APPEND` and `rename(2)`
+/// atomicity) — Unix only, no Windows fallback attempted.
+///
+/// One accepted, narrow limitation: if a session's watermark survives long enough
+/// (it now does — see [`maybe_seal_and_cleanup`]) that the OS reuses an old,
+/// deleted file's exact `(dev, ino)` pair for an unrelated *new* file in the same
+/// session, that new file would be misread as already-confirmed. This requires the
+/// same session_id to be reused after its files were deleted *and* an inode number
+/// collision, both independently unlikely; nothing here defends against it, and if
+/// it ever shows up in practice a generation counter alongside the offset is the
+/// fix, not a rewrite of this scheme.
+fn file_identity(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("{}:{}", meta.dev(), meta.ino())
 }
 
 /// The inverse of `ctxlake_core::envelope::Runtime::as_str()`. Kept local rather
@@ -146,12 +179,19 @@ fn session_files(spool_root: &Path, runtime: &str, session_id: &str) -> Vec<Spoo
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            (name == canonical || name.starts_with(&format!("{canonical}."))).then_some(
-                SpoolFileRef {
-                    path: e.path(),
-                    file_name: name,
-                },
-            )
+            if !(name == canonical || name.starts_with(&format!("{canonical}."))) {
+                return None;
+            }
+            // A file that fails to stat here (removed concurrently, e.g. by a
+            // cleanup racing this same walk) is skipped, not an error — same
+            // best-effort tolerance `discover_sessions`'s own doc states for a
+            // directory that vanishes mid-walk.
+            let meta = e.metadata().ok()?;
+            Some(SpoolFileRef {
+                path: e.path(),
+                identity: file_identity(&meta),
+                file_name: name,
+            })
         })
         .collect();
     files.sort_by_key(|f| rotation_key(&f.file_name, session_id));
@@ -219,7 +259,7 @@ pub async fn upload_session_once(
     let mut segments_written = 0u32;
 
     for file in &files {
-        let confirmed = state.confirmed_bytes(&file.file_name);
+        let confirmed = state.confirmed_bytes(&file.identity);
         let (lines, new_offset) = read_new_complete_lines(&file.path, confirmed)?;
         if new_offset == confirmed {
             continue; // nothing new in this file this cycle.
@@ -270,7 +310,7 @@ pub async fn upload_session_once(
             segments_written += 1;
         }
 
-        state.files.insert(file.file_name.clone(), new_offset);
+        state.files.insert(file.identity.clone(), new_offset);
         watermark::write(&state_path, &state)?;
     }
 
@@ -290,6 +330,42 @@ pub async fn upload_session_once(
 /// this daemon only ever uses as an opaque partition string.
 fn partition_date_of(e: &Envelope) -> String {
     e.emitted_at.get(0..10).unwrap_or(&e.emitted_at).to_string()
+}
+
+/// Name of `ctxlake-hook`'s tracked-size sidecar (`crates/ctxlake-hook/src/spool.rs`'s
+/// `SIZE_SIDECAR_NAME`), duplicated here for the same reason `runtime_from_dir_name`
+/// above duplicates one match arm rather than pulling in that crate — must stay in
+/// sync with that constant.
+const HOOK_SIZE_SIDECAR_NAME: &str = ".spool_size";
+
+/// Subtract `freed` bytes from a runtime directory's tracked-size sidecar.
+///
+/// `ctxlake-hook`'s `append_event_at` only ever increments this counter
+/// (`spool.rs`'s `write_tracked_size`) — it has no reason to decrement it, because
+/// wave 1 shipped no drainer. This crate *is* that drainer, and cleanup deletes the
+/// very files those bytes were counted for; without this call the counter only
+/// ratchets upward forever; once enough uploaded-and-reclaimed sessions push it past
+/// `MAX_RUNTIME_DIR_BYTES` (512 MiB), the hook silently drops every new event
+/// against an empty spool directory, with no error any runtime surfaces (the hook's
+/// warning goes to stderr, which callers discard).
+///
+/// Best-effort, like the sidecar itself already is documented to be (`spool.rs`:
+/// "under- or over-count by a line or two ... acceptable for a cap that is already
+/// ... advisory disk-fill protection, not for anything that needs to be exact"): a
+/// concurrent hook append between this read and this write loses a few bytes of the
+/// decrement, which cannot compound into a permanent drift, because the hook only
+/// ever trusts this sidecar's *value* — it never re-derives it from a real scan
+/// unless the sidecar file is missing entirely.
+fn decrement_tracked_size(dir: &Path, freed: u64) {
+    if freed == 0 {
+        return;
+    }
+    let sidecar = dir.join(HOOK_SIZE_SIDECAR_NAME);
+    let current = std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let _ = std::fs::write(&sidecar, current.saturating_sub(freed).to_string());
 }
 
 /// If the session's `.done` sentinel exists and every known physical file has been
@@ -316,7 +392,7 @@ async fn maybe_seal_and_cleanup(
         let on_disk = std::fs::metadata(&f.path)
             .map(|m| m.len())
             .unwrap_or(u64::MAX);
-        state.confirmed_bytes(&f.file_name) == on_disk
+        state.confirmed_bytes(&f.identity) == on_disk
     });
     if !fully_consumed {
         return Ok((false, false));
@@ -348,11 +424,30 @@ async fn maybe_seal_and_cleanup(
         just_sealed = true;
     }
 
+    // Sizes must be read before deletion — there is nothing left to stat after.
+    let freed: u64 = files
+        .iter()
+        .map(|f| std::fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0))
+        .sum();
     for f in files {
         let _ = std::fs::remove_file(&f.path);
     }
+    decrement_tracked_size(&dir, freed);
     let _ = std::fs::remove_file(&done_marker);
-    let _ = std::fs::remove_file(state_path);
+    // The watermark itself is deliberately NOT deleted here (a past version of this
+    // function did, and it was a bronze-corrupting bug): `docs/runtimes/claude-code.md`
+    // documents that `--resume`/`--continue` reuses `session_id`, so a `.ndjson` can
+    // reappear at this same path days later. Deleting the watermark would reset
+    // `next_seg` to 0 and `sealed_in_store` to `false`, and the very first segment the
+    // resumed session uploads would `PUT` straight over `seg-000000` — a key this
+    // session already told the store, via `_SEALED`, was finished — destroying
+    // whatever was in it. Keeping the (tiny — a handful of JSON fields) watermark
+    // file forever means a resumed session's next upload sees `sealed_in_store:
+    // true` and `next_seg` picking up where it left off, so a new segment is
+    // *appended* under a fresh number rather than *overwriting* an old one. The
+    // traded-off cost is one small file per session_id that has ever existed,
+    // persisting past cleanup — `ctxlake maint` is the natural place to eventually
+    // garbage-collect these against `sessions/.../_SEALED` ages, not this loop.
 
     Ok((just_sealed || state.sealed_in_store, true))
 }
@@ -722,7 +817,16 @@ mod tests {
             "the fully-uploaded ndjson must be removed"
         );
         assert!(!rt_dir.join("sess-1.done").exists());
-        assert!(!watermark::state_path(dir.path(), "claude_code", "sess-1").exists());
+        // The watermark is deliberately KEPT (see `maybe_seal_and_cleanup`'s doc): a
+        // reused session_id (Claude Code `--resume`/`--continue`) must see
+        // `sealed_in_store: true` and a `next_seg` that keeps counting up, not a
+        // deleted-and-reset state that would let it overwrite `seg-000000`.
+        let state =
+            watermark::read(&watermark::state_path(dir.path(), "claude_code", "sess-1")).unwrap();
+        assert!(
+            state.sealed_in_store,
+            "the retained watermark must still record that this session was sealed"
+        );
     }
 
     #[tokio::test]
@@ -770,6 +874,230 @@ mod tests {
 
         let outcome = upload_session_once(&store, &c, &key).await.unwrap();
         assert!(outcome.sealed, "an empty-but-done session must still seal");
+    }
+
+    #[tokio::test]
+    async fn a_rotation_between_cycles_neither_duplicates_nor_strands_events() {
+        // Regression: the watermark used to key `state.files` by file *name*.
+        // `ctxlake-hook`'s rotation renames the fully-uploaded canonical file aside
+        // and starts a brand-new one at the same name — so a name-keyed watermark
+        // attached the OLD confirmed offset to the NEW (small) file at that name
+        // (stranding its real new bytes forever, since `from_offset >= len`) while
+        // treating the just-renamed file, under its new name, as never-uploaded
+        // (re-uploading its already-confirmed lines as a duplicate segment).
+        let dir = tempfile::tempdir().unwrap();
+        let store = InMemory::new();
+        let c = cfg(dir.path());
+        let key = SessionKey {
+            runtime: "claude_code".into(),
+            session_id: "sess-1".into(),
+        };
+        let rt_dir = dir.path().join("claude_code");
+        let canonical = rt_dir.join("sess-1.ndjson");
+
+        // Cycle 1: two lines land in the canonical file and get confirmed as seg-0.
+        append_line(
+            dir.path(),
+            "claude_code",
+            "sess-1",
+            &envelope_line("sess-1", 0),
+        );
+        append_line(
+            dir.path(),
+            "claude_code",
+            "sess-1",
+            &envelope_line("sess-1", 1),
+        );
+        let outcome1 = upload_session_once(&store, &c, &key).await.unwrap();
+        assert_eq!(outcome1.segments_written, 1);
+
+        // Simulate `ctxlake-hook`'s own rotation exactly (`spool.rs::rotate_if_full`):
+        // rename the canonical file aside, then a fresh append recreates it. `rename`
+        // preserves the inode; the fresh file is a brand-new one.
+        std::fs::rename(&canonical, rt_dir.join("sess-1.ndjson.1700000000")).unwrap();
+        append_line(
+            dir.path(),
+            "claude_code",
+            "sess-1",
+            &envelope_line("sess-1", 2),
+        );
+
+        // Cycle 2: must upload exactly the one truly-new line, not re-upload lines
+        // 0/1 under the rotated name, and not strand line 2 under the fresh name.
+        let outcome2 = upload_session_once(&store, &c, &key).await.unwrap();
+        assert_eq!(
+            outcome2.segments_written, 1,
+            "exactly one new segment for the one truly new line"
+        );
+
+        let seg0 = ctxlake_store::layout::session_segment(
+            "2026-09-11",
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            "sess-1",
+            0,
+        );
+        let seg1 = ctxlake_store::layout::session_segment(
+            "2026-09-11",
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            "sess-1",
+            1,
+        );
+        let mut all: Vec<String> = read_segment_envelopes(&store, &seg0)
+            .await
+            .into_iter()
+            .chain(read_segment_envelopes(&store, &seg1).await)
+            .map(|e| e.content.unwrap())
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                "line 0".to_string(),
+                "line 1".to_string(),
+                "line 2".to_string()
+            ],
+            "every line must appear exactly once across segments — no duplicate, no loss"
+        );
+        // Confirm no third segment (which a re-upload of the rotated file's already-
+        // confirmed lines as a *fresh* stream would have produced instead of a clean
+        // 1-line seg-1).
+        let seg2 = ctxlake_store::layout::session_segment(
+            "2026-09-11",
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            "sess-1",
+            2,
+        );
+        assert!(store.get(&seg2).await.is_err(), "no third segment expected");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_after_sealing_appends_new_segments_rather_than_overwriting_seg0() {
+        // Regression: cleanup used to delete the watermark file once a session
+        // sealed. Claude Code's `--resume`/`--continue` reuses `session_id`
+        // (docs/runtimes/claude-code.md), so a session's `.ndjson` can reappear at
+        // the same spool path later. With the watermark gone, that reappearance
+        // read back as `next_seg: 0, sealed_in_store: false` and its first upload
+        // PUT straight over the already-sealed `seg-000000`, destroying it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = InMemory::new();
+        let c = cfg(dir.path());
+        let key = SessionKey {
+            runtime: "claude_code".into(),
+            session_id: "sess-1".into(),
+        };
+
+        append_line(
+            dir.path(),
+            "claude_code",
+            "sess-1",
+            &envelope_line("sess-1", 0),
+        );
+        mark_done(dir.path(), "claude_code", "sess-1");
+        let outcome1 = upload_session_once(&store, &c, &key).await.unwrap();
+        assert!(outcome1.sealed);
+        assert!(outcome1.cleaned_up);
+
+        let seg0 = ctxlake_store::layout::session_segment(
+            "2026-09-11",
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            "sess-1",
+            0,
+        );
+        let before = read_segment_envelopes(&store, &seg0).await;
+        assert_eq!(before[0].content.as_deref(), Some("line 0"));
+
+        // The session resumes: the same session_id gets a fresh `.ndjson` with new
+        // content, exactly as `--resume` would produce.
+        append_line(
+            dir.path(),
+            "claude_code",
+            "sess-1",
+            &envelope_line("sess-1", 9),
+        );
+        let outcome2 = upload_session_once(&store, &c, &key).await.unwrap();
+        assert_eq!(
+            outcome2.segments_written, 1,
+            "the resumed line must upload as a new segment"
+        );
+
+        // seg-000000 must be untouched — the original event must still be there.
+        let after = read_segment_envelopes(&store, &seg0).await;
+        assert_eq!(
+            after[0].content.as_deref(),
+            Some("line 0"),
+            "a resumed session_id must never overwrite an already-sealed segment"
+        );
+
+        let seg1 = ctxlake_store::layout::session_segment(
+            "2026-09-11",
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            "sess-1",
+            1,
+        );
+        let seg1_envelopes = read_segment_envelopes(&store, &seg1).await;
+        assert_eq!(seg1_envelopes[0].content.as_deref(), Some("line 9"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_gives_back_the_bytes_it_freed_to_the_hooks_size_sidecar() {
+        // Regression: cleanup deleted a session's spool files but never touched
+        // `ctxlake-hook`'s `.spool_size` counter (`spool.rs`'s
+        // `read_or_seed_tracked_size`), so the counter only ever grew. Once enough
+        // uploaded-and-reclaimed sessions pushed it past `MAX_RUNTIME_DIR_BYTES`,
+        // the hook would silently drop every future event against an empty spool
+        // directory.
+        let dir = tempfile::tempdir().unwrap();
+        let store = InMemory::new();
+        let c = cfg(dir.path());
+        let key = SessionKey {
+            runtime: "claude_code".into(),
+            session_id: "sess-1".into(),
+        };
+        let rt_dir = dir.path().join("claude_code");
+
+        append_line(
+            dir.path(),
+            "claude_code",
+            "sess-1",
+            &envelope_line("sess-1", 0),
+        );
+        mark_done(dir.path(), "claude_code", "sess-1");
+        let on_disk_before = std::fs::metadata(rt_dir.join("sess-1.ndjson"))
+            .unwrap()
+            .len();
+
+        // Seed the sidecar the way `ctxlake-hook` would have left it after writing
+        // exactly this session's one line (plus a little headroom to prove the
+        // decrement is a *subtraction*, not a reset to zero).
+        std::fs::write(
+            rt_dir.join(".spool_size"),
+            (on_disk_before + 1000).to_string(),
+        )
+        .unwrap();
+
+        let outcome = upload_session_once(&store, &c, &key).await.unwrap();
+        assert!(outcome.cleaned_up);
+
+        let sidecar_after: u64 = std::fs::read_to_string(rt_dir.join(".spool_size"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            sidecar_after, 1000,
+            "cleanup must give back exactly the bytes it freed, not leave the \
+             counter at its pre-cleanup value"
+        );
     }
 
     #[tokio::test]

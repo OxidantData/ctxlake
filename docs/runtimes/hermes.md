@@ -11,10 +11,24 @@ second spool writer, and so no chance of the two drifting apart.
 > **Verification basis:** every capability, field name and semantic below was read from
 > Hermes's own source — `agent/shell_hooks.py`, `hermes_cli/plugins.py` (`VALID_HOOKS`),
 > and `website/docs/user-guide/features/hooks.md`. This is the best-grounded of the three
-> pages on *what Hermes does*, and, now that the Python-plugin adapter is gone, also the
-> one runtime page where prose and code fully agree: `adapters::hermes` (in
-> `crates/ctxlake-hook`) normalizes exactly the shell-hook payload described below,
-> through the same binary every other runtime uses.
+> pages on *what Hermes does*, and, now that the Python-plugin adapter is gone,
+> `adapters::hermes` (in `crates/ctxlake-hook`) does normalize exactly the payload shape
+> described below, through the same binary every other runtime uses.
+>
+> What is **not** yet true: the `command:` lines in the config block below are the
+> target invocation, not what `ctxlake install hermes` writes (that installer command
+> is a later wave). `ctxlake-hook`'s own contract (`main.rs`) takes the event name and
+> runtime id as two *positional* arguments — `ctxlake-hook <event> <runtime>` — with no
+> flag parsing at all, so a `--runtime hermes` flag is silently swallowed as a
+> non-existent third positional argument and the hook fails closed (harmlessly — it
+> still exits 0 — but it captures nothing). The event names must also be the ones
+> `adapters::hermes::normalize` actually matches (`on_session_start`, `pre_llm_call`,
+> `pre_tool_call`, `post_tool_call`, `post_llm_call`, `on_session_end`) — the shorter
+> names below are the *envelope's* event vocabulary, not argv[1]'s.
+
+<!-- TODO(ctxlake install hermes): once the installer exists, replace the config block
+     below with its actual output and drop this callout — verify by running the
+     installed hook end-to-end against a live Hermes session first. -->
 
 ## Two mechanisms, and why we use the shell one
 
@@ -42,23 +56,26 @@ Python plugins first, then shell hooks, and the first valid directive wins.
 # ~/.hermes/config.yaml
 hooks:
   on_session_start:
-    - command: ctxlake-hook session_start --runtime hermes
+    - command: ctxlake-hook on_session_start hermes
   pre_llm_call:
-    - command: ctxlake-hook prompt --runtime hermes
+    - command: ctxlake-hook pre_llm_call hermes
   pre_tool_call:
-    - command: ctxlake-hook pre_tool --runtime hermes
+    - command: ctxlake-hook pre_tool_call hermes
       timeout: 5
       fail_closed: false
   post_tool_call:
-    - command: ctxlake-hook tool --runtime hermes
+    - command: ctxlake-hook post_tool_call hermes
   post_llm_call:
-    - command: ctxlake-hook assistant --runtime hermes
+    - command: ctxlake-hook post_llm_call hermes
   on_session_end:
-    - command: ctxlake-hook session_end --runtime hermes
+    - command: ctxlake-hook on_session_end hermes
 ```
 
-`ctxlake install hermes` writes this, merging into an existing `hooks:` block rather than
-replacing it.
+Each `command:` is `ctxlake-hook <hermes event name> hermes` — positional, matching
+`main.rs`'s `argv[1]` (event) / `argv[2]` (runtime id) contract exactly, not the
+envelope's own shorter event names (`session_start`, `tool_call`, …) from the mapping
+table above. `ctxlake install hermes` (a later wave) will write this, merging into an
+existing `hooks:` block rather than replacing it.
 
 Each entry accepts `command`, and optionally `matcher` (a regex over the tool name),
 `timeout` (seconds), and `fail_closed`.
@@ -115,11 +132,20 @@ aggregate it lands in.
 
 ## Capabilities
 
-| Capability | Supported | How |
+The table below is about **Hermes's own hook mechanism** — what the shell-hook surface
+is capable of, verified against Hermes's source the same way the rest of this page is.
+It is not a status report on `adapters::hermes`: this wave's adapter only *captures*.
+`hermes::response_for` returns `{}` for every event — briefing injection and blocking
+both need the daemon's view of the lake (a lease, a synthesized digest), which does not
+reach the hook in this wave, the same gap `claude_code.rs` and `cursor.rs` both document
+for their own runtimes. Wiring an actual `{"context": "..."}` or `{"action": "block"}`
+response is later work, not something this page can claim is live today.
+
+| Capability | Hermes supports it | How |
 |---|---|---|
-| Capture every event | yes | the six hooks above |
-| Inject the briefing | yes | `pre_llm_call` returning `{"context": "..."}` |
-| Block a colliding edit | yes | `pre_tool_call` returning `{"action": "block", "message": ...}`, or `exit 2` |
+| Capture every event | yes | the six hooks above — this is what `adapters::hermes` uses today |
+| Inject the briefing | yes, mechanically | `pre_llm_call` returning `{"context": "..."}` — **not yet sent**; see above |
+| Block a colliding edit | yes, mechanically | `pre_tool_call` returning `{"action": "block", "message": ...}`, or `exit 2` — **not yet sent**; see above |
 | Claude Code response format | yes | `{"decision": "modify", "tool_input": {...}}` is normalized internally |
 | Fail closed on hook crash | yes | `fail_closed: true`, `pre_tool_call` only |
 | Compaction marker | **no** | no hook exists |
@@ -144,10 +170,19 @@ Hermes has no `pre_compact` equivalent, so a Hermes session has no marker for th
 its context was discarded. Claude Code and Cursor both emit one.
 
 The consequence is narrow but real: for a Hermes session you cannot reconstruct what the
-agent could still see at a given point. Everything else — the transcript, tool calls,
-outcomes, digests — is unaffected. There is a `session:compress` event on the *gateway*
-hook surface, but that fires for messaging-platform sessions rather than the agent's own
-tool-calling loop, so it is not a substitute.
+agent could still see at a given point. Tool calls, outcomes, and digests are unaffected.
+There is a `session:compress` event on the *gateway* hook surface, but that fires for
+messaging-platform sessions rather than the agent's own tool-calling loop, so it is not a
+substitute.
+
+The transcript itself has a separate, narrower gap worth stating plainly rather than
+folding into "unaffected": `pre_llm_call`/`post_llm_call` envelopes are captured with
+`role` set but **no `content`** — `adapters::hermes`'s module doc explains why (no field
+name for the prompt/assistant text has been verified against a live payload capture, and
+this adapter would rather leave a field empty than spool a guessed key). So today a
+Hermes session's bronze record has one `Prompt` and one `Assistant` envelope per turn,
+correctly ordered and timestamped, but without the actual text — fix this the same way
+`cursor.rs`'s fields were corrected, by diffing against a live capture.
 
 ctxlake records the gap rather than papering over it: Hermes sessions simply have no
 `compact` events, and nothing infers one.

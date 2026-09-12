@@ -53,35 +53,49 @@ pub struct PresenceConfig {
     pub cwd: Option<String>,
 }
 
-fn intent_snapshot(cfg: &PresenceConfig) -> Intent {
+/// Build the intent this heartbeat wants to publish, carrying forward whatever
+/// session-level detail `existing` already held.
+///
+/// Per-session task/path detail is written by whatever is actually running the
+/// session (a later wave's job — see the module doc); this daemon's own republish
+/// is the coarse "I am alive" heartbeat, not a task update, so it must never
+/// *clear* a richer intent something else just wrote. Because `intent::write` is a
+/// whole-object overwrite (that module's own doc: no CAS, exactly one *kind* of
+/// writer for this key, so no read-modify-*write* was ever needed to avoid a race)
+/// — but "no race to avoid" is not "no read to do first": omitting a field from
+/// this struct is indistinguishable, on the wire, from actively clearing it
+/// (`#[serde(skip_serializing_if)]` drops it from the JSON either way). So this
+/// reads the previous object and folds its `session_id`/`task`/`paths` forward
+/// unconditionally, and only ever refreshes the fields this heartbeat actually
+/// owns: `repo`/`branch`/`cwd` (which track *this process*, not the session) and
+/// `updated_at`.
+fn intent_snapshot(cfg: &PresenceConfig, existing: Option<&Intent>) -> Intent {
     Intent {
         agent_id: cfg.agent_id.clone(),
         fleet_id: cfg.fleet_id.clone(),
         runtime: cfg.runtime,
-        // Per-session task/path detail is written by whatever is actually running
-        // the session (a later wave's job — see the module doc); this daemon's own
-        // republish is the coarse "I am alive" heartbeat, not a task update, so it
-        // must never *clear* a richer intent something else just wrote. A full
-        // solution needs read-modify-write here or a separate key; deliberately not
-        // attempted in this wave (see the module doc) — for now the daemon simply
-        // does not touch these fields.
-        session_id: None,
+        session_id: existing.and_then(|i| i.session_id.clone()),
         repo: cfg.repo.clone(),
         branch: cfg.branch.clone(),
         cwd: cfg.cwd.clone(),
-        task: None,
-        paths: Vec::new(),
+        task: existing.and_then(|i| i.task.clone()),
+        paths: existing.map(|i| i.paths.clone()).unwrap_or_default(),
         updated_at: OffsetDateTime::now_utc(),
     }
 }
 
-/// Publish this agent's own intent once. Cheap and always safe to call — no CAS, no
-/// contention (`intent.rs`'s module doc: this key has exactly one writer).
+/// Publish this agent's own intent once: read whatever is already there (so a
+/// richer intent's `session_id`/`task`/`paths` survive this heartbeat — see
+/// [`intent_snapshot`]), then overwrite. Not CAS — `intent.rs`'s module doc
+/// explains why this key never needs it — so the write itself is still cheap and
+/// always safe; only the read is new cost, once per heartbeat interval, not once
+/// per hook.
 pub async fn publish_intent(
     store: &dyn ObjectStore,
     cfg: &PresenceConfig,
 ) -> Result<(), StoreError> {
-    intent::write(store, &intent_snapshot(cfg)).await
+    let existing = intent::read(store, &cfg.agent_id).await?;
+    intent::write(store, &intent_snapshot(cfg, existing.as_ref())).await
 }
 
 /// Tracks whether this process currently holds the maintenance lease, across
@@ -258,6 +272,51 @@ mod tests {
         let back = intent::read(&store, "cc-01").await.unwrap().unwrap();
         assert_eq!(back.agent_id, "cc-01");
         assert_eq!(back.branch.as_deref(), Some("wave2/sync"));
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_never_clears_a_richer_intent_something_else_already_wrote() {
+        // Regression: `intent_snapshot` used to hardcode `session_id: None, task:
+        // None, paths: Vec::new()` on every call. Because `intent::write` is a
+        // whole-object `PutMode::Overwrite`, omitting a field IS clearing it (the
+        // `skip_serializing_if` attributes drop it from the JSON either way) — so
+        // this daemon's own 60s "I am alive" republish erased a richer intent
+        // (session_id, task, paths) that any session-aware writer had just set,
+        // exactly contradicting this module's own doc comment.
+        let store = InMemory::new();
+        let rich = Intent {
+            agent_id: "cc-01".into(),
+            fleet_id: "oxidant".into(),
+            runtime: Runtime::ClaudeCode,
+            session_id: Some("sess-42".into()),
+            repo: Some("github.com/OxidantData/ctxlake".into()),
+            branch: Some("wave2/sync".into()),
+            cwd: None,
+            task: Some("implementing the upload loop".into()),
+            paths: vec!["crates/ctxlake-sync/src/upload.rs".into()],
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        intent::write(&store, &rich).await.unwrap();
+
+        let mut presence = Presence::new();
+        presence.tick(&store, &SystemClock, &cfg()).await.unwrap();
+
+        let back = intent::read(&store, "cc-01").await.unwrap().unwrap();
+        assert_eq!(
+            back.session_id.as_deref(),
+            Some("sess-42"),
+            "a heartbeat tick must not clear session_id"
+        );
+        assert_eq!(
+            back.task.as_deref(),
+            Some("implementing the upload loop"),
+            "a heartbeat tick must not clear task"
+        );
+        assert_eq!(
+            back.paths,
+            vec!["crates/ctxlake-sync/src/upload.rs".to_string()],
+            "a heartbeat tick must not clear paths"
+        );
     }
 
     #[tokio::test]

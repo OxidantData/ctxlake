@@ -40,7 +40,14 @@ pub struct SessionUploadState {
     #[serde(default)]
     pub next_seg: u32,
     /// Per-physical-file byte offset already confirmed written to the store, keyed
-    /// by file name only (the directory is implied by where this state file lives).
+    /// by the file's `(dev, ino)` identity (`"<dev>:<ino>"`, computed internally by
+    /// `crate::upload`'s `file_identity`), never by file *name*.
+    /// `ctxlake-hook`'s rotation renames a full spool file aside and starts a fresh
+    /// one at the canonical name — a name-keyed map would attach the rotated file's
+    /// already-confirmed offset to whatever new, mostly-empty file next takes that
+    /// name (stranding new events forever) while treating the rotated file itself,
+    /// under its new name, as never-uploaded (re-uploading it as a duplicate
+    /// segment). Identity survives the rename; name does not.
     #[serde(default)]
     pub files: BTreeMap<String, u64>,
     /// Set once `_SEALED` has been written to the store for this session. Once

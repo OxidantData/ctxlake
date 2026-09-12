@@ -13,3 +13,6 @@ site/.vitepress/dist
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# agent worktrees and session scratch — never part of the repo
+.claude/

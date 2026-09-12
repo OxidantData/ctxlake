@@ -72,19 +72,34 @@ pub(crate) async fn run_one_cycle(cfg: &Config) -> Result<String> {
     // A provider is only ever constructed when Tier 2 is actually configured —
     // `tier2_enabled` is the same gate `ctxlake_maint::extract` itself checks
     // first, so a `mode = "agent"` fleet never resolves an env var or builds an
-    // HTTP client it isn't going to use. When it *is* enabled, an unresolvable
-    // `api_key_env` must fail the whole run loudly rather than let maintenance
-    // silently skip extraction forever — see `build_provider`'s doc.
+    // HTTP client it isn't going to use.
+    //
+    // **A provider that cannot be built does not fail the cycle.** This used to be
+    // `?`, on the reasoning that an unresolvable `api_key_env` should fail loudly
+    // rather than let maintenance silently skip extraction forever. Loudly was right;
+    // *failing the cycle* was not, and a live lake showed why: compaction, digests,
+    // the gates and the snapshot need no model, and every one of them stopped running
+    // because an optional summarizer could not resolve. The snapshot went three and a
+    // half hours stale on a lake that was still receiving sessions, and the only
+    // symptom was one line about a provider.
+    //
+    // It is not silent either — the failure rides in this cycle's summary, which the
+    // daemon prints every pass. That is the distinction the original comment was
+    // reaching for: loud, without taking four working steps down with it.
+    let mut tier2_unavailable: Option<String> = None;
     let provider: Option<Box<dyn ctxlake_maint::extract::Provider>> =
         if ctxlake_maint::extract::tier2_enabled(&extract_cfg) {
             let batch_cfg = extract_cfg
                 .batch
                 .as_ref()
                 .expect("tier2_enabled just confirmed cfg.batch.is_some()");
-            Some(
-                ctxlake_maint::extract::build_provider(batch_cfg)
-                    .context("resolving the Tier 2 provider from [summarize.batch]")?,
-            )
+            match ctxlake_maint::extract::build_provider(batch_cfg) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tier2_unavailable = Some(e.to_string());
+                    None
+                }
+            }
         } else {
             None
         };
@@ -105,13 +120,20 @@ pub(crate) async fn run_one_cycle(cfg: &Config) -> Result<String> {
     .await
     .context("running the maintenance chain")?;
 
+    let extraction = match &tier2_unavailable {
+        // Named in the summary rather than logged separately, so the one line the
+        // daemon prints per cycle carries both what ran and what could not.
+        Some(why) => format!("extraction UNAVAILABLE ({why})"),
+        None => describe_extraction(&report.extraction),
+    };
+
     Ok(format!(
         "compacted {} date(s) · {} digest(s) written, {} already done · snapshot {} · {} · {}",
         report.dates_compacted.len(),
         report.digests_written,
         report.digests_skipped,
         describe_snapshot(&report.snapshot),
-        describe_extraction(&report.extraction),
+        extraction,
         describe_gate(&report.gate),
     ))
 }
@@ -305,16 +327,9 @@ mod tests {
             .expect("an un-initialized store has no work, not an error");
     }
 
-    #[tokio::test]
-    async fn a_batch_mode_run_fails_loudly_when_the_configured_env_var_is_unset() {
-        // Tier 2 misconfiguration must not fail silently: a fleet that turned
-        // batch mode on and then never set the key should see maintenance stop
-        // and say why, not quietly run compaction/digest/gate forever while
-        // extraction does nothing.
-        let var = "CTXLAKE_TEST_MAINT_CMD_MISSING_KEY";
-        std::env::remove_var(var);
-        let dir = tempfile::tempdir().unwrap();
-        let mut c = cfg(dir.path(), "myteam", "cc-01");
+    /// Build a config whose Tier 2 provider cannot possibly resolve.
+    fn cfg_with_unbuildable_tier2(dir: &std::path::Path, var: &str) -> Config {
+        let mut c = cfg(dir, "myteam", "cc-01");
         c.summarize.mode = SummarizeMode::Shadow;
         c.summarize.batch = Some(BatchConfig {
             provider: ProviderKind::Anthropic,
@@ -325,15 +340,66 @@ mod tests {
             max_sessions_per_run: 50,
             max_input_tokens: 8000,
         });
-        let err = run(&c, true).await.unwrap_err();
-        // `{:#}` (the "alternate" Display anyhow uses to walk the full `.source()`
-        // chain — see `main.rs`'s own `eprintln!("Error: {err:#}")`) is what an
-        // operator actually sees; a plain `{err}` shows only the outer
-        // `.context(...)` line and would miss the variable name entirely.
-        let full = format!("{err:#}");
+        c
+    }
+
+    #[tokio::test]
+    async fn an_unbuildable_provider_does_not_stop_compaction_digests_gates_or_the_snapshot() {
+        // Found on a live lake. The daemon was up (v0.1.6 made an unreachable provider
+        // non-fatal at startup) and the snapshot was still three and a half hours
+        // stale, on a bucket that was receiving sessions the whole time — because
+        // every maintenance cycle aborted on `build_provider` before reaching any of
+        // the four steps that need no model at all.
+        //
+        // This is the same mistake as the startup one, one level down: an optional
+        // step taking mandatory ones with it. Fixing the outer boundary and not this
+        // one left the daemon alive and the chain dead, which is arguably worse —
+        // `sync status` reports a healthy daemon.
+        let var = "CTXLAKE_TEST_MAINT_CMD_MISSING_KEY";
+        // SAFETY: a name unique to this test; nothing else reads it.
+        unsafe { std::env::remove_var(var) };
+        let dir = tempfile::tempdir().unwrap();
+
+        let summary = run_one_cycle(&cfg_with_unbuildable_tier2(dir.path(), var))
+            .await
+            .expect("the chain must complete without a usable Tier 2 provider");
+
+        // The four model-independent steps all reported.
+        for step in ["compacted", "digest", "snapshot", "gate"] {
+            assert!(
+                summary.contains(step),
+                "'{step}' must still run without a provider: {summary}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unbuildable_provider_is_named_in_the_summary_rather_than_passing_silently() {
+        // The half of the original behaviour worth keeping. Maintenance quietly
+        // running forever while extraction does nothing is the failure the old `?`
+        // existed to prevent — it just should not have cost the rest of the chain.
+        // The daemon prints this line every cycle.
+        let var = "CTXLAKE_TEST_MAINT_CMD_MISSING_KEY_NAMED";
+        // SAFETY: a name unique to this test; nothing else reads it.
+        unsafe { std::env::remove_var(var) };
+        let dir = tempfile::tempdir().unwrap();
+
+        let summary = run_one_cycle(&cfg_with_unbuildable_tier2(dir.path(), var))
+            .await
+            .unwrap();
+
         assert!(
-            full.contains(var),
-            "error must name the unset env var: {full}"
+            summary.contains("UNAVAILABLE"),
+            "a cycle that could not extract must say so: {summary}"
+        );
+        assert!(
+            summary.contains(var),
+            "and must name the unset variable, or the operator has nothing to act on: {summary}"
+        );
+        // Must not be confusable with the honest "Tier 2 is switched off" wording.
+        assert!(
+            !summary.contains("extraction disabled"),
+            "a broken provider is not the same as a disabled one: {summary}"
         );
     }
 

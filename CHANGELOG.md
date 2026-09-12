@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### An unusable model stopped the entire maintenance chain
+
+v0.1.6 made an unreachable Tier 2 provider non-fatal at daemon *startup* and left the
+same abort inside the cycle itself, which is arguably worse: the daemon comes up, `sync
+status` reports it healthy, and compaction, digests, the gates and the snapshot never
+run. Found on a live lake — the snapshot was three and a half hours stale on a bucket
+that had been receiving sessions the whole time, and the only symptom was one log line
+about a provider.
+
+None of those four steps needs a model. A cycle now builds what it can, runs everything
+else, and names the failure in the summary line the daemon prints each pass —
+`extraction UNAVAILABLE (<reason>)`, distinct from the `extraction disabled` a fleet with
+Tier 2 switched off reports. Loud was the half of the old behaviour worth keeping;
+failing the cycle was not.
+
 ### `ctxlake update` re-renders the service unit
 
 Without this, every future upgrade would need `ctxlake sync install` run by hand

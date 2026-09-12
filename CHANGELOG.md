@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### `ctxlake update` re-renders the service unit
+
+Without this, every future upgrade would need `ctxlake sync install` run by hand
+afterwards — the exact "remember to do a second thing" step v0.1.6 removed from
+maintenance scheduling, reintroduced one layer down. A unit goes stale on an upgrade in
+two invisible ways: it names a binary path a package manager just deleted, and it pins a
+`PATH` from before a provider binary existed. `update` now refreshes it from the config
+path the unit itself records, then restarts. Re-rendering an unchanged unit writes
+nothing.
+
+Deliberately without re-running the pre-install checks: refusing to refresh an
+already-installed unit because a store is briefly unreachable would leave it pointing at
+a deleted binary, which is worse than either outcome those checks protect against.
+
 ## v0.1.6
 
 The daemon did not run on either machine it was installed on. All four causes were

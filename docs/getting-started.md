@@ -321,7 +321,8 @@ does not inherit your shell:
 
 After a `brew upgrade` from a version before v0.1.6, run `ctxlake sync install` once
 more: units written by older versions point at a versioned Homebrew path that the
-upgrade deleted. `ctxlake update` handles this for you going forward.
+upgrade deleted, and pin no `PATH`. This is a one-time step — `ctxlake update`
+re-renders the unit itself, so later upgrades need nothing.
 
 ## Next steps
 

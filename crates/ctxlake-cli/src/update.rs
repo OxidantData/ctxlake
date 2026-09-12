@@ -445,7 +445,17 @@ fn restart_daemon_if_supervised() {
     if !crate::service::is_installed() {
         return;
     }
-    println!("\nrestarting the sync daemon so it runs the new binary");
+    println!("\nrefreshing the sync daemon's service unit");
+    // Before restarting, not after: a unit written by the previous version may name a
+    // binary path this upgrade just deleted (a package manager's version-stamped
+    // directory), in which case restarting it fails and the daemon stays down. It may
+    // also pin a PATH from before a provider binary was installed. Re-rendering costs
+    // nothing when neither is true — `write_unit` reports no change.
+    match crate::service::refresh_installed_unit() {
+        Ok(true) => println!("  unit updated for the new binary"),
+        Ok(false) => println!("  unit already current"),
+        Err(e) => println!("  could not refresh it ({e:#}) — run `ctxlake sync install`"),
+    }
     match crate::service::restart_installed() {
         Ok(()) => println!("  restarted — `ctxlake sync status` to confirm"),
         Err(e) => println!("  could not restart it ({e:#}) — run `ctxlake sync restart`"),

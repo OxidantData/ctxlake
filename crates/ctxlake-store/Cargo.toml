@@ -1,6 +1,6 @@
 [package]
 name = "ctxlake-store"
-description = "Object-storage coordination: compare-and-swap, leases, roster, capability probe."
+description = "Object-storage coordination: compare-and-swap, roster, capability probe."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

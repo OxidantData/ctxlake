@@ -34,29 +34,11 @@ pub fn agent_intent(agent_id: &str) -> Path {
     agents_prefix().join(format!("{agent_id}.json"))
 }
 
-/// The fan-in of every agent's intent, built by whoever holds
-/// [`lease_maintenance`]. See the `roster` module doc.
+/// The fan-in of every agent's intent, published with a CAS write — see the
+/// `roster` module doc for why any number of daemons may build this concurrently
+/// rather than one elected builder.
 pub fn roster() -> Path {
     Path::from("live").join("roster.json")
-}
-
-/// The `live/leases/` prefix.
-pub fn leases_prefix() -> Path {
-    Path::from("live").join("leases")
-}
-
-/// A lease keyed by resource hash (see `ctxlake_core::hash::resource_key`). The
-/// object always exists once first touched; its *contents* say free or held — see
-/// the `lease` module doc and AGENTS.md invariant 4.
-pub fn lease(resource_hash: &str) -> Path {
-    leases_prefix().join(format!("{resource_hash}.json"))
-}
-
-/// The lease arbitrating who builds [`roster`]. Not resource-hash-keyed — there is
-/// exactly one of these per fleet — so it gets a fixed name instead of running
-/// through [`lease`].
-pub fn lease_maintenance() -> Path {
-    leases_prefix().join("_maintenance")
 }
 
 /// The directory a sealed session's segments live under, without the segment
@@ -205,13 +187,17 @@ pub fn claims_fleet_prefix() -> Path {
 /// **only** by the promotion gate inside `ctxlake maint` (AGENTS.md invariant 9) —
 /// nothing else in this codebase constructs this path for a `put`.
 ///
-/// Unlike `live/` this is a plain overwrite, not a CAS write: the gate is a
-/// single-writer batch job that runs under `lease_maintenance`, so by the time
-/// anything touches this key there is, by construction, no second writer to race —
-/// two promotions cannot happen at once. Adding a version-checked CAS here would be
-/// locking a resource the design has already made single-writer; see
-/// `docs/architecture.md`'s maintenance chain for why the lease is what does that
-/// work instead.
+/// Unlike `live/` this is a plain overwrite, not a CAS write: the content written
+/// here is always a claim's current *folded* state (`ctxlake_maint::claims::fold`),
+/// which is itself deterministic in the values that matter (status,
+/// `independent_count`, `confidence`) given the same view of `claims/events/` —
+/// two gate runs computing the same promotion write the same bytes, and
+/// `claims::fold`'s handling of a repeated `Promoted` event (first promotion wins)
+/// is what keeps this key well-defined even when two runs' views briefly disagree.
+/// This key is fully re-derivable from the event log at any time, the same
+/// "disposable, recomputed" property [`roster`] and [`sessions_compaction_marker`]
+/// rely on for their own plain overwrites — see `docs/architecture.md`'s
+/// maintenance chain.
 pub fn claim_fleet(claim_id: &str) -> Path {
     claims_fleet_prefix().join(format!("{claim_id}.json"))
 }
@@ -275,8 +261,6 @@ mod tests {
         assert_eq!(fleet_meta().as_ref(), "_meta/fleet.json");
         assert_eq!(agent_intent("cc-01").as_ref(), "live/agents/cc-01.json");
         assert_eq!(roster().as_ref(), "live/roster.json");
-        assert_eq!(lease("abc123").as_ref(), "live/leases/abc123.json");
-        assert_eq!(lease_maintenance().as_ref(), "live/leases/_maintenance");
         assert_eq!(
             session_segment("2026-09-11", "oxidant", Runtime::ClaudeCode, "cc-01", "sess-1", 3)
                 .as_ref(),
@@ -370,16 +354,16 @@ mod tests {
             "an extra path separator survived encoding: {p}"
         );
 
-        let evil_hash = "a/b/../c";
-        let lp = lease(evil_hash);
+        let evil_session = "a/b/../c";
+        let cp = claims_extracted(evil_session);
         assert!(
-            lp.as_ref().starts_with("live/leases/"),
-            "escaped its directory: {lp}"
+            cp.as_ref().starts_with("claims/extracted/"),
+            "escaped its directory: {cp}"
         );
         assert_eq!(
-            lp.as_ref().matches('/').count(),
+            cp.as_ref().matches('/').count(),
             2,
-            "an extra path separator survived encoding: {lp}"
+            "an extra path separator survived encoding: {cp}"
         );
     }
 

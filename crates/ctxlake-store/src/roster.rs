@@ -7,26 +7,29 @@
 //! real S3 bill money (~$650/mo range) for infrastructure whose whole premise is
 //! "nothing to operate, nothing to pay for when idle."
 //!
-//! The fix: elect one agent — whoever holds [`crate::layout::lease_maintenance`] —
-//! to do the O(N) work once per interval: list every intent, merge them into a
-//! single `live/roster.json` ([`build`]). Everyone else does exactly one
+//! The fix: any daemon may do the O(N) work — list every intent, merge them into
+//! one `live/roster.json` ([`build`]) — and everyone else does exactly one
 //! conditional `GET` per interval ([`fetch`]) with `If-None-Match` set to the etag
-//! they last saw; an unchanged roster costs a 304 with no body transfer. That is
-//! O(N) requests fleet-wide instead of O(N^2) — at 50 agents, roughly $23/mo
-//! instead of ~$650/mo for the identical information.
+//! they last saw; an unchanged roster costs a 304 with no body transfer.
 //!
-//! The fallback: the maintenance lease is advisory (AGENTS.md invariant 5), so if
-//! nobody currently *and actually* holds it — the fleet just started, or the sole
-//! maintainer died and nobody has stolen the role yet — `roster.json` may be
-//! missing or stale, and trusting it would mean showing everyone a roster from
-//! before the outage. [`fetch`] checks the lease's TTL, not merely whether it has
-//! a `holder` on file, and falls back to `list_intents_directly` (the O(N) LIST +
-//! GETs, done ad hoc by whichever caller needs an answer right now) whenever no
-//! one is *live* maintaining it — a `holder` whose TTL already lapsed counts as
-//! nobody, because the doc's own claim above ("the sole maintainer died") is
-//! exactly a lease left `Some(dead_agent)` past its expiry, not a lease that
-//! reverted to `None`. Checking only `holder.is_none()` would keep trusting a
-//! roster nobody has refreshed since the outage started — see the regression test.
+//! **Several daemons building this concurrently is fine, not a bug.** `build`
+//! publishes with a CAS write against whatever version it observed: two builders
+//! racing produce two writes, at most one lands (the other's `412` is reported as
+//! [`BuildOutcome::Skipped`], not an error), and because `roster.json` is fully
+//! recomputed from a fresh listing every time rather than accumulated, there is
+//! nothing for the loser's write to have contributed that the winner's doesn't
+//! already contain. A reader following the pointer never sees a torn write either
+//! way — an earlier version of this design elected exactly one builder via a
+//! maintenance lease so that fleet-wide request volume stayed O(N) instead of
+//! O(N^2); see `ctxlake_sync::presence`'s module doc for how that cost is now
+//! controlled instead (a cheap per-daemon backoff, not a lock).
+//!
+//! The only real fallback left is bootstrap: nobody has ever published
+//! `roster.json` yet (a fleet that just started, before any daemon's first
+//! build has landed). [`fetch`] falls back to [`list_intents_directly`] — the
+//! O(N) LIST + GETs, done ad hoc by whichever caller needs an answer right now —
+//! exactly in that case, and self-heals the moment any daemon's first `build`
+//! succeeds.
 
 use futures::StreamExt;
 use object_store::{
@@ -35,11 +38,9 @@ use object_store::{
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::clock::Clock;
 use crate::error::StoreError;
 use crate::intent::Intent;
 use crate::layout;
-use crate::lease;
 
 /// A merged view of every agent's intent, plus how it was produced.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,10 +54,11 @@ pub struct RosterSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RosterSource {
-    /// Produced by the maintenance-lease holder's periodic [`build`].
+    /// Produced by some daemon's periodic [`build`] — any number of daemons may
+    /// produce this, see the module doc.
     RosterBuild,
-    /// Produced ad hoc by a caller because no one currently holds the maintenance
-    /// lease — see the module doc.
+    /// Produced ad hoc by a caller because nobody has ever published
+    /// `roster.json` yet — see the module doc's bootstrap case.
     DirectList,
 }
 
@@ -99,15 +101,13 @@ async fn list_intents_directly(store: &dyn ObjectStore) -> Result<RosterSnapshot
 
 /// Merge every current intent into `live/roster.json`.
 ///
-/// Callers should only invoke this while holding [`crate::layout::lease_maintenance`]
-/// — this function does not check the lease itself, so that a caller doing its own
-/// lease bookkeeping (renewing, deciding whether to keep building) isn't forced
-/// through a redundant read here too. The write is still CAS'd against whatever
+/// Any caller may invoke this at any time — see the module doc for why several
+/// daemons doing so concurrently is fine. The write is CAS'd against whatever
 /// version of `roster.json` this call observed: `roster.json` is fully recomputed
 /// every cycle rather than accumulated, so a lost race here only ever discards a
-/// competing snapshot from the same instant — the CAS exists to stop a builder whose
-/// lease already expired from clobbering a *newer* roster with a *staler* one, not
-/// to protect against data loss (there isn't any to lose).
+/// competing snapshot from the same instant — the CAS exists to stop a builder
+/// working from a stale read from clobbering a *newer* roster with a *staler* one,
+/// not to protect against data loss (there isn't any to lose).
 ///
 /// The first-ever publish (no `roster.json` yet) uses `PutMode::Overwrite`, not
 /// `Create` — unlike a lease, there is no "someone already holds this, don't
@@ -152,32 +152,11 @@ pub enum Roster {
 }
 
 /// Fetch the roster the cheap way when possible, falling back to a direct listing
-/// when there is no *live* maintenance-lease holder to trust `roster.json`'s
-/// freshness — see the module doc. `clock` answers "is the lease's TTL still
-/// current," the same question `lease::acquire` asks before stealing, and for the
-/// same reason (AGENTS.md invariant 6): a lapsed maintainer must be judged lapsed
-/// by the store's clock, not by whichever caller happens to be polling.
+/// only when nobody has ever published `roster.json` yet — see the module doc.
 pub async fn fetch(
     store: &dyn ObjectStore,
-    clock: &dyn Clock,
     prior_etag: Option<&str>,
 ) -> Result<Roster, StoreError> {
-    let maintenance = lease::read(store, &layout::lease_maintenance()).await?;
-    let now = OffsetDateTime::from(clock.now().await?);
-    if maintenance.stealable(now) {
-        // Nobody is *live*-maintaining the roster right now: either nobody has
-        // ever held the lease, or the last holder's TTL has already lapsed. A
-        // `holder` on file past its own expiry (the sole-maintainer-died case the
-        // module doc describes) must be treated exactly like no holder at all —
-        // trusting `roster.json` here means trusting a snapshot nobody has
-        // refreshed since the outage began.
-        let snapshot = list_intents_directly(store).await?;
-        return Ok(Roster::Fresh {
-            snapshot,
-            etag: None,
-        });
-    }
-
     let opts = GetOptions {
         if_none_match: prior_etag.map(str::to_string),
         ..Default::default()
@@ -190,8 +169,8 @@ pub async fn fetch(
         }
         Err(OsError::NotModified { .. }) => Ok(Roster::Unchanged),
         Err(OsError::NotFound { .. }) => {
-            // A builder holds the lease but hasn't published its first roster yet
-            // (just took over). Same remedy as no builder at all.
+            // Bootstrap: nobody has ever published `roster.json` yet. Self-heals
+            // the moment any daemon's `build` succeeds.
             let snapshot = list_intents_directly(store).await?;
             Ok(Roster::Fresh {
                 snapshot,
@@ -205,10 +184,8 @@ pub async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::SystemClock;
     use ctxlake_core::Runtime;
     use object_store::memory::InMemory;
-    use std::time::Duration;
 
     async fn seed_intent(store: &dyn ObjectStore, agent_id: &str) {
         let intent = Intent {
@@ -241,12 +218,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_without_a_maintainer_falls_back_to_direct_list() {
+    async fn fetch_before_any_publish_falls_back_to_direct_list() {
         let store = InMemory::new();
-        let clock = SystemClock;
         seed_intent(&store, "cc-01").await;
-        // No one has ever acquired the maintenance lease.
-        let Roster::Fresh { snapshot, .. } = fetch(&store, &clock, None).await.unwrap() else {
+        // Nobody has ever called build() against this store yet.
+        let Roster::Fresh { snapshot, .. } = fetch(&store, None).await.unwrap() else {
             panic!("expected a fresh (fallback) roster");
         };
         assert_eq!(snapshot.source, RosterSource::DirectList);
@@ -257,90 +233,25 @@ mod tests {
     async fn fetch_reports_unchanged_on_a_matching_etag() {
         let store = InMemory::new();
         seed_intent(&store, "cc-01").await;
-        let clock = SystemClock;
-        lease::provision(&store, &layout::lease_maintenance())
-            .await
-            .unwrap();
-        let outcome = lease::acquire(
-            &store,
-            &clock,
-            &layout::lease_maintenance(),
-            "maintainer-1",
-            Some("roster-builder"),
-            Duration::from_secs(60),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, lease::AcquireOutcome::Acquired(_)));
         build(&store).await.unwrap();
 
-        let Roster::Fresh { etag, .. } = fetch(&store, &clock, None).await.unwrap() else {
+        let Roster::Fresh { etag, .. } = fetch(&store, None).await.unwrap() else {
             panic!("expected a fresh roster on the first fetch");
         };
         let etag = etag.expect("a real backend roster should carry an etag");
 
-        let second = fetch(&store, &clock, Some(&etag)).await.unwrap();
+        let second = fetch(&store, Some(&etag)).await.unwrap();
         assert!(matches!(second, Roster::Unchanged));
     }
 
     #[tokio::test]
-    async fn fetch_falls_back_once_the_sole_maintainer_dies_past_its_ttl() {
-        // Regression test: a maintainer that dies mid-hold leaves `holder:
-        // Some(..)` on a lease whose TTL has lapsed — exactly the "sole
-        // maintainer died and nobody has stolen the role yet" scenario the module
-        // doc names. The old `fetch` checked only `holder.is_none()`, so it kept
-        // trusting the pre-outage roster forever; a dead maintainer never looks
-        // like "no maintainer" under that check.
-        let store = InMemory::new();
-        let clock = SystemClock;
-        seed_intent(&store, "cc-01").await;
-
-        lease::provision(&store, &layout::lease_maintenance())
-            .await
-            .unwrap();
-        let outcome = lease::acquire(
-            &store,
-            &clock,
-            &layout::lease_maintenance(),
-            "maintainer-1",
-            None,
-            Duration::from_millis(10), // short TTL, deliberately left to lapse
-        )
-        .await
-        .unwrap();
-        assert!(matches!(outcome, lease::AcquireOutcome::Acquired(_)));
-        build(&store).await.unwrap(); // publishes a roster containing only cc-01
-
-        tokio::time::sleep(Duration::from_millis(30)).await; // TTL lapses; no release()
-
-        // A new agent starts up after the outage began — nobody has rebuilt the
-        // roster since, so a correct fetch must not report a roster that predates
-        // cc-02 even existing.
-        seed_intent(&store, "cc-02").await;
-
-        let Roster::Fresh { snapshot, .. } = fetch(&store, &clock, None).await.unwrap() else {
-            panic!("expected a fresh (fallback) roster once the maintainer's TTL lapsed");
-        };
-        assert_eq!(
-            snapshot.source,
-            RosterSource::DirectList,
-            "a lapsed maintainer must be treated as no maintainer, not as a still-valid one"
-        );
-        let mut ids: Vec<_> = snapshot.agents.iter().map(|a| a.agent_id.clone()).collect();
-        ids.sort();
-        assert_eq!(
-            ids,
-            vec!["cc-01".to_string(), "cc-02".to_string()],
-            "the fallback must see every currently-live agent, not the stale roster"
-        );
-    }
-
-    #[tokio::test]
     async fn a_stale_read_cannot_win_a_cas_write_after_a_fresher_publish() {
-        // build() itself always CASes against a version it just read, so it can
-        // never observe this race internally. What we're really guarding is the
-        // primitive build() relies on: prove directly that a version read *before*
-        // a fresher publish is rejected by the store, not merely trusted to be.
+        // This is the proof that several daemons building the roster concurrently
+        // (the module doc's "fine, not a bug") can't corrupt it: build() itself
+        // always CASes against a version it just read, so it can never observe
+        // this race internally. What we're really guarding is the primitive
+        // build() relies on: prove directly that a version read *before* a
+        // fresher publish is rejected by the store, not merely trusted to be.
         let store = InMemory::new();
         seed_intent(&store, "cc-01").await;
         build(&store).await.unwrap();

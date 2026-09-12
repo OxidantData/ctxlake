@@ -38,8 +38,10 @@ pub struct DaemonConfig {
     pub upload_poll_interval: Duration,
     /// Cache refresh interval — the docs' 5-15s staleness floor.
     pub cache_poll_interval: Duration,
-    /// Intent republish / lease renewal cadence — 60s, 1/5 of
-    /// [`crate::presence::MAINTENANCE_LEASE_TTL`].
+    /// Intent republish cadence — `docs/architecture.md`'s knob table gives 60s
+    /// as an example default. Also the presence loop's own tick interval, which
+    /// gates how promptly (not whether — see `crate::presence`'s module doc) a
+    /// due roster rebuild actually happens.
     pub presence_poll_interval: Duration,
 }
 
@@ -107,18 +109,10 @@ impl Daemon {
         });
 
         let cache_store = Arc::clone(&store);
-        let cache_clock = Arc::clone(&clock);
         let cache_rx = shutdown_rx.clone();
         let cache_interval = cfg.cache_poll_interval;
         let cache_handle = tokio::spawn(async move {
-            crate::cache::run(
-                cache_store,
-                cache_clock,
-                cache_cfg,
-                cache_interval,
-                cache_rx,
-            )
-            .await;
+            crate::cache::run(cache_store, cache_cfg, cache_interval, cache_rx).await;
         });
 
         let presence_store = Arc::clone(&store);
@@ -142,12 +136,11 @@ impl Daemon {
         }
     }
 
-    /// Signal every loop to stop after its current iteration, release the
-    /// maintenance lease if this daemon held it (inside `presence::run`'s own
-    /// shutdown tail), and wait for all three tasks to actually finish. Flushing is
-    /// implicit: each loop's own watermark/cache writes are already durable the
-    /// instant they happen (module docs), so there is no separate buffered state
-    /// here that a shutdown needs to flush on the way out.
+    /// Signal every loop to stop after its current iteration, and wait for all
+    /// three tasks to actually finish. Flushing is implicit: each loop's own
+    /// watermark/cache writes are already durable the instant they happen (module
+    /// docs), so there is no separate buffered state here that a shutdown needs to
+    /// flush on the way out.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         for handle in self.handles {
@@ -229,39 +222,6 @@ mod tests {
         assert!(
             roster_cache.exists(),
             "expected the cache loop to have run at least once"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_releases_the_maintenance_lease_if_this_daemon_held_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        ctxlake_store::lease::provision(store.as_ref(), &layout::lease_maintenance())
-            .await
-            .unwrap();
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-
-        let mut cfg = DaemonConfig::with_defaults(
-            "oxidant",
-            "cc-01",
-            Runtime::ClaudeCode,
-            dir.path().join("spool"),
-            dir.path().join("cache"),
-        );
-        cfg.presence_poll_interval = Duration::from_millis(10);
-        cfg.upload_poll_interval = Duration::from_millis(50);
-        cfg.cache_poll_interval = Duration::from_millis(50);
-
-        let daemon = Daemon::spawn(Arc::clone(&store), clock, cfg);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        daemon.shutdown().await;
-
-        let state = ctxlake_store::lease::read(store.as_ref(), &layout::lease_maintenance())
-            .await
-            .unwrap();
-        assert_eq!(
-            state.holder, None,
-            "a held maintenance lease must be released on graceful shutdown"
         );
     }
 }

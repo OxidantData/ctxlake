@@ -54,11 +54,11 @@
 //! passed through individually, exactly once, regardless of how many others in the
 //! same session share that hash.
 //!
-//! Callers must hold `live/leases/_maintenance` before calling anything here — this
-//! module does not acquire it itself, the same convention
-//! `ctxlake_store::roster::build` documents for the same reason: a caller already
-//! doing its own lease bookkeeping shouldn't be forced through a second, redundant
-//! check. See [`crate::run`].
+//! No lock guards this module, and none is needed: [`run`] is safe to call
+//! concurrently, from any number of hosts, over the same input — see
+//! [`crate::run`]'s module doc for why (the short version: `generation` below is
+//! a content hash, so two hosts compacting the same sealed-session set always
+//! land in the same directory with the same bytes).
 
 use std::collections::HashSet;
 

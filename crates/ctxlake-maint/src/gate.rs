@@ -7,17 +7,18 @@
 //! `ctxlake claims --status candidate --explain`) until a human or a later run
 //! with more evidence changes the outcome.
 //!
-//! **The caller must hold `lease_maintenance` before calling [`run`], and this
-//! module now makes that a compile-time requirement rather than a comment.**
-//! [`run`] takes a `&ctxlake_store::lease::LeaseHandle` and checks at runtime that
-//! its key is actually `lease_maintenance` — a lease for the wrong key is still a
-//! caller mistake worth rejecting, not a proof of anything. That is what makes
-//! `publish_fleet_state`'s plain overwrite and this module's total absence of a
-//! version column or a CAS retry loop correct rather than reckless — see
-//! `claims::publish_fleet_state`'s doc and AGENTS.md's maintenance chain. Gate
-//! logic is not the place to re-implement lease acquisition (renewal, stealing,
-//! TTL) — it is the place to require proof it already happened, which a
-//! `LeaseHandle` value only exists once `lease::acquire` has succeeded.
+//! **Nothing serializes [`run`] across hosts, on purpose.** An earlier version of
+//! this module required a fleet-wide maintenance lease before running, on the
+//! theory that `claims/fleet/`'s plain overwrite (`claims::publish_fleet_state`)
+//! was only safe because the gate was single-writer. That lease is gone: two
+//! concurrent gate runs must not double-promote, and they don't, because
+//! promotion is idempotent by fold semantics rather than by exclusivity —
+//! `claims::fold`'s handling of a repeated `Promoted` event for an
+//! already-promoted claim is a no-op (first promotion wins; see its own doc and
+//! test), so it doesn't matter which of two racing runs' events lands, or folds,
+//! first. Do not reintroduce a lock here — if a future check turns out not to be
+//! safe under concurrent runs, make *that check's* output idempotent by content,
+//! the same way this one is.
 
 use std::collections::HashMap;
 
@@ -477,54 +478,20 @@ pub struct GateRunSummary {
     pub demoted_by_quarantine: usize,
 }
 
-/// Proof that the caller holds `lease_maintenance` before it may touch
-/// single-writer state — `claims/fleet/` here, and `crate::calibrate`'s own
-/// quarantine/calibration events for the identical reason. Pulled out to one
-/// place so [`run`] and every entry point in `crate::calibrate` check the
-/// *same* thing the *same* way, rather than each reimplementing (and risking
-/// drifting from) this exact comparison — see AGENTS.md on why a duplicated
-/// resolver is a standing risk in this codebase, not a style nit.
-/// `caller` names the failing function in the error so a mismatched-lease bug
-/// report doesn't require guessing which of several call sites tripped it.
-pub(crate) fn require_maintenance_lease(
-    lease: &ctxlake_store::lease::LeaseHandle,
-    caller: &str,
-) -> Result<(), StoreError> {
-    let expected_key = ctxlake_store::layout::lease_maintenance();
-    if lease.key != expected_key {
-        // A `LeaseHandle` for some other key proves nothing about who else may be
-        // touching `claims/fleet/` right now — accepting it would make the type
-        // requirement above theater. This is a caller bug (wrong lease threaded
-        // through), not a race, so it fails loudly rather than silently trusting
-        // the wrong proof.
-        return Err(StoreError::Config(format!(
-            "{caller} requires a LeaseHandle for {expected_key} (lease_maintenance), got one for {}",
-            lease.key
-        )));
-    }
-    Ok(())
-}
-
 /// Fold every event, run the gate over every still-`candidate` claim, append the
 /// resulting events, and republish `claims/fleet/` for anything that changed
 /// status.
 ///
-/// `lease` must be a [`ctxlake_store::lease::LeaseHandle`] for
-/// `ctxlake_store::layout::lease_maintenance()` — see the module doc for why this
-/// is a parameter rather than a comment. It is not renewed or released here;
-/// callers own its lifecycle exactly as they do today, this just makes "did you
-/// remember to acquire it" a value you have to produce instead of a sentence you
-/// have to remember.
+/// Safe to call concurrently, from any number of hosts — see the module doc for
+/// why double-promotion can't happen even without a lock.
 pub async fn run(
     store: &dyn ObjectStore,
-    lease: &ctxlake_store::lease::LeaseHandle,
     ctx_at: &str,
     known_agents: &std::collections::HashSet<String>,
     session_windows: &HashMap<String, (String, String)>,
     injected_context_by_session: &HashMap<String, std::collections::HashSet<String>>,
     excerpt_resolves: impl Fn(&Evidence) -> bool,
 ) -> Result<GateRunSummary, StoreError> {
-    require_maintenance_lease(lease, "gate::run")?;
     let events = claims::list_events(store).await?;
     // Both folds read the exact same already-fetched `events` — no second
     // `list_events` round-trip just to learn who is quarantined or how an
@@ -699,33 +666,6 @@ mod tests {
             // about it. Tests that DO care (the provenance suite below)
             // override this per evidence item.
             observed_at: "2026-09-09T12:00:00Z".into(),
-        }
-    }
-
-    /// Acquire a real [`ctxlake_store::lease::LeaseHandle`] for
-    /// `lease_maintenance` against a fresh in-memory store — `gate::run` now
-    /// requires one (see the module doc), and `LeaseHandle`'s CAS `version` field
-    /// is private outside `ctxlake_store::lease`, so a test can't just construct
-    /// one by hand; it has to go through the real acquire path like any caller
-    /// would.
-    async fn test_maintenance_lease(store: &dyn ObjectStore) -> ctxlake_store::lease::LeaseHandle {
-        let key = ctxlake_store::layout::lease_maintenance();
-        ctxlake_store::lease::provision(store, &key).await.unwrap();
-        match ctxlake_store::lease::acquire(
-            store,
-            &ctxlake_store::clock::SystemClock,
-            &key,
-            "test-maintenance-runner",
-            None,
-            std::time::Duration::from_secs(300),
-        )
-        .await
-        .unwrap()
-        {
-            ctxlake_store::lease::AcquireOutcome::Acquired(handle) => handle,
-            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => {
-                panic!("a freshly provisioned lease on an empty store must always be acquirable")
-            }
         }
     }
 
@@ -1270,11 +1210,9 @@ mod tests {
         let known_agents = StdHashSet::from(["cc-01".to_string()]);
         let windows = windows_for(&["s1"]);
         let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
-        let lease = test_maintenance_lease(&store).await;
 
         let summary = run(
             &store,
-            &lease,
             "2026-09-09T12:05:00Z",
             &known_agents,
             &windows,
@@ -1312,11 +1250,9 @@ mod tests {
         let known_agents = StdHashSet::from(["cc-01".to_string()]);
         let windows = windows_for(&["s1"]);
         let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
-        let lease = test_maintenance_lease(&store).await;
 
         let summary = run(
             &store,
-            &lease,
             "2026-09-09T12:05:00Z",
             &known_agents,
             &windows,
@@ -1335,50 +1271,73 @@ mod tests {
         assert!(claims::list_fleet_claims(&store).await.unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn run_refuses_a_lease_for_the_wrong_key() {
-        // A LeaseHandle is a value, not magic — `run` must actually check which
-        // key it names rather than accepting any handle as proof someone,
-        // somewhere, holds *some* lease. Threading in a handle for an unrelated
-        // key is the caller-side bug this check exists to catch.
-        let store = object_store::memory::InMemory::new();
-        let wrong_key = object_store::path::Path::from("live/leases/not-maintenance");
-        ctxlake_store::lease::provision(&store, &wrong_key)
-            .await
-            .unwrap();
-        let wrong_lease = match ctxlake_store::lease::acquire(
-            &store,
-            &ctxlake_store::clock::SystemClock,
-            &wrong_key,
-            "someone-else",
-            None,
-            std::time::Duration::from_secs(300),
-        )
-        .await
-        .unwrap()
-        {
-            ctxlake_store::lease::AcquireOutcome::Acquired(h) => h,
-            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => unreachable!(),
-        };
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_runs_promoting_the_same_candidate_do_not_double_promote() {
+        // The test that replaces the maintenance lease at the `gate::run` level:
+        // two hosts racing to promote the exact same qualifying candidate — real
+        // OS threads, not just two futures on one executor (`InMemory`'s
+        // operations never actually suspend, so a single-threaded `join!` would
+        // just run them back to back and prove nothing about contention), and
+        // repeated several times because a race is not guaranteed to manifest on
+        // any one attempt. Whichever way it interleaves, the converged state must
+        // show exactly one fleet-scope claim, Promoted, agreeing with a fresh
+        // fold of the raw event log — never two, never neither.
+        for _ in 0..20 {
+            let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+            let p1 = crate::claims::ProposedClaim {
+                claim_id: "c1".into(),
+                claim: "staging SSH listens on 2222".into(),
+                claim_type: ClaimType::Environment,
+                subject: "staging".into(),
+                scope: Scope::Agent,
+                observed_by: "cc-01".into(),
+                observed_at: "2026-09-09T12:00:00Z".into(),
+                evidence: vec![evidence("s1", "m1")],
+                embedding: None,
+                resolves_at: None,
+            };
+            claims::append_proposed(store.as_ref(), "2026-09-09", &p1)
+                .await
+                .unwrap();
 
-        let known_agents = StdHashSet::new();
-        let windows = HashMap::new();
-        let injected = HashMap::new();
-        let err = run(
-            &store,
-            &wrong_lease,
-            "2026-09-09T12:05:00Z",
-            &known_agents,
-            &windows,
-            &injected,
-            always_resolves,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("lease_maintenance"),
-            "expected a lease-key error, got: {err}"
-        );
+            let spawn_run = |store: std::sync::Arc<object_store::memory::InMemory>| {
+                tokio::spawn(async move {
+                    let known_agents = StdHashSet::from(["cc-01".to_string()]);
+                    let windows = windows_for(&["s1"]);
+                    let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
+                    run(
+                        store.as_ref(),
+                        "2026-09-09T12:05:00Z",
+                        &known_agents,
+                        &windows,
+                        &injected,
+                        always_resolves,
+                    )
+                    .await
+                })
+            };
+
+            let (a, b) = tokio::join!(spawn_run(store.clone()), spawn_run(store.clone()));
+            a.unwrap().unwrap();
+            b.unwrap().unwrap();
+
+            let fleet = claims::list_fleet_claims(store.as_ref()).await.unwrap();
+            assert_eq!(
+                fleet.len(),
+                1,
+                "exactly one fleet-scope claim must exist after two racing promotions"
+            );
+            assert_eq!(fleet[0].status, ClaimStatus::Promoted);
+
+            let events = claims::list_events(store.as_ref()).await.unwrap();
+            let folded = claims::fold(events.iter());
+            let c1 = folded.get("c1").unwrap();
+            assert_eq!(
+                c1.status,
+                ClaimStatus::Promoted,
+                "folding the raw event log independently must agree with claims/fleet/"
+            );
+        }
     }
 
     // ---- "no evidence, no claim" applies even to a human-approved preference ----

@@ -1,32 +1,48 @@
-//! `run` — the maintenance chain under the lease. See `docs/architecture.md`'s
-//! maintenance-chain diagram.
+//! `run` — the maintenance chain: compact, digest, publish. See
+//! `docs/architecture.md`'s maintenance-chain diagram.
 //!
-//! Acquires `live/leases/_maintenance` ([`ctxlake_store::lease`]), renews it at each
-//! phase boundary, runs compact -> digest -> snapshot, releases cleanly. **If the
-//! lease cannot be acquired, this returns [`RunOutcome::LeaseHeldElsewhere`] — not
-//! an error.** Someone else is already doing this work, which is the system
-//! behaving correctly, not a failure to report.
+//! **No lock guards this, and none is needed.** An earlier version of this
+//! function acquired a fleet-wide maintenance lease before doing anything, and
+//! reported "lease held elsewhere" rather than run at all if it lost the race.
+//! That lease is gone: every step this chain calls is already idempotent by
+//! content, so two hosts running `run` at once — the case the lease was there to
+//! prevent — do redundant work at worst, never conflicting or corrupt work.
+//!
+//! - [`compact::run`] writes into `sessions/compacted/dt=.../fleet=.../gen=<hash
+//!   of the exact sealed-session set it folded in>/` (see
+//!   `ctxlake_store::layout::sessions_compacted_part`'s doc). Two hosts compacting
+//!   the same sessions compute the same hash and write the same bytes to the same
+//!   directory; a different session set lands in a different one. Neither can
+//!   overwrite or half-write the other's output, and a reader following
+//!   `_COMPACTED` never sees a torn generation.
+//! - [`digest::run_for_session`] recomputes a pure function of a sealed session's
+//!   own segments and overwrites in place — recomputing it twice, from two hosts
+//!   or from a retry, always reproduces the same bytes (see
+//!   `ctxlake_store::layout::session_digest`'s doc).
+//! - [`snapshot::publish`] writes an immutable, content-addressed blob and then
+//!   CAS-swaps `snapshot/latest.json` to point at it — the same write-then-CAS-
+//!   swap pattern every other content-addressed publish in this design uses.
+//!
+//! So concurrent `ctxlake maint` runs, on any number of hosts, at any overlap, are
+//! safe: a compaction generation is content-addressed, an extraction marker
+//! (`ctxlake_maint::extract::mark_extracted_if_new`) is a genuine create-if-absent
+//! claim so exactly one host extracts a given session, and the snapshot pointer
+//! only ever moves forward via CAS. **Do not reintroduce a lock here.** If a
+//! genuinely new step is added to this chain and it turns out not to be safe
+//! under concurrent runs, the fix is to make *that step* idempotent by content —
+//! a new marker, a new content-addressed directory — not to wrap the whole chain
+//! in exclusivity again.
 //!
 //! There is deliberately no fallback that does any of compact/digest/snapshot
-//! *without* holding the lease. That fallback is exactly what would turn "nothing
-//! holds the lease and no agent is running" into standing background compute — the
-//! zero-standing-compute property this whole design trades on. If nothing is
-//! scheduled to call `run`, nothing runs, and nothing breaks; that is correct, not a
-//! gap to paper over.
+//! *without* the chain actually running. If nothing is scheduled to call `run`,
+//! nothing runs, and nothing breaks; that is correct, not a gap to paper over.
 
-use std::time::Duration;
-
-use ctxlake_store::clock::Clock;
-use ctxlake_store::lease::{self, LeaseHandle};
 use object_store::ObjectStore;
 
 use crate::error::MaintError;
 use crate::{compact, digest, snapshot};
 
-/// Matches `docs/architecture.md`'s documented default lease TTL.
-pub const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
-
-/// What one full [`run`] call did, when it actually ran.
+/// What one full [`run`] call did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintenanceReport {
     pub dates_compacted: Vec<compact::CompactionOutcome>,
@@ -35,19 +51,7 @@ pub struct MaintenanceReport {
     pub snapshot: snapshot::SnapshotOutcome,
 }
 
-/// The result of one [`run`] call.
-#[derive(Debug)]
-pub enum RunOutcome {
-    Ran(MaintenanceReport),
-    /// Someone else holds the maintenance lease and its TTL hasn't lapsed. The
-    /// correct, expected outcome whenever more than one host's scheduler fires close
-    /// together — see the module doc.
-    LeaseHeldElsewhere,
-}
-
-/// Run the full maintenance chain for `fleet_id`, under the maintenance lease,
-/// identifying this attempt as `holder` (an operator- or host-stable string — see
-/// `docs/coordination.md` on lease holder identity).
+/// Run the full maintenance chain for `fleet_id`: compact -> digest -> publish.
 ///
 /// `agent_reads_enabled` is the boolean form of `docs/summarization.md`'s
 /// `[summarize] mode` (`shadow`/`none` -> `false`, everything else -> `true`) —
@@ -56,79 +60,18 @@ pub enum RunOutcome {
 /// `ctxlake.toml`-reading into this crate yet; whoever adds that wiring computes
 /// this value and passes it in, rather than this function reaching into a config
 /// module this crate's task brief excludes ("NOT extraction or gates").
+///
+/// Safe to call concurrently, from any number of hosts, over the same input —
+/// see the module doc for why.
 pub async fn run(
     store: &dyn ObjectStore,
-    clock: &dyn Clock,
     fleet_id: &str,
-    holder: &str,
-    agent_reads_enabled: bool,
-) -> Result<RunOutcome, MaintError> {
-    let lease_key = ctxlake_store::layout::lease_maintenance();
-    // A one-time, pre-contention step normally run by `ctxlake init` (see
-    // `lease.rs`'s module doc). Calling it here too costs one cheap GET once the
-    // key already exists (`provision` is a no-op in that case) and means a fleet
-    // that reaches its first maintenance run before `init` provisioned this key
-    // doesn't hard-fail with `LeaseNotProvisioned` instead of just acquiring.
-    lease::provision(store, &lease_key).await?;
-
-    let mut handle = match lease::acquire(
-        store,
-        clock,
-        &lease_key,
-        holder,
-        Some("maintenance"),
-        LEASE_TTL,
-    )
-    .await?
-    {
-        lease::AcquireOutcome::Acquired(h) => h,
-        lease::AcquireOutcome::NotAcquired { .. } => return Ok(RunOutcome::LeaseHeldElsewhere),
-    };
-
-    let report =
-        run_maintenance_chain(store, clock, fleet_id, &mut handle, agent_reads_enabled).await;
-
-    // Release regardless of whether the chain succeeded. A lease abandoned mid-crash
-    // is exactly the advisory-expiry case AGENTS.md invariant 5 already accounts
-    // for; releasing promptly on a clean error is strictly kinder to the next
-    // contender than making it wait out the full TTL.
-    let _ = lease::release(store, handle).await;
-
-    Ok(RunOutcome::Ran(report?))
-}
-
-/// Renew the lease at a phase boundary. `Err` here means someone else's steal
-/// already landed (our version is stale) — the chain must stop immediately rather
-/// than keep writing under the belief it still holds exclusivity, per
-/// `lease::renew`'s own contract: "the caller no longer holds the lease and should
-/// treat their critical section as over."
-async fn renew_or_stop(
-    store: &dyn ObjectStore,
-    clock: &dyn Clock,
-    handle: &mut LeaseHandle,
-) -> Result<(), MaintError> {
-    if lease::renew(store, clock, handle, LEASE_TTL).await? {
-        Ok(())
-    } else {
-        Err(MaintError::Other(
-            "maintenance lease was stolen mid-run; stopping rather than continuing without it"
-                .to_string(),
-        ))
-    }
-}
-
-async fn run_maintenance_chain(
-    store: &dyn ObjectStore,
-    clock: &dyn Clock,
-    fleet_id: &str,
-    handle: &mut LeaseHandle,
     agent_reads_enabled: bool,
 ) -> Result<MaintenanceReport, MaintError> {
     let mut dates_compacted = Vec::new();
     for date in compact::discover_dates(store).await? {
         dates_compacted.push(compact::run(store, &date, fleet_id).await?);
     }
-    renew_or_stop(store, clock, handle).await?;
 
     let thresholds = digest::FrictionThresholds::default();
     let mut digests_written = 0usize;
@@ -139,7 +82,6 @@ async fn run_maintenance_chain(
             digest::DigestOutcome::Skipped => digests_skipped += 1,
         }
     }
-    renew_or_stop(store, clock, handle).await?;
 
     let snapshot = snapshot::publish(store, agent_reads_enabled).await?;
 
@@ -156,16 +98,16 @@ mod tests {
     use super::*;
     use ctxlake_core::envelope::{Envelope, EventType};
     use ctxlake_core::Runtime;
-    use ctxlake_store::clock::SystemClock;
     use object_store::memory::InMemory;
     use object_store::{ObjectStoreExt, PutPayload};
+    use std::sync::Arc;
 
-    async fn seal_a_session(store: &dyn ObjectStore) {
+    async fn seal_a_session(store: &dyn ObjectStore, session_id: &str) {
         let mut e = Envelope::new(
             "oxidant",
             "cc-01",
             Runtime::ClaudeCode,
-            "sess-1",
+            session_id,
             EventType::ToolCall,
             "2026-09-11T18:22:00.000Z",
         );
@@ -176,7 +118,7 @@ mod tests {
             "oxidant",
             Runtime::ClaudeCode,
             "cc-01",
-            "sess-1",
+            session_id,
             0,
         );
         store.put(&seg, PutPayload::from(bytes)).await.unwrap();
@@ -185,7 +127,7 @@ mod tests {
             "oxidant",
             Runtime::ClaudeCode,
             "cc-01",
-            "sess-1",
+            session_id,
         );
         store
             .put(&sealed, PutPayload::from_static(b"{}"))
@@ -196,46 +138,23 @@ mod tests {
     #[tokio::test]
     async fn a_full_run_compacts_digests_and_publishes() {
         let store = InMemory::new();
-        let clock = SystemClock;
-        seal_a_session(&store).await;
+        seal_a_session(&store, "sess-1").await;
 
-        let outcome = run(&store, &clock, "oxidant", "host-a", true)
-            .await
-            .unwrap();
-        let RunOutcome::Ran(report) = outcome else {
-            panic!("expected the chain to run");
-        };
+        let report = run(&store, "oxidant", true).await.unwrap();
         assert_eq!(report.dates_compacted.len(), 1);
         assert_eq!(report.dates_compacted[0].sealed_session_count, 1);
         assert_eq!(report.digests_written, 1);
         assert_eq!(report.digests_skipped, 0);
         assert_eq!(report.snapshot.claim_count, 0);
-
-        // The lease must have been released, not left held.
-        let state = lease::read(&store, &ctxlake_store::layout::lease_maintenance())
-            .await
-            .unwrap();
-        assert_eq!(
-            state.holder, None,
-            "run() must release the lease when it finishes"
-        );
     }
 
     #[tokio::test]
     async fn a_second_run_right_after_is_a_clean_no_op_not_a_duplication() {
         let store = InMemory::new();
-        let clock = SystemClock;
-        seal_a_session(&store).await;
+        seal_a_session(&store, "sess-1").await;
 
-        run(&store, &clock, "oxidant", "host-a", true)
-            .await
-            .unwrap();
-        let RunOutcome::Ran(second) = run(&store, &clock, "oxidant", "host-a", true)
-            .await
-            .unwrap()
-        else {
-            panic!("lease was released; a second run must be able to acquire it");
-        };
+        run(&store, "oxidant", true).await.unwrap();
+        let second = run(&store, "oxidant", true).await.unwrap();
         assert!(
             second.dates_compacted[0].skipped,
             "compaction must recognize the partition as unchanged"
@@ -245,80 +164,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_concurrent_runs_exactly_one_does_work() {
-        // `object_store::memory::InMemory`'s async operations never actually
-        // suspend (nothing here is a real network call), so racing two `run()`
-        // futures through `tokio::join!` would just run them back-to-back on one
-        // executor thread — the first would acquire, do all its work, and release
-        // *before the second is ever polled*, which proves nothing about
-        // contention. What actually needs proving is `lease::acquire`'s exclusivity
-        // (already covered end-to-end in `ctxlake_store::lease`'s own test suite)
-        // wired correctly into `run`'s control flow — so this simulates the
-        // contended case the way `ctxlake_store::lease`'s own tests do
-        // (`second_contender_is_refused_while_held`): host-a is already mid-run
-        // (lease held, not yet released) when host-b's `run` is called.
+    async fn a_run_that_finds_nothing_still_exits_cleanly() {
         let store = InMemory::new();
-        let clock = SystemClock;
-        seal_a_session(&store).await;
-
-        let lease_key = ctxlake_store::layout::lease_maintenance();
-        lease::provision(&store, &lease_key).await.unwrap();
-        let lease::AcquireOutcome::Acquired(host_a_handle) = lease::acquire(
-            &store,
-            &clock,
-            &lease_key,
-            "host-a",
-            Some("maintenance"),
-            LEASE_TTL,
-        )
-        .await
-        .unwrap() else {
-            panic!("host-a should have acquired the never-before-held lease");
-        };
-
-        let outcome_b = run(&store, &clock, "oxidant", "host-b", true)
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome_b, RunOutcome::LeaseHeldElsewhere),
-            "host-b must not run the chain while host-a holds the lease: {outcome_b:?}"
-        );
-        // And host-b's attempt must not have touched anything — no compaction, no
-        // digest, no snapshot — exactly the "does no work" half of the property.
-        assert!(
-            store
-                .get(&ctxlake_store::layout::snapshot_latest())
-                .await
-                .is_err(),
-            "a run that never acquired the lease must not have published a snapshot"
-        );
-
-        // host-a's own in-flight lease must be completely undisturbed by host-b's
-        // failed attempt.
-        let state = lease::read(&store, &lease_key).await.unwrap();
-        assert_eq!(state.holder.as_deref(), Some("host-a"));
-
-        lease::release(&store, host_a_handle).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_run_that_finds_nothing_still_exits_cleanly_and_releases() {
-        let store = InMemory::new();
-        let clock = SystemClock;
-        let RunOutcome::Ran(report) = run(&store, &clock, "oxidant", "host-a", true)
-            .await
-            .unwrap()
-        else {
-            panic!("an idle fleet still owns the lease briefly to publish an empty snapshot");
-        };
+        let report = run(&store, "oxidant", true).await.unwrap();
         assert!(report.dates_compacted.is_empty());
         assert_eq!(report.digests_written, 0);
         assert_eq!(report.snapshot.claim_count, 0);
-
-        let state = lease::read(&store, &ctxlake_store::layout::lease_maintenance())
-            .await
-            .unwrap();
-        assert_eq!(state.holder, None);
     }
 
     /// `run`'s `agent_reads_enabled` parameter must actually reach `snapshot::publish`
@@ -328,18 +179,70 @@ mod tests {
     #[tokio::test]
     async fn agent_reads_enabled_threads_through_to_the_published_snapshot() {
         let store = InMemory::new();
-        let clock = SystemClock;
-
-        let RunOutcome::Ran(report) = run(&store, &clock, "oxidant", "host-a", false)
-            .await
-            .unwrap()
-        else {
-            panic!("expected the chain to run");
-        };
+        let report = run(&store, "oxidant", false).await.unwrap();
         assert!(
             !report.snapshot.agent_reads_enabled,
             "run(..., agent_reads_enabled: false) must not silently publish a \
              reads-enabled snapshot"
         );
+    }
+
+    /// This is the test that replaces the maintenance lease: two hosts calling
+    /// `run` over the exact same sealed sessions, genuinely concurrently (real OS
+    /// threads, not just two futures on one executor — `InMemory`'s operations
+    /// never actually suspend, so a single-threaded `join!` would just run them
+    /// back to back and prove nothing about contention), must converge on one
+    /// compaction generation and one coherent, readable snapshot — never two
+    /// different generations for the same input, never a pointer naming a blob
+    /// that doesn't exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_runs_over_the_same_input_converge_on_one_generation_and_one_snapshot() {
+        for _ in 0..10 {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            seal_a_session(store.as_ref(), "sess-1").await;
+            seal_a_session(store.as_ref(), "sess-2").await;
+
+            let store_a = store.clone();
+            let store_b = store.clone();
+            let (a, b) = tokio::join!(
+                tokio::spawn(async move { run(store_a.as_ref(), "oxidant", true).await }),
+                tokio::spawn(async move { run(store_b.as_ref(), "oxidant", true).await }),
+            );
+            let report_a = a.unwrap().unwrap();
+            let report_b = b.unwrap().unwrap();
+
+            assert_eq!(
+                report_a.dates_compacted[0].generation, report_b.dates_compacted[0].generation,
+                "two hosts compacting the same sealed-session set must compute the \
+                 identical generation, never two different directories for the same input"
+            );
+            assert_eq!(
+                report_a.snapshot.content_hash, report_b.snapshot.content_hash,
+                "two hosts publishing from the same claim history must compute the \
+                 identical content-addressed snapshot"
+            );
+
+            // One coherent snapshot at the end: the pointer names a blob that
+            // actually exists and matches what both runs computed.
+            let pointer = store
+                .get(&ctxlake_store::layout::snapshot_latest())
+                .await
+                .unwrap();
+            let pointer: serde_json::Value =
+                serde_json::from_slice(&pointer.bytes().await.unwrap()).unwrap();
+            assert_eq!(
+                pointer["content_hash"].as_str().unwrap(),
+                report_a.snapshot.content_hash
+            );
+            assert!(
+                store
+                    .get(&ctxlake_store::layout::snapshot(
+                        &report_a.snapshot.content_hash
+                    ))
+                    .await
+                    .is_ok(),
+                "the pointer must name a blob that actually exists"
+            );
+        }
     }
 }

@@ -729,17 +729,19 @@ pub struct SessionTranscript {
 
 /// Claim `claims/extracted/<session_id>` with `PutMode::Create`. `true` means
 /// this call is the one that gets to extract; `false` means someone (a prior
-/// run, or a racing holder on another host) already has.
+/// run, or a racing caller on another host) already has.
 ///
-/// This is a genuine create-if-absent lock, unlike a lease (AGENTS.md invariant
-/// 4 is about leases specifically, which already exist and only ever move
-/// between free/held via CAS `Update`). `claims/extracted/<id>` never exists
-/// before the first extraction and never needs a second state, so `Create` is
-/// the correct primitive here — with the same MinIO caveat as everywhere else in
+/// This is an idempotency **marker**, not a lock: there is no holder, no TTL, no
+/// renewal, no stealing, and nobody waits on it. `claims/extracted/<id>` never
+/// exists before the first extraction and never needs a second state — it either
+/// doesn't exist yet, or it does — so a plain `Create` fully answers "am I the
+/// one" in a single round trip, with the same MinIO caveat as everywhere else in
 /// this codebase that reaches for it (minio/minio#20346): on MinIO this call
 /// fails outright rather than succeeding-or-losing-a-race, so a MinIO-backed
 /// fleet will re-attempt extraction on every run until that is worked around.
-/// `ctxlake doctor`'s put-if-absent probe is what surfaces this ahead of time.
+/// `ctxlake doctor`'s put-if-absent probe is what surfaces this ahead of time. See
+/// `mark_extracted_if_new_under_real_concurrency_exactly_one_host_wins` below for
+/// proof that racing callers never both win.
 pub async fn mark_extracted_if_new(
     store: &dyn ObjectStore,
     session_id: &str,
@@ -1562,6 +1564,40 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn mark_extracted_if_new_under_real_concurrency_exactly_one_host_wins() {
+        // This is the test that replaces a lock at the extraction-marker level:
+        // "exactly one host extracts a given session" is a claim about real
+        // concurrent callers, not sequential ones — `mark_extracted_if_new_claims_
+        // exactly_once` above only proves the sequential case. Real OS threads
+        // (`InMemory`'s operations never actually suspend, so a single-threaded
+        // race would just run callers back to back and prove nothing about
+        // contention) racing the exact same session id, repeated because a race
+        // is not guaranteed to manifest on any single attempt.
+        for _ in 0..20 {
+            let store = std::sync::Arc::new(object_store::memory::InMemory::new());
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let store = store.clone();
+                handles.push(tokio::spawn(async move {
+                    mark_extracted_if_new(store.as_ref(), "sess-contended")
+                        .await
+                        .unwrap()
+                }));
+            }
+            let mut winners = 0;
+            for h in handles {
+                if h.await.unwrap() {
+                    winners += 1;
+                }
+            }
+            assert_eq!(
+                winners, 1,
+                "exactly one of several concurrent callers must win the claim"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn extract_session_skips_a_session_already_marked_extracted() {
         let store = object_store::memory::InMemory::new();
@@ -1872,28 +1908,8 @@ mod tests {
             std::collections::HashSet::from([claim_id.clone()]),
         );
 
-        let lease_key = ctxlake_store::layout::lease_maintenance();
-        ctxlake_store::lease::provision(&store, &lease_key)
-            .await
-            .unwrap();
-        let lease = match ctxlake_store::lease::acquire(
-            &store,
-            &ctxlake_store::clock::SystemClock,
-            &lease_key,
-            "test-maintenance-runner",
-            None,
-            std::time::Duration::from_secs(300),
-        )
-        .await
-        .unwrap()
-        {
-            ctxlake_store::lease::AcquireOutcome::Acquired(h) => h,
-            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => unreachable!(),
-        };
-
         let summary = crate::gate::run(
             &store,
-            &lease,
             "2026-09-12T10:00:00Z",
             &known_agents,
             &windows,

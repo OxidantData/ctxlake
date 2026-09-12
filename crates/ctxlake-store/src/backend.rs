@@ -99,8 +99,9 @@ pub fn build(url: &Url, opts: &BackendOptions) -> Result<(Arc<dyn ObjectStore>, 
     match url.scheme() {
         "file" => {
             // `object_store` 0.14's `LocalFileSystem` has no `PutMode::Update` at
-            // all (it returns `NotImplemented`) — see `local_cas` for why leases
-            // need real CAS here too, and how this wrapper provides it.
+            // all (it returns `NotImplemented`) — see `local_cas` for why every
+            // CAS-dependent caller (the roster fan-in, the snapshot pointer)
+            // needs real CAS here too, and how this wrapper provides it.
             //
             // `url.path()` is the raw, percent-*encoded* path component ("my
             // lake" comes back as "my%20lake") — handing that to `PathBuf`
@@ -180,8 +181,9 @@ pub struct BackendInfo {
     pub caveats: Vec<&'static str>,
 }
 
-const MINIO_NO_PUT_IF_ABSENT: &str = "no put-if-absent (minio/minio#20346) — ctxlake never \
-     relies on it; leases are CAS-only (AGENTS.md invariant 4)";
+const MINIO_NO_PUT_IF_ABSENT: &str = "no put-if-absent (minio/minio#20346) — ctxlake's own \
+     coordination (the roster fan-in, the snapshot pointer) never relies on it, only on real \
+     CAS (AGENTS.md invariant 4)";
 
 const R2_CONDITIONAL_WRITE_MODE: &str = "CAS depends on the bucket's conditional-write mode \
      being ETagMatch-compatible — a bucket created in the wrong mode returns success codes for \

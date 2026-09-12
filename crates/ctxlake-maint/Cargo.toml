@@ -11,15 +11,28 @@ authors.workspace = true
 [dependencies]
 ctxlake-core = { path = "../ctxlake-core" }
 ctxlake-store = { path = "../ctxlake-store" }
+# Envelope <-> Parquet encode/decode already lives in ctxlake-sync's codec module —
+# reusing it (rather than a second Arrow schema here) is exactly the fix the
+# "duplicate resolver" hard-won fact in AGENTS.md calls out: two independently
+# maintained schemas for the same on-disk bytes drift silently, the same way two
+# independently resolved `~/.ctxlake` paths did. ctxlake-sync has no dependency back
+# on this crate, so this is a plain downstream edge, not a cycle.
+ctxlake-sync = { path = "../ctxlake-sync" }
+object_store.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 rusqlite.workspace = true
 reqwest.workspace = true
 time.workspace = true
-
-[dev-dependencies]
+futures.workspace = true
+tracing.workspace = true
+# Building the SQLite snapshot artifact means giving rusqlite a real file path
+# (Connection::serialize/deserialize needs unsafe sqlite3_malloc-backed buffers on
+# the read side for no benefit here — see snapshot.rs's module doc), so this is a
+# runtime dependency, not just a dev one.
 tempfile.workspace = true

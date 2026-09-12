@@ -732,14 +732,19 @@ dependencies = [
  "arrow",
  "ctxlake-core",
  "ctxlake-store",
+ "ctxlake-sync",
+ "futures",
+ "object_store",
  "parquet",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

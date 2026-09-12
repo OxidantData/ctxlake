@@ -13,17 +13,21 @@ e.g. `s3://my-bucket/ctxlake`. This is the full tree, prefix by prefix.
     leases/<resource_key>.json                    # advisory lock — status: free | held, owner, expires_at
 
   sessions/                                       # data plane — single-writer append, bronze, immutable
-    runtime=<runtime>/agent=<agent_id>/date=<yyyy-mm-dd>/<session_id>.parquet
+    dt=<yyyy-mm-dd>/fleet=<fleet_id>/runtime=<runtime>/agent=<agent_id>/session=<session_id>/
+      seg-000000.parquet, seg-000001.parquet, ...  # appended one per flush; never rewritten once written
+      _SEALED                                      # marks the session done — compaction won't touch a dir without this
+      digest.json                                  # Tier 0 structural digest, written once by `ctxlake maint digest`
+    compacted/dt=<yyyy-mm-dd>/fleet=<fleet_id>/
+      part-000000.parquet, ...                     # `ctxlake maint compact`'s output — bronze above is never rewritten
+      _COMPACTED                                    # records which sealed sessions this partition's parts reflect
 
   claims/                                         # data plane — single-writer append
-    events/<agent_id>/<ulid>.json                 # proposed claims (memory_propose) — one file per proposal
+    events/dt=<yyyy-mm-dd>/agent=<agent_id>/<ulid>.json  # proposed claims (memory_propose) — one file per proposal
     fleet/<claim_id>.json                         # promoted claims — only the gate (ctxlake maint) writes here
 
   snapshot/                                       # serving plane — immutable publish + CAS pointer swap
-    briefing/<sha256-of-content>.json             # content-addressed, written once, never overwritten
-    briefing/current.json                         # tiny pointer object — CAS-updated to name the current blob
-    roster/<sha256-of-content>.json
-    roster/current.json
+    <sha256-of-content>.sqlite                    # content-addressed, written once, never overwritten — see below
+    latest.json                                   # tiny pointer object — CAS-updated to name the current blob
 
   quarantine/                                     # withheld content — see security.md
     <agent_id>/<date>/<ulid>.json                 # {status: quarantined, rules_fired, hash} — never the raw value
@@ -38,12 +42,33 @@ collide into the same lease). It's deterministic, so two agents locking the same
 logical resource always compute the same key without coordinating first, and it's
 plain hex, so it's a safe object-key component on every backend.
 
-**`sessions/` is Hive-partitioned** on `runtime`, `agent`, and `date` so any Parquet
-engine — DuckDB, Spark, Oxidant — can prune by any of the three without reading a
-manifest first. One file per session, written exactly once when the session's spool is
-sealed; nothing ever appends to an already-written session file, which is what makes
-"single-writer append" true at the *key* level even though each file's *rows* accumulate
-over the session's lifetime in the local spool before that one flush.
+**`sessions/` is Hive-partitioned** on `dt`, `fleet`, `runtime`, and `agent` so any
+Parquet engine — DuckDB, Spark, Oxidant — can prune by any of the four without reading
+a manifest first. Each session gets its own directory of `seg-*.parquet` files — one
+appended per confirmed flush, zero-padded so lexicographic `LIST` order is also
+numeric order — rather than one file, because a session's spool can flush more than
+once before it ends; nothing ever rewrites an already-written segment, which is what
+makes "single-writer append" true at the *key* level even though a session's *rows*
+accumulate over its lifetime. `_SEALED` is the marker that the session is done — see
+[`ctxlake-sync`'s upload loop](../crates/ctxlake-sync/src/upload.rs) for what writes it
+and [`ctxlake-maint`'s compaction](../crates/ctxlake-maint/src/compact.rs) for why it
+must never touch a directory without one (that would race the still-appending writer).
+
+**`sessions/<session>/digest.json`** is the Tier 0 structural digest —
+[summarization.md](summarization.md)'s always-on, no-LLM tier — computed purely from
+that one session's own sealed segments: files touched, commands and exit codes, token
+usage, and friction signals (a command failing repeatedly, a file edited past a
+threshold, a session abandoned after a run of failures). See
+[`ctxlake-maint/src/digest.rs`](../crates/ctxlake-maint/src/digest.rs).
+
+**`sessions/compacted/`** is where `ctxlake maint compact` writes — never into the
+`dt=.../session=.../` directories above. Bronze is immutable, so compaction only ever
+*adds* a derived, queryable rewrite of a whole `(date, fleet)` partition into fewer,
+larger files, deduped on `content_hash` (with one deliberate exception: an envelope
+that never set `content` — every plain tool call — is never deduped against another
+one just because both hash the same empty string; see the module's own doc for why
+that distinction matters). `_COMPACTED` records exactly which sealed sessions were
+folded in, so a second run over an unchanged partition is a no-op, not a duplication.
 
 **`claims/events/` vs `claims/fleet/`** are deliberately two different prefixes, not
 one with a status field, because they have different write permissions: any agent can
@@ -52,10 +77,17 @@ inside `ctxlake maint` ever writes under `claims/fleet/` (AGENTS.md invariant 9)
 prefixes make that boundary checkable by bucket policy, not just by convention — see
 [security.md](security.md)'s IAM section.
 
-**`snapshot/*/current.json`** is small on purpose — it holds nothing but a reference
-(content hash, maybe a timestamp) to the real blob sitting under the same prefix. That
-smallness is why the pointer swap is cheap and fast even though the thing it points at
-can be large: the CAS write that matters is a few dozen bytes, not the whole briefing.
+**`snapshot/latest.json`** is small on purpose — it holds nothing but `{content_hash}`,
+a reference to the real blob sitting alongside it. That smallness is why the pointer
+swap is cheap and fast even though the thing it points at can be large: the CAS write
+that matters is a few dozen bytes, not the whole snapshot. Today that blob is a SQLite
+file — `ctxlake maint snapshot`'s fold of `claims/events/` into one `claims` table, an
+FTS5 index over claim text, and an (as yet unpopulated) 256-dim `embedding` BLOB column
+— published write-then-swap: the blob lands first, the pointer only ever points at a
+blob that's already there. See
+[`ctxlake-maint/src/snapshot.rs`](../crates/ctxlake-maint/src/snapshot.rs) for the exact
+schema and [`ctxlake-sync`'s cache module](../crates/ctxlake-sync/src/cache.rs) for how
+it's mirrored down to every host, byte-for-byte, without knowing what's inside it.
 
 **`quarantine/`** never holds the secret it's naming. See
 [`RedactionOutcome::Quarantined`](../crates/ctxlake-core/src/redact.rs) — the object

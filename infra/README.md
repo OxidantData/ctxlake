@@ -9,7 +9,7 @@ anything here blindly**; it is a description, not a provisioning script.
 | Resource | Identifier |
 |---|---|
 | S3 bucket | `oxidantdata-docs-320107919290` (us-east-1, all public access blocked) |
-| CloudFront distribution | `E5S9QVG3JL86S` → `drf9zt30vjszj.cloudfront.net` |
+| CloudFront distribution | `E5S9QVG3JL86S` → `ctxlake.oxidantdata.com` |
 | Origin Access Control | `ctxlake-docs-oac` (`E114JFCFIMWEIG`) |
 | Deploy role | `arn:aws:iam::320107919290:role/ctxlake-docs-deploy` |
 
@@ -42,12 +42,26 @@ invalidating the marketing site.
 **OIDC trust is `refs/heads/main` of this repo only**, in both the plain and numeric-id
 `sub` forms, matching the convention the existing `oxidant-site-deploy` role uses.
 
-## Not done
+## Custom domain
 
-**No custom domain.** The site answers on its CloudFront domain. `docs.oxidantdata.com`
-needs an ACM certificate in us-east-1 and a DNS record, which is a decision about the
-domain rather than about this repo.
+`https://ctxlake.oxidantdata.com` — ACM certificate
+`ce0ab97f-1f24-49bd-9362-2430f8c18d71` (us-east-1, DNS-validated), attached to the
+distribution as its sole alias, with A and AAAA alias records in hosted zone
+`Z0794502B7ZXSE8UV137` pointing at the distribution.
 
-To add it later: request the cert, validate it, add the alias plus
-`ViewerCertificate` to `E5S9QVG3JL86S`, and point a CNAME at
-`drf9zt30vjszj.cloudfront.net`.
+Two details worth keeping:
+
+**The certificate must be in us-east-1** regardless of where anything else lives.
+CloudFront reads certificates from that region only.
+
+**`Z2FDTNDATAQYW2` is not this zone's id.** It is CloudFront's fixed, global hosted-zone
+id, used as the `AliasTarget.HostedZoneId` for every distribution alias record. Putting
+the real zone id there is a common and confusing failure.
+
+Setting an alias without also setting `ViewerCertificate` leaves CloudFront serving its
+default `*.cloudfront.net` certificate, which does not cover the alias — every request to
+the custom domain then fails TLS while the CloudFront domain keeps working. Both were set
+in the same update.
+
+The marketing site's distribution was not touched; this is a separate one, and
+`https://oxidantdata.com` was verified still serving afterwards.

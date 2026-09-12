@@ -60,7 +60,7 @@ pass/fail matrix rather than assuming.
 
 ## Documentation
 
-**<https://drf9zt30vjszj.cloudfront.net/>** — or read the same files on GitHub, starting
+**<https://ctxlake.oxidantdata.com/>** — or read the same files on GitHub, starting
 with [`docs/getting-started.md`](docs/getting-started.md); the full index is in
 [`docs/README.md`](docs/README.md). If you are debugging,
 [`docs/architecture.md`](docs/architecture.md) is an operator's map of every component.

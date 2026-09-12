@@ -16,3 +16,7 @@ site/.vitepress/dist
 
 # agent worktrees and session scratch — never part of the repo
 .claude/
+
+# Python bytecode from running docs/checks/ locally.
+__pycache__/
+*.pyc

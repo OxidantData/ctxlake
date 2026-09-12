@@ -88,6 +88,28 @@ fn s3_builder(bucket: &str, opts: &BackendOptions) -> AmazonS3Builder {
     if let Some(v) = &opts.session_token {
         builder = builder.with_token(v);
     }
+
+    // Last, and only if nothing above supplied a key: the shared credentials file.
+    // `object_store` does not read it (env, IMDS, ECS and web identity only), so
+    // without this a laptop with a perfectly good `aws` CLI falls through to
+    // instance metadata and spends ~16s failing to reach 169.254.169.254. Explicit
+    // options and environment variables both still win — see `aws_profile::load`.
+    if opts.access_key_id.is_none() {
+        if let Some(p) = crate::aws_profile::load() {
+            builder = builder
+                .with_access_key_id(&p.access_key_id)
+                .with_secret_access_key(&p.secret_access_key);
+            if let Some(t) = &p.session_token {
+                builder = builder.with_token(t);
+            }
+            if opts.region.is_none() {
+                if let Some(r) = &p.region {
+                    builder = builder.with_region(r);
+                }
+            }
+        }
+    }
+
     builder
         .with_allow_http(opts.allow_http)
         .with_virtual_hosted_style_request(opts.virtual_hosted_style_request)

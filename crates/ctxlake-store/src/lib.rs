@@ -27,6 +27,7 @@
 //!   builders may race to write it.
 //! - [`probe`] — `ctxlake doctor`'s capability matrix.
 
+pub mod aws_profile;
 pub mod backend;
 pub mod clock;
 mod error;

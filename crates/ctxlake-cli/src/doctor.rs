@@ -263,8 +263,9 @@ impl Report {
                 age.as_secs()
             ),
             None => println!(
-                "  never — ctxlake-maint has not published a snapshot yet (optional: \
-                 `ctxlake maint` from cron/systemd, or run it by hand; see docs/reference.md)"
+                "  never — no snapshot published yet. `ctxlake sync` runs the \
+                 maintenance chain every 5 min; `ctxlake maint --once` forces a cycle \
+                 now (docs/reference.md)"
             ),
         }
 

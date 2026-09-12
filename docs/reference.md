@@ -270,9 +270,28 @@ Everything below `agent_id` is optional and defaults exactly as shown. A file wi
 
 | Field | Meaning |
 |---|---|
-| `store` — required | `s3://bucket/prefix`, `gs://…`, `az://…` (also `abfs://`/`abfss://`), or `file:///absolute/path`. Credentials are never part of this line — every backend but `file://` reads them the way its own SDK does |
+| `store` — required | `s3://bucket/prefix`, `gs://…`, `az://…` (also `abfs://`/`abfss://`), or `file:///absolute/path`. Credentials are never part of this line — see **Credentials** below |
 | `fleet_id` — required | The boundary of who sees whom. Map it to a team genuinely collaborating, not to a company |
 | `agent_id` — required | A stable logical identity — not a hostname, and not something that changes across restarts |
+
+### Credentials
+
+Resolved in this order, first match wins:
+
+| Source | Notes |
+|---|---|
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`) | Always wins, so an explicit export is never overridden by a stale file |
+| `~/.aws/credentials`, profile from `AWS_PROFILE` or `default` | Static keys only. Region comes from there or `~/.aws/config` |
+| EC2 instance role / ECS task role / web identity | What `object_store` resolves on its own |
+
+> **SSO, `credential_process` and assume-role profiles are not read.** They all mint
+> *temporary* credentials that expire under a long-running daemon, and quietly handing
+> a daemon credentials that expire is worse than saying so. `ctxlake doctor` names the
+> mechanism when it spots one instead of reporting an unhelpful "store unreachable".
+
+The daemon installed by `ctxlake sync install` has no shell, so it never sees an
+exported variable — it reads `~/.aws/credentials` under the `HOME` the unit pins.
+That is the case worth checking before you rely on a supervised daemon.
 
 ### `[summarize]`
 

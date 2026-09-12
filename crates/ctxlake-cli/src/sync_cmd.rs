@@ -129,11 +129,35 @@ pub async fn run_foreground_until(
     cache_root: PathBuf,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    // Before anything starts: if Tier 2 is configured, prove the provider can
-    // actually be built. A daemon that comes up healthy and then fails the same way
-    // on every maintenance tick, into a log file nobody reads, is the failure mode
-    // this whole project keeps re-learning.
-    crate::maint_cmd::validate_tier2(cfg)?;
+    // If Tier 2 is configured, say up front whether the provider can be built — but
+    // do NOT refuse to start over it.
+    //
+    // This used to be `validate_tier2(cfg)?`, on the reasoning that a daemon failing
+    // the same way on every tick into a log nobody reads is worse than one that
+    // refuses loudly. That reasoning was right about the symptom and wrong about the
+    // blast radius, and a real install proved it: `provider = "claude-cli"` resolves
+    // fine in the shell that ran `sync install` and not at all under launchd, whose
+    // PATH is `/usr/bin:/bin:/usr/sbin:/sbin` and does not contain Homebrew. The
+    // daemon exited 1 before starting a single loop, the supervisor restarted it, and
+    // it exited 1 again — fourteen times, with `sync status` reporting only
+    // "activating" / "spawn scheduled" and no hint at the log that held the reason.
+    //
+    // The store legs are not optional and the model is: capture shipping, cache
+    // refresh, and presence have nothing to do with Tier 2. Taking all three down
+    // because an *optional* summarizer is unreachable inverts their importance, and
+    // it does it in the mode where the user can least see why.
+    //
+    // So: warn, start everything, and let `maintenance_loop` rebuild the provider on
+    // each cycle — which also means a key that comes back, or a `claude` that gets
+    // installed, heals without anyone restarting anything.
+    if let Err(e) = crate::maint_cmd::validate_tier2(cfg) {
+        eprintln!("warning: Tier 2 extraction is configured but unavailable: {e:#}");
+        eprintln!(
+            "warning: the daemon is starting anyway — capture, cache and presence do \
+             not depend on it. Claims will not be extracted until it resolves; each \
+             maintenance cycle retries."
+        );
+    }
 
     let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
     let store = store_ctx::prefixed_store(&ctx);
@@ -169,10 +193,12 @@ pub async fn run_foreground_until(
 /// envelope codec, so the edge would be a cycle. The CLI is the one place that
 /// already has both, plus the resolved config the chain needs.
 ///
-/// **A failed cycle logs and continues.** Maintenance is batch work that nothing is
-/// waiting on; a store that is briefly unreachable should cost a skipped pass, not a
-/// dead daemon that also stops shipping the spool. The one failure that *is* fatal —
-/// an unbuildable Tier 2 provider — is caught before this loop ever starts.
+/// **Every failed cycle logs and continues** — including an unbuildable Tier 2
+/// provider, which this loop rebuilds from config on each pass. Maintenance is batch
+/// work that nothing is waiting on; a store that is briefly unreachable, or a model
+/// that is, should cost a skipped pass rather than a dead daemon that also stops
+/// shipping the spool. Retrying from config each cycle is also what lets a provider
+/// that becomes reachable later start working without a restart.
 async fn maintenance_loop(cfg: Config, mut stop: tokio::sync::oneshot::Receiver<()>) {
     let interval = interval_override("CTXLAKE_SYNC_MAINT_INTERVAL_MS", MAINT_INTERVAL);
     loop {
@@ -378,6 +404,92 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg(dir.path(), "ctxlake-cli-test-fleet-never-real", "cc-01");
         assert!(status(&cfg).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_tier2_provider_does_not_stop_the_daemon_from_starting() {
+        // The bug this pins, from a real install on two machines:
+        //
+        //   provider = "claude-cli" resolves in the shell that ran `sync install` and
+        //   not under launchd, whose PATH is /usr/bin:/bin:/usr/sbin:/sbin. The daemon
+        //   exited 1 before starting a loop; the supervisor restarted it; it exited 1
+        //   again — fourteen times on macOS, with `sync status` saying only
+        //   "spawn scheduled" and nothing pointing at the log holding the reason.
+        //
+        // The damage was not the missing claims. It was that spool shipping, cache
+        // refresh and presence — none of which involve a model — were all down because
+        // an *optional* summarizer was unreachable. `service.rs` now pins a PATH so
+        // this particular provider resolves; this test is about the blast radius, and
+        // holds for any unreachable provider: a revoked key, an endpoint that moved, a
+        // machine that lost the binary after install.
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let spool_dir = dir.path().join("spool");
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::create_dir_all(spool_dir.join("claude_code")).unwrap();
+
+        {
+            use std::io::Write as _;
+            let mut f =
+                std::fs::File::create(spool_dir.join("claude_code").join("sess-1.ndjson")).unwrap();
+            let e = ctxlake_core::Envelope::new(
+                "tier2-down-fleet",
+                "cc-01",
+                ctxlake_core::Runtime::ClaudeCode,
+                "sess-1",
+                ctxlake_core::EventType::ToolCall,
+                "2026-09-11T18:22:00.000Z",
+            );
+            writeln!(f, "{}", e.to_ndjson().unwrap()).unwrap();
+        }
+
+        let mut cfg = cfg(&store_dir, "tier2-down-fleet", "cc-01");
+        // Shadow runs Tier 2 in full, so this is the configuration a user following
+        // `ctxlake init --llm ...` actually ends up with.
+        cfg.summarize.mode = crate::config::SummarizeMode::Shadow;
+        cfg.summarize.batch = Some(crate::config::BatchConfig {
+            provider: crate::config::ProviderKind::Anthropic,
+            model: "no-such-model".into(),
+            // A variable no test process sets — which is also precisely how this fails
+            // in production: a supervisor does not inherit the `export` from the shell
+            // that ran `ctxlake doctor`.
+            api_key_env: "CTXLAKE_TEST_KEY_THAT_IS_NEVER_SET".into(),
+            base_url: None,
+            use_batch_api: false,
+            max_sessions_per_run: 1,
+            max_input_tokens: 100,
+        });
+
+        assert!(
+            crate::maint_cmd::validate_tier2(&cfg).is_err(),
+            "the fixture must actually be unbuildable, or this test proves nothing"
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cfg_for_task = cfg.clone();
+        let handle = tokio::spawn(async move {
+            run_foreground_until(&cfg_for_task, None, spool_dir, cache_dir, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let pid_path = paths::pid_file(&cfg.fleet_id);
+        assert!(
+            pid_path.exists(),
+            "the daemon must come up and write a pidfile even with Tier 2 unreachable \
+             — capture, cache and presence do not depend on a model"
+        );
+
+        let _ = tx.send(());
+        handle
+            .await
+            .unwrap()
+            .expect("an unreachable Tier 2 provider must not make the daemon exit non-zero");
+        assert!(!pid_path.exists(), "pidfile must be cleaned up on shutdown");
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ exceptions are flagged inline — `ctxlake mcp` and `ctxlake install hermes`.
 
 | Command | What it does |
 |---|---|
+| `ctxlake update` | Update to the latest release, however this copy was installed |
 | `ctxlake init` | Point at a store, write `ctxlake.toml` |
 | `ctxlake doctor` | Execute every store primitive against your bucket; detect runtimes |
 | `ctxlake import` | Backfill history already on disk |
@@ -18,11 +19,43 @@ exceptions are flagged inline — `ctxlake mcp` and `ctxlake install hermes`.
 | `ctxlake maint` | Run the maintenance chain — safe from any number of hosts at once |
 | `ctxlake claims` | Review candidate / contested / promoted claims |
 | `ctxlake quarantine` | Stop one agent's claims from promoting |
+| `ctxlake briefing` | Render the session briefing, or write it to the cache the hook reads |
 | `ctxlake mcp` | The stdio MCP server — **not wired up yet**, see [MCP tools](#mcp-tools) |
 
 Every subcommand accepts `--config <path>` to point at a `ctxlake.toml` elsewhere than
 `$XDG_CONFIG_HOME/ctxlake/ctxlake.toml` (or `~/.config/ctxlake/ctxlake.toml` when
 `XDG_CONFIG_HOME` is unset) — useful for running more than one agent identity per host.
+
+### `ctxlake update`
+
+```sh
+ctxlake update [--check]
+```
+
+Updates `ctxlake` **and** `ctxlake-hook` to the latest release. `--check` reports
+whether a newer one exists and changes nothing.
+
+It infers how this copy was installed from where the binary lives, rather than
+remembering anything at install time — nothing writes a receipt, and a remembered one
+would be wrong the moment someone moved the file.
+
+| Where the binary is | What `update` does |
+|---|---|
+| Under a Homebrew prefix | `brew update && brew upgrade oxidantdata/tap/ctxlake` |
+| `~/.cargo/bin` | `cargo install --git ... --tag <latest> --force` (compiles) |
+| Anywhere else | Downloads the release archive, verifies it against `SHA256SUMS`, replaces both binaries |
+| A `target/{debug,release}` directory | Refuses — that is a checkout, not an install |
+
+**A package manager's files are never written to directly.** Dropping a new binary into
+a Cellar leaves Homebrew's manifest describing a file that is no longer there:
+`brew list --versions` reports the old version and the next `brew upgrade` silently
+overwrites the update.
+
+**Replacement is by rename, never in place.** `ctxlake-hook` fires on every tool call in
+every live agent session on the machine; writing over it in place would mean some
+session's hook executes a half-written file. A rename is atomic, and a process that
+already has the old binary open keeps it — which is also why `update` restarts the sync
+daemon afterwards, if one is installed.
 
 ### `ctxlake init`
 
@@ -88,7 +121,7 @@ ctxlake import --dry-run          # count and classify, write nothing
 ```
 
 Resumable and idempotent; deduplicated by content hash. Per-runtime fidelity is in
-[adding-it.md](adding-it.md).
+[Adding it](adding-it.md).
 
 ### `ctxlake install` / `ctxlake uninstall`
 
@@ -119,7 +152,7 @@ prints a line-level diff without writing. `--all` targets every runtime whose co
 exists; a runtime with no config file is left untouched.
 
 > **`ctxlake install hermes` does not exist yet.** Write the `hooks:` block by hand for
-> now — [runtimes.md](runtimes.md) has it.
+> now — [Runtimes](runtimes.md) has it.
 
 ### `ctxlake status`
 
@@ -143,10 +176,18 @@ heartbeat, and the **maintenance chain** every 5 minutes. Without it running som
 sessions sit in the spool and never reach the lake — and because the hook only ever writes
 locally, nothing tells you it stopped. That is why `install` exists.
 
-A maintenance cycle that fails is logged and retried next tick: a briefly unreachable
-store should cost a skipped pass, not a dead daemon that also stops shipping the spool.
-The one failure that is fatal — a `[summarize.batch]` whose key cannot be resolved — is
-caught before the daemon starts, so it exits 78 and the unit declines to restart it.
+**Every failure is logged and retried next tick**, including an unreachable
+`[summarize.batch]` provider, which the daemon rebuilds from config on each cycle — so a
+key that comes back, or a `claude` binary that gets installed, starts working without
+anyone restarting anything.
+
+Nothing about the model is allowed to stop the daemon starting. An earlier version
+treated an unbuildable provider as fatal, on the reasoning that failing loudly beats
+failing into a log nobody reads. That was right about the symptom and wrong about the
+blast radius: capture shipping, cache refresh and presence have nothing to do with a
+model, and taking all three down because an *optional* summarizer is unreachable is
+strictly worse than missing some claims — especially under a supervisor, where it
+becomes a restart loop reported as nothing more informative than `activating`.
 
 `start`/`stop`/`restart`/`status` mean the same thing either way: with a service
 installed they drive systemd or launchd, without one they drive a detached child process
@@ -160,6 +201,14 @@ waits 5 seconds, and reports what actually happened.
 | Scope | systemd **user** unit | **LaunchAgent** |
 | Starts at | login, and on `install` | login, and on `install` |
 | Survives reboot | **only with lingering** (below) | yes |
+
+The unit pins `HOME` and `PATH` rather than inheriting them. Both supervisors start jobs
+with an environment that is not yours: launchd supplies its own `HOME` from the user
+record and a `PATH` of `/usr/bin:/bin:/usr/sbin:/sbin`. `install` writes the values it
+ran with, so the pre-install checks and the daemon resolve the same files and the same
+binaries. It also writes the **stable** path to `ctxlake` — not the version-stamped one a
+package manager resolves to, which the next upgrade deletes.
+
 
 Both are user-scoped deliberately: the daemon reads *your* spool and writes with *your*
 store credentials. A system unit or LaunchDaemon runs as root and would reach neither.
@@ -176,8 +225,15 @@ store credentials. A system unit or LaunchDaemon runs as root and would reach ne
 |---|---|
 | The store is unreachable | The daemon would come up `active` and ship nothing |
 | A CAS or conditional-GET probe fails | No roster fan-in, no snapshot publish |
-| `[summarize.batch]` is set but its `api_key_env` is not | Every maintenance cycle would fail identically, in a log nobody reads |
+| `[summarize.batch]` is set but its `api_key_env` is not | Nothing would ever extract, and you asked for extraction |
 | The key resolves but the provider rejects a live call | A revoked key or typo'd model resolves fine and fails hours later |
+
+A key that resolves *only in your shell* is a **warning**, not a blocker: someone running
+the daemon under their own supervisor, or with a systemd drop-in carrying their own
+`EnvironmentFile=`, has a working setup this cannot see — and since an unreachable
+provider no longer takes the daemon down with it, being wrong in that direction costs
+claims rather than capture. See
+[Provider keys and the daemon](#provider-keys-and-the-daemon-config-ctxlake-env).
 
 Missing runtime hooks are a warning, not a blocker — wiring a runtime after the daemon is
 an ordinary order to do things in. `--skip-checks` overrides the whole gate for an
@@ -190,6 +246,23 @@ air-gapped host; the daemon will then start and fail at whatever you skipped.
 > systemd gives up immediately instead of relaunching every five seconds forever.
 > Everything else exits 1, so a genuinely transient failure (an unreachable store) is
 > still retried.
+
+### `ctxlake briefing`
+
+```sh
+ctxlake briefing            # render it to stdout — what an agent would be told
+ctxlake briefing --write    # write it to <cache>/<fleet_id>/briefing.json
+```
+
+The read path's expensive half. Listing the roster, folding claims, and applying
+attribution all need the lake, and the hook may not touch the object store under its 5ms
+budget — so rendering happens here and the hook only reads the result. `ctxlake sync`
+calls `--write` on its cache loop; running it by hand is how you see exactly what your
+next session will open with.
+
+The hook **fails open** on every path: no cache, unreadable file, malformed JSON, daemon
+never started — each yields a normal session with no briefing. A missing briefing costs
+an agent some context; a hook that fails a session start costs you the turn.
 
 ### `ctxlake maint`
 
@@ -204,12 +277,12 @@ One chain, in order:
 |---|---|
 | Compact small Parquet files | always |
 | Write Tier 0 digests for newly sealed sessions | always |
-| Tier 2 batch extraction | `[summarize.batch]` is configured — see [memory.md](memory.md#turning-on-tier-2) |
+| Tier 2 batch extraction | `[summarize.batch]` is configured — see [Memory](memory.md#turning-on-tier-2) |
 | Promotion gate | always, even with no Tier 2 config — `memory_propose` candidates still need gating |
 | Publish `snapshot/` | always, after the gate, so a claim promoted this run is in this run's snapshot |
 
 **Safe to schedule on every host, or none** — no lock, no primary host, because every step
-is idempotent by content ([how-it-works.md](how-it-works.md)). Overlapping runs cost
+is idempotent by content ([How it works](how-it-works.md)). Overlapping runs cost
 redundant work, never corrupted output. If nobody runs it, capture and coordination keep
 working; the lake just stays as fresh as the last pass.
 
@@ -239,7 +312,7 @@ ctxlake quarantine <agent_id>
 
 Its claims stop promoting, its already-promoted claims move to `contested`, and capture
 continues. There is no `ctxlake unquarantine` yet, but the marker is a plain object at a
-known key. See [memory.md](memory.md) for the known gap between this command and the
+known key. See [Memory](memory.md) for the known gap between this command and the
 gate.
 
 ## Configuration — `ctxlake.toml`
@@ -309,6 +382,39 @@ backend: AWS S3
   UNREACHABLE: ... 403 Forbidden ... AccessDenied
       -> this is an authorization failure, not a network one — the request was signed and refused.
 ```
+
+### Provider keys and the daemon — `~/.config/ctxlake/env`
+
+The same "a service has no shell" problem applies to LLM provider keys, and it is
+easier to miss because everything looks fine from a terminal.
+
+`ctxlake.toml` holds the **name** of an environment variable, never a key. That name has
+to resolve *where the daemon runs*, and a launchd job or a systemd user unit starts with
+neither your exports nor your shell rc. So:
+
+```sh
+mkdir -p ~/.config/ctxlake
+touch ~/.config/ctxlake/env && chmod 600 ~/.config/ctxlake/env
+echo "OPENROUTER_API_KEY=$(printenv OPENROUTER_API_KEY)" >> ~/.config/ctxlake/env
+```
+
+Every `ctxlake` process loads this file at startup, before anything else runs.
+
+| Rule | Why |
+|---|---|
+| Mode must be `600` (owner-only) | A credentials file any local process can read is a published credential. ctxlake refuses to read it otherwise and says so |
+| An existing variable is never overridden | `FOO=bar ctxlake maint` must mean what it says |
+| Format is `NAME=value`, `#` comments, optional `export ` | Deliberately not shell. A file that looks like it supports `$(...)` and silently does not is worse than one that obviously does not |
+
+`ctxlake doctor` checks specifically for a key that this shell has and the daemon will
+not, and prints the commands above.
+
+The daemon's `PATH` is handled differently, because it is not a secret: `ctxlake sync
+install` pins the `PATH` it was invoked with into the unit file. That is what makes
+`provider = "claude-cli"` and `provider = "ollama"` work under a supervisor — launchd's
+default `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin`, which contains no Homebrew and no
+`~/.local/bin`. **If you install a provider binary after running `sync install`, run
+`ctxlake sync install` again** so the unit picks up the new directory.
 
 ### `[summarize]`
 
@@ -429,6 +535,6 @@ stray `println!` would corrupt every frame after it.
 
 ## Next steps
 
-- [getting-started.md](getting-started.md) — these commands in the order a first run uses
-- [memory.md](memory.md) — what `[summarize]` selects between
-- [storage.md](storage.md) — the capability matrix `doctor` executes
+- [Getting started](getting-started.md) — these commands in the order a first run uses
+- [Memory](memory.md) — what `[summarize]` selects between
+- [Storage](storage.md) — the capability matrix `doctor` executes

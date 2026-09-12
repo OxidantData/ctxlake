@@ -10,6 +10,7 @@ mod claims;
 mod config;
 mod config_cmd;
 mod doctor;
+mod envfile;
 mod hooks;
 mod import;
 mod init;
@@ -22,6 +23,7 @@ mod service;
 mod status;
 mod store_ctx;
 mod sync_cmd;
+mod update;
 
 use std::path::PathBuf;
 
@@ -93,6 +95,20 @@ enum Command {
     /// not touch the object store (AGENTS.md invariant 1). So the expensive half runs
     /// here and the hook only reads the result.
     Briefing(BriefingCmd),
+    /// Update ctxlake to the latest release, however it was installed.
+    ///
+    /// Homebrew and cargo installs are handed to the tool that owns them; a
+    /// curl-installed binary is replaced in place, after verifying the download
+    /// against the release's SHA256SUMS. The sync daemon is restarted afterwards if
+    /// one is installed, since a running daemon holds the old binary open.
+    Update(UpdateCmd),
+}
+
+#[derive(Args)]
+struct UpdateCmd {
+    /// Report whether a newer release exists and stop, changing nothing.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Args)]
@@ -294,6 +310,21 @@ impl std::fmt::Display for ConfigUnusable {
 
 #[tokio::main]
 async fn main() {
+    // Before anything else, and before any task is spawned: fold
+    // `<config_home>/ctxlake/env` into this process's environment.
+    //
+    // This is what makes `ctxlake doctor` in a terminal and `ctxlake sync run` under
+    // launchd resolve the same credentials. Without it the two run in different
+    // environments and a green check proves nothing about the daemon — see
+    // `paths::env_file`. An explicit `export` still wins; the file only fills gaps.
+    //
+    // In `main` rather than in a subcommand because `set_var` is only sound while the
+    // process is single-threaded, and because every subcommand wants the same answer.
+    let env_file = envfile::load_default();
+    if let Some(why) = &env_file.refused {
+        eprintln!("warning: {} — {why}", paths::env_file().display());
+    }
+
     if let Err(err) = run().await {
         eprintln!("Error: {err:#}");
         // Only a config failure gets the distinguished code; everything else stays 1
@@ -437,6 +468,10 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        // Deliberately does NOT load the config: a machine whose ctxlake.toml is
+        // missing or unparseable is one of the states you most want to be able to
+        // update out of.
+        Command::Update(args) => update::run(args.check).await,
     }
 }
 

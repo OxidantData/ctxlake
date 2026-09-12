@@ -116,7 +116,7 @@ Hermes fires `pre_tool_call` once per call, so three parallel calls fire it thre
 **On fail-closed.** ctxlake's posture is fail-open for capture: if the hook errors while
 building an envelope, the tool call proceeds anyway, because coordination metadata is
 advisory and must never block real work. The one exception is the path denylist
-([security.md](security.md)) — a read of a known-sensitive path is denied at the pre-tool
+([Security](security.md)) — a read of a known-sensitive path is denied at the pre-tool
 hook rather than scrubbed afterwards.
 
 All three schemas hold an array per event, so more than one tool can register.
@@ -172,7 +172,7 @@ Two gaps against Claude Code: Cursor has **no `SessionStart` event** (boundaries
 inferred from the `cursor-agent` process lifecycle, so briefing injection happens at the
 first `beforeSubmitPrompt`), and **no pre-compaction event**, so `EventType::Compact` is
 never emitted for a Cursor session. Import fidelity differs too — see
-[adding-it.md](adding-it.md).
+[Adding it](adding-it.md).
 
 ## Hermes
 
@@ -225,7 +225,7 @@ Three gaps:
   gateway's `session:compress` event covers messaging-platform sessions, not the
   tool-calling loop, so it is not a substitute. `ctxlake import` recovers these markers
   from `state.db` after the fact — see
-  [adding-it.md](adding-it.md#hermes-imports-more-than-hermes-captures).
+  [Adding it](adding-it.md#hermes-imports-more-than-hermes-captures).
 - **`pre_llm_call`/`post_llm_call` envelopes carry `role` but no `content`.** No field name
   for the prompt or assistant text has been verified against a live capture, and this
   adapter leaves a field empty rather than spool a guessed key. A live-captured Hermes
@@ -239,6 +239,6 @@ Three gaps:
 
 ## Next steps
 
-- [how-it-works.md](how-it-works.md) — where the envelope goes next
-- [reference.md](reference.md) — what `ctxlake install` writes, per runtime
-- [architecture.md](architecture.md) — the worked trace this mapping feeds into
+- [How it works](how-it-works.md) — where the envelope goes next
+- [Reference](reference.md) — what `ctxlake install` writes, per runtime
+- [Architecture](architecture.md) — the worked trace this mapping feeds into

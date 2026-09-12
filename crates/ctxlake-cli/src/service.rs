@@ -118,6 +118,63 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The directories a supervised daemon gets on `PATH` when nobody pins one.
+///
+/// launchd hands a job `/usr/bin:/bin:/usr/sbin:/sbin` and a systemd user unit gets
+/// something equally minimal. Neither contains `/opt/homebrew/bin`, `/usr/local/bin`
+/// or `~/.local/bin` — which is to say neither contains `claude`, `ollama`, or almost
+/// anything else a person installed deliberately.
+const FALLBACK_PATH_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+/// The `PATH` to pin into the unit.
+///
+/// **A unit must carry the PATH it was installed with, or exec-based config lies.**
+/// `[summarize.batch] provider = "claude-cli"` (and `ollama`, and anything else that
+/// shells out) is verified by `ctxlake doctor` and `sync install` in an interactive
+/// shell, where `claude` is on `PATH` because Homebrew put it there. The daemon then
+/// runs under launchd with `/usr/bin:/bin:/usr/sbin:/sbin` and cannot find the same
+/// binary the check just succeeded against. The check and the thing it is checking
+/// were running in different environments, so a green check meant nothing.
+///
+/// Taking the installing process's own `PATH` is what makes those two environments
+/// the same one. Non-existent and relative entries are dropped — a `PATH` is allowed
+/// to accumulate junk over years of dotfiles, and a unit file is a poor place to
+/// enshrine it — and the standard directories are appended so the unit still works if
+/// this was invoked from something with a deliberately empty `PATH`.
+fn service_path() -> String {
+    service_path_from(std::env::var_os("PATH").as_deref())
+}
+
+/// [`service_path`], over an explicit `PATH` value.
+///
+/// The split is only so tests can assert the filtering rules without calling
+/// `set_var` on a process-global that every other test in this binary is reading in
+/// parallel — the flakiness `paths.rs`'s module doc was written about.
+fn service_path_from(path_var: Option<&std::ffi::OsStr>) -> String {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut push = |d: &str| {
+        if d.is_empty() || !d.starts_with('/') {
+            return;
+        }
+        let d = d.trim_end_matches('/');
+        let d = if d.is_empty() { "/" } else { d };
+        if !dirs.iter().any(|existing| existing == d) {
+            dirs.push(d.to_string());
+        }
+    };
+    if let Some(path) = path_var {
+        for dir in std::env::split_paths(path) {
+            if dir.is_dir() {
+                push(&dir.display().to_string());
+            }
+        }
+    }
+    for d in FALLBACK_PATH_DIRS {
+        push(d);
+    }
+    dirs.join(":")
+}
+
 /// Substitute the template placeholders. Pure, so the rendered output is testable
 /// without writing to `$HOME` or shelling out to a service manager.
 pub fn render(
@@ -126,6 +183,7 @@ pub fn render(
     config_path: &Path,
     home: &Path,
     log_dir: &Path,
+    path: &str,
 ) -> String {
     let (exec, config, home_s, log) = (
         exec.display().to_string(),
@@ -137,12 +195,14 @@ pub fn render(
         Manager::Systemd => SYSTEMD_TEMPLATE
             .replace("{{EXEC}}", &exec)
             .replace("{{CONFIG}}", &config)
-            .replace("{{HOME}}", &home_s),
+            .replace("{{HOME}}", &home_s)
+            .replace("{{PATH}}", path),
         Manager::Launchd => LAUNCHD_TEMPLATE
             .replace("{{EXEC}}", &xml_escape(&exec))
             .replace("{{CONFIG}}", &xml_escape(&config))
             .replace("{{HOME}}", &xml_escape(&home_s))
-            .replace("{{LOG_DIR}}", &xml_escape(&log)),
+            .replace("{{LOG_DIR}}", &xml_escape(&log))
+            .replace("{{PATH}}", &xml_escape(path)),
     }
 }
 
@@ -154,13 +214,42 @@ fn home_dir() -> PathBuf {
 
 /// The absolute path to write into the unit's `ExecStart`.
 ///
-/// Canonicalized because `current_exe` can hand back a symlink — which is exactly
-/// what Homebrew installs into `/opt/homebrew/bin` — and a unit pointing at a symlink
-/// breaks the moment `brew upgrade` repoints it mid-flight.
+/// **Deliberately not canonicalized**, which reverses this function's first version.
+///
+/// The original reasoning was that `current_exe` can hand back a symlink — exactly
+/// what Homebrew installs into `/opt/homebrew/bin` — and that a unit pointing at a
+/// symlink would break when `brew upgrade` repointed it mid-flight. Both halves are
+/// true and the conclusion is backwards. Resolving the symlink pins
+/// `/opt/homebrew/Cellar/ctxlake/<version>/bin/ctxlake`, and `brew upgrade` *deletes*
+/// that directory: the unit then names a path that does not exist, and the daemon
+/// crash-loops until someone reinstalls the service. The symlink is repointed, not
+/// removed — it is the stable name, and the worst a mid-flight upgrade costs is one
+/// restart, which the supervisor was going to do anyway.
+///
+/// The same argument covers every version-stamped install layout, not just Homebrew's
+/// (`~/.local/share/mise/installs/...`, Nix profiles, and so on). `current_exe` on
+/// macOS preserves the invoked symlink path, and on Linux `/proc/self/exe` resolves
+/// it — so on Linux this is whatever the kernel reports and the guard below only
+/// absolutizes it.
 fn exec_path() -> Result<PathBuf> {
     let exe =
         std::env::current_exe().context("locating the ctxlake binary for the service unit")?;
-    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+    Ok(stable_exec_path(&exe))
+}
+
+/// [`exec_path`]'s policy, over a given `current_exe` — the seam the test drives.
+///
+/// Testing this through `exec_path` would assert nothing: under `cargo test` the
+/// running binary is `target/debug/deps/…`, which is not a symlink and not inside a
+/// version-stamped directory, so canonicalizing and not canonicalizing return the
+/// same path and the regression sails through.
+fn stable_exec_path(exe: &Path) -> PathBuf {
+    if exe.is_absolute() {
+        return exe.to_path_buf();
+    }
+    // A relative `current_exe` cannot go into a unit file — the supervisor's working
+    // directory is not this shell's. Resolving is strictly better than shipping it.
+    std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf())
 }
 
 /// True when the rendered unit for this host is already on disk.
@@ -303,7 +392,14 @@ pub async fn install(
     // Captured before the write: it decides whether a daemon already running is one
     // the supervisor owns or a stray one this install has to clear out.
     let was_installed = unit_path.exists();
-    let contents = render(manager, &exec, &config_path, &home, &log_dir);
+    let contents = render(
+        manager,
+        &exec,
+        &config_path,
+        &home,
+        &log_dir,
+        &service_path(),
+    );
     let changed = write_unit(&unit_path, &contents)?;
 
     println!(
@@ -612,6 +708,29 @@ pub fn restart(
     Ok(())
 }
 
+/// Restart the supervised daemon, without needing a `Config` or a config path.
+///
+/// `ctxlake update` calls this after replacing the binary: a running daemon holds the
+/// *old* file open (which is exactly what makes replacing it safe), so it keeps
+/// running the previous version until something restarts it. Split out of [`restart`]
+/// because that function's unsupervised branch re-launches the daemon itself and
+/// needs a config to do it — here there is definitionally a unit, and the unit
+/// already names its own config.
+pub fn restart_installed() -> Result<()> {
+    match Manager::detect()? {
+        Manager::Systemd => run_checked("systemctl", &["--user", "restart", SYSTEMD_UNIT])?,
+        Manager::Launchd => {
+            let unit = Manager::Launchd
+                .unit_path(&home_dir())
+                .display()
+                .to_string();
+            let _ = run("launchctl", &["bootout", &gui_domain(), &unit]);
+            launchd_bootstrap(&unit)?
+        }
+    }
+    Ok(())
+}
+
 /// `ctxlake sync status` — the service manager's view *and* the pidfile's.
 ///
 /// Both are printed because they can disagree, and the disagreement is the
@@ -656,16 +775,151 @@ pub fn status(cfg: &Config) -> Result<()> {
         }
         _ => println!("service:  not installed (run `ctxlake sync install` to survive reboots)"),
     }
-    crate::sync_cmd::status(cfg)
+    crate::sync_cmd::status(cfg)?;
+
+    // The part that was missing, and that cost two machines a debugging session:
+    // "state: activating" plus "ctxlake sync is not running" is a description, not a
+    // diagnosis. Both supervisors had the reason — one line, in a file — and neither
+    // status command mentioned that the file existed.
+    if let Some(m) = manager {
+        if m.unit_path(&home_dir()).exists()
+            && crate::sync_cmd::read_running_pid(&paths::pid_file(&cfg.fleet_id)).is_none()
+        {
+            print_why_not_running(m, cfg);
+        }
+    }
+    Ok(())
+}
+
+/// How many lines of the daemon's own error output to show.
+///
+/// Enough to carry a panic's message and a line of context, short enough that it does
+/// not bury the status report it is appended to. A crash loop repeats the same line,
+/// so more would mostly be the same error again.
+const LOG_TAIL_LINES: usize = 6;
+
+/// Why the supervisor has a unit installed and no daemon running.
+fn print_why_not_running(manager: Manager, cfg: &Config) {
+    println!("\nwhy:      the service is installed but no daemon is running.");
+    let lines = match manager {
+        // launchd redirects the job's stderr to a file the plist names, so the reason
+        // is sitting there whether or not anyone knew to look.
+        Manager::Launchd => {
+            let err_log = paths::sync_log_file(&cfg.fleet_id)
+                .parent()
+                .map(|d| d.join("sync.err.log"));
+            match err_log {
+                Some(path) => {
+                    let tail = tail_lines(&path, LOG_TAIL_LINES);
+                    if !tail.is_empty() {
+                        println!("          last output — {}:", path.display());
+                    }
+                    tail
+                }
+                None => Vec::new(),
+            }
+        }
+        // A systemd unit logs to the journal, so there is no file to tail.
+        Manager::Systemd => {
+            let out = run(
+                "journalctl",
+                &[
+                    "--user",
+                    "-u",
+                    SYSTEMD_UNIT,
+                    "-n",
+                    "20",
+                    "--no-pager",
+                    "-p",
+                    "warning",
+                    "-o",
+                    "cat",
+                ],
+            );
+            match out {
+                Ok(o) if o.status.success() => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    let tail: Vec<String> = text
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .rev()
+                        .take(LOG_TAIL_LINES)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    if !tail.is_empty() {
+                        println!("          last output — journalctl --user -u {SYSTEMD_UNIT}:");
+                    }
+                    tail
+                }
+                _ => Vec::new(),
+            }
+        }
+    };
+
+    for line in &lines {
+        println!("            {line}");
+    }
+    if lines.is_empty() {
+        match manager {
+            Manager::Launchd => println!(
+                "          no output captured yet. Full log: {}",
+                paths::sync_log_file(&cfg.fleet_id)
+                    .parent()
+                    .map(|d| d.join("sync.err.log").display().to_string())
+                    .unwrap_or_default()
+            ),
+            Manager::Systemd => println!(
+                "          nothing in the journal yet: journalctl --user -u {SYSTEMD_UNIT} -f"
+            ),
+        }
+    }
+    println!("          `ctxlake doctor` checks the things that usually cause this.");
+}
+
+/// The last `n` non-empty lines of a file, or nothing if it cannot be read.
+///
+/// Reads the whole file, which is fine for a log a supervisor rotates and which only
+/// ever holds this daemon's own stderr — and much less code than seeking backwards
+/// for a diagnostic that runs when something is already wrong.
+fn tail_lines(path: &Path, n: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(n)
+        .map(str::to_string)
+        .collect();
+    lines.reverse();
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `render` with a fixed PATH, for the assertions that are not about PATH.
+    ///
+    /// A real `service_path()` reads the test process's own environment, which makes
+    /// every unrelated assertion depend on whatever CI happens to have on PATH.
+    fn render_t(
+        manager: Manager,
+        exec: &Path,
+        config_path: &Path,
+        home: &Path,
+        log_dir: &Path,
+    ) -> String {
+        render(manager, exec, config_path, home, log_dir, "/usr/bin:/bin")
+    }
+
     #[test]
     fn the_systemd_unit_leaves_no_placeholder_behind() {
-        let out = render(
+        let out = render_t(
             Manager::Systemd,
             Path::new("/usr/local/bin/ctxlake"),
             Path::new("/home/alice/.config/ctxlake/ctxlake.toml"),
@@ -680,7 +934,7 @@ mod tests {
 
     #[test]
     fn the_launchd_plist_leaves_no_placeholder_behind() {
-        let out = render(
+        let out = render_t(
             Manager::Launchd,
             Path::new("/opt/homebrew/bin/ctxlake"),
             Path::new("/Users/alice/.config/ctxlake/ctxlake.toml"),
@@ -701,7 +955,7 @@ mod tests {
         // launchd's KeepAlive would do the same — a restart loop that still, somehow,
         // leaves a working daemon running unsupervised. Pin it.
         for m in [Manager::Systemd, Manager::Launchd] {
-            let out = render(
+            let out = render_t(
                 m,
                 Path::new("/bin/ctxlake"),
                 Path::new("/c/ctxlake.toml"),
@@ -720,7 +974,7 @@ mod tests {
         // `ctxlake sync stop` exits 0. `Restart=always` or a bare `KeepAlive=true`
         // would bring the daemon straight back, making the stop command a no-op that
         // reports success — the worst kind of bug to debug.
-        let sd = render(
+        let sd = render_t(
             Manager::Systemd,
             Path::new("/b"),
             Path::new("/c"),
@@ -730,7 +984,7 @@ mod tests {
         assert!(sd.contains("Restart=on-failure"));
         assert!(!sd.contains("Restart=always"));
 
-        let ld = render(
+        let ld = render_t(
             Manager::Launchd,
             Path::new("/b"),
             Path::new("/c"),
@@ -745,7 +999,7 @@ mod tests {
         // Pairs with main.rs's EX_CONFIG exit. If either half moves, systemd
         // restarts a daemon whose ctxlake.toml is missing, five seconds apart,
         // forever.
-        let sd = render(
+        let sd = render_t(
             Manager::Systemd,
             Path::new("/b"),
             Path::new("/c"),
@@ -760,7 +1014,7 @@ mod tests {
 
     #[test]
     fn an_ampersand_in_a_path_cannot_break_the_plist() {
-        let out = render(
+        let out = render_t(
             Manager::Launchd,
             Path::new("/Users/a&b/bin/ctxlake"),
             Path::new("/Users/a&b/ctxlake.toml"),
@@ -778,7 +1032,7 @@ mod tests {
         // path ctxlake resolves — spool, cache, pidfile — hangs off $HOME, so the
         // daemon came up healthy, drained a spool nothing was writing to, and reported
         // itself as not running because its pidfile was somewhere else entirely.
-        let sd = render(
+        let sd = render_t(
             Manager::Systemd,
             Path::new("/b"),
             Path::new("/c"),
@@ -790,7 +1044,7 @@ mod tests {
             "got:\n{sd}"
         );
 
-        let ld = render(
+        let ld = render_t(
             Manager::Launchd,
             Path::new("/b"),
             Path::new("/c"),
@@ -800,6 +1054,146 @@ mod tests {
         assert!(
             ld.contains("<key>HOME</key><string>/Users/alice</string>"),
             "got:\n{ld}"
+        );
+    }
+
+    #[test]
+    fn both_units_pin_a_path_rather_than_inheriting_the_supervisors() {
+        // Found by a real install on two machines. `provider = "claude-cli"` passed
+        // `ctxlake doctor` and `sync install` in an interactive shell, then the daemon
+        // failed with "`claude` is not on PATH" on every start — fourteen restarts on
+        // macOS — because launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin and systemd's
+        // user PATH is no better. The pre-install check and the checked thing were
+        // running in different environments, so a green check proved nothing.
+        let sd = render(
+            Manager::Systemd,
+            Path::new("/b"),
+            Path::new("/c"),
+            Path::new("/home/alice"),
+            Path::new("/l"),
+            "/opt/tools/bin:/usr/bin",
+        );
+        assert!(
+            sd.contains(r#"Environment="PATH=/opt/tools/bin:/usr/bin""#),
+            "got:\n{sd}"
+        );
+
+        let ld = render(
+            Manager::Launchd,
+            Path::new("/b"),
+            Path::new("/c"),
+            Path::new("/Users/alice"),
+            Path::new("/l"),
+            "/opt/homebrew/bin:/usr/bin",
+        );
+        assert!(
+            ld.contains("<key>PATH</key><string>/opt/homebrew/bin:/usr/bin</string>"),
+            "got:\n{ld}"
+        );
+    }
+
+    #[test]
+    fn the_pinned_path_carries_the_installing_shells_directories() {
+        // The whole point: the directory `claude` was found in during the pre-install
+        // checks has to still be on PATH when the daemon looks for it.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("tools");
+        std::fs::create_dir_all(&real).unwrap();
+        let real_s = real.to_str().unwrap().to_string();
+
+        let got = service_path_from(Some(std::ffi::OsStr::new(&format!(
+            "{real_s}:/definitely/not/here:relative/dir:"
+        ))));
+        let dirs: Vec<&str> = got.split(':').collect();
+
+        assert!(
+            dirs.contains(&real_s.as_str()),
+            "the installing shell's directory must survive: {got}"
+        );
+        assert!(
+            !got.contains("/definitely/not/here"),
+            "a PATH entry that does not exist is junk to enshrine in a unit: {got}"
+        );
+        assert!(
+            !got.contains("relative/dir"),
+            "a relative PATH entry means nothing to a supervisor: {got}"
+        );
+        assert!(
+            dirs.iter().all(|d| !d.is_empty()),
+            "an empty entry means `.` to some shells — never in a unit: {got}"
+        );
+        for fallback in FALLBACK_PATH_DIRS {
+            if std::path::Path::new(fallback).is_dir() {
+                assert!(
+                    dirs.contains(fallback),
+                    "{fallback} must be appended so the unit works from an empty PATH: {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_path_never_repeats_a_directory() {
+        // `Environment="PATH=..."` with duplicates is harmless but reads as a bug in
+        // a file an operator is going to open while debugging.
+        let got = service_path_from(Some(std::ffi::OsStr::new("/usr/bin:/usr/bin/:/bin")));
+        let dirs: Vec<&str> = got.split(':').collect();
+        let mut uniq = dirs.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(dirs.len(), uniq.len(), "duplicate entries: {got}");
+    }
+
+    #[test]
+    fn the_unit_names_a_path_that_survives_an_upgrade() {
+        // `exec_path` used to canonicalize, which on Homebrew pins
+        // /opt/homebrew/Cellar/ctxlake/<version>/bin/ctxlake. `brew upgrade` deletes
+        // that directory, so a unit installed before an upgrade names a file that no
+        // longer exists and the daemon crash-loops with nothing saying why. The
+        // symlink in <prefix>/bin is the stable name — brew repoints it rather than
+        // removing it, and the worst a mid-flight upgrade costs is one restart the
+        // supervisor was going to do anyway.
+        //
+        // Built here as a real symlink into a real version-stamped directory, because
+        // that is the only shape where canonicalizing and not canonicalizing differ.
+        let dir = tempfile::tempdir().unwrap();
+        let cellar = dir.path().join("Cellar/ctxlake/0.1.5/bin");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&cellar).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(cellar.join("ctxlake"), "#!/bin/sh\n").unwrap();
+        let link = bin.join("ctxlake");
+        std::os::unix::fs::symlink(cellar.join("ctxlake"), &link).unwrap();
+
+        let got = stable_exec_path(&link);
+        assert_eq!(
+            got, link,
+            "the unit must name the stable symlink, not the version-stamped target"
+        );
+        assert!(
+            !got.display().to_string().contains("/Cellar/"),
+            "a version-stamped install path disappears on the next upgrade: {got:?}"
+        );
+    }
+
+    #[test]
+    fn the_log_tail_shows_the_last_lines_and_drops_the_blank_ones() {
+        // `sync status` reporting "activating" / "not running" and nothing else is
+        // what turned a one-line error into a debugging session on two machines. The
+        // reason was already in this file; nothing pointed at it.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sync.err.log");
+        std::fs::write(&f, "one\n\ntwo\nthree\n\nfour\n").unwrap();
+
+        assert_eq!(tail_lines(&f, 2), vec!["three", "four"]);
+        assert_eq!(
+            tail_lines(&f, 99),
+            vec!["one", "two", "three", "four"],
+            "asking for more lines than exist must return what there is, in order"
+        );
+        assert!(
+            tail_lines(&dir.path().join("absent"), 5).is_empty(),
+            "a missing log is the normal case before a first run, not an error"
         );
     }
 

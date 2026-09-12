@@ -122,7 +122,7 @@ ownership of the bucket, only of its own root.
   fired, so dedup and auditing work without the withheld value being readable back.
 
 The spool and cache between the hook and the store are local per-host state, not part of
-this tree — see [architecture.md](architecture.md).
+this tree — see [Architecture](architecture.md).
 
 ## What it costs
 
@@ -195,6 +195,6 @@ and `snapshot/` stay unchanged on the lake.
 
 ## Next steps
 
-- [how-it-works.md](how-it-works.md) — why each prefix got the write pattern it did
-- [architecture.md](architecture.md) — every timing knob and its blast radius
-- [security.md](security.md) — the IAM policy that makes "bronze is immutable" enforced
+- [How it works](how-it-works.md) — why each prefix got the write pattern it did
+- [Architecture](architecture.md) — every timing knob and its blast radius
+- [Security](security.md) — the IAM policy that makes "bronze is immutable" enforced

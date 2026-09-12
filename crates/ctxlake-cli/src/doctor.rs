@@ -90,6 +90,48 @@ pub struct LlmReport {
     /// hours later, inside a maintenance log. `None` when no call was attempted
     /// (nothing to call, or the key was missing so there was no point).
     pub reachable: Option<Result<(), String>>,
+    /// Whether the daemon will have this key too, or only this shell does.
+    ///
+    /// `doctor` runs in a terminal that has your `export`s; a launchd job and a
+    /// systemd user unit have neither those nor your shell rc. So "the key resolves"
+    /// answers a question nobody asked — the one that matters is whether it resolves
+    /// *where the daemon runs*, and the only place that is true of is
+    /// [`crate::paths::env_file`].
+    ///
+    /// `true` for a provider that needs no key at all, since there is nothing for the
+    /// daemon to be missing.
+    pub daemon_will_resolve: bool,
+}
+
+impl LlmReport {
+    /// The warning for a key that this shell has and the daemon will not.
+    ///
+    /// A warning rather than a `blocks_service_install` reason on purpose. Someone
+    /// running `ctxlake sync run --foreground` under a process manager of their own,
+    /// or with a systemd drop-in carrying their own `EnvironmentFile=`, has a
+    /// perfectly working setup that this cannot see — refusing to install would be
+    /// wrong for them. And since an unreachable provider no longer takes the daemon
+    /// down with it (`sync_cmd::run_foreground_until`), the cost of being wrong in
+    /// this direction is some missing claims, not a dead daemon.
+    ///
+    /// `None` when there is nothing to warn about: no key needed, the key is already
+    /// in the env file, or it does not resolve at all (which `print` reports as the
+    /// louder, more basic problem).
+    pub fn daemon_env_warning(&self) -> Option<String> {
+        if self.daemon_will_resolve || !self.resolves || self.env_var.trim().is_empty() {
+            return None;
+        }
+        let k = &self.env_var;
+        let f = crate::paths::env_file().display().to_string();
+        Some(format!(
+            "-> {k} is set in this shell, but the sync daemon will not see it.\n\
+             \x20  launchd and systemd start with neither your exports nor your shell\n\
+             \x20  rc, so Tier 2 would fail on every maintenance cycle. Put it where\n\
+             \x20  both can read it:\n\
+             \x20    mkdir -p $(dirname {f}) && touch {f} && chmod 600 {f}\n\
+             \x20    echo \"{k}=$(printenv {k})\" >> {f}"
+        ))
+    }
 }
 
 pub struct CacheReport {
@@ -241,6 +283,10 @@ impl Report {
                 println!(
                     "      -> export it, or point api_key_env at the variable that holds the key"
                 );
+            } else if let Some(warning) = llm.daemon_env_warning() {
+                for line in warning.lines() {
+                    println!("      {line}");
+                }
             }
         }
 
@@ -496,6 +542,8 @@ pub async fn run(cfg: &Config) -> Result<Report> {
                 // machine that was correctly configured. Reported from a real install.
                 let needs_key = !b.api_key_env.trim().is_empty();
                 let resolves = !needs_key || std::env::var(&b.api_key_env).is_ok();
+                let daemon_will_resolve = !needs_key
+                    || crate::envfile::names(&paths::env_file()).contains(&b.api_key_env);
                 // A round trip is worth it whenever there is nothing already known to
                 // be wrong — which for a keyless provider is always.
                 let reachable = if resolves {
@@ -507,6 +555,7 @@ pub async fn run(cfg: &Config) -> Result<Report> {
                     resolves,
                     env_var: b.api_key_env.clone(),
                     reachable,
+                    daemon_will_resolve,
                 })
             }
             None => None,
@@ -706,6 +755,67 @@ mod tests {
         assert_eq!(report.byte_count, 5 + 10);
     }
 
+    fn llm(env_var: &str, resolves: bool, daemon_will_resolve: bool) -> LlmReport {
+        LlmReport {
+            env_var: env_var.into(),
+            resolves,
+            reachable: resolves.then_some(Ok(())),
+            daemon_will_resolve,
+        }
+    }
+
+    #[test]
+    fn a_key_only_this_shell_has_is_reported_as_a_gap_the_daemon_will_hit() {
+        // The bug class this closes, seen twice on real machines: `doctor` answers
+        // "does this key resolve", the operator reads it as "the daemon is configured",
+        // and those are different questions. launchd's job and a systemd user unit get
+        // neither the `export` nor the shell rc that set it.
+        let w = llm("OPENROUTER_API_KEY", true, false)
+            .daemon_env_warning()
+            .expect("a shell-only key must warn");
+        assert!(w.contains("OPENROUTER_API_KEY"), "{w}");
+        assert!(w.contains("will not see it"), "{w}");
+        assert!(w.contains("chmod 600"), "must say where to put it: {w}");
+        // The remedy must not ask anyone to retype a secret into their shell history.
+        assert!(w.contains("printenv OPENROUTER_API_KEY"), "{w}");
+    }
+
+    #[test]
+    fn nothing_is_warned_about_when_the_daemon_already_has_what_it_needs() {
+        assert_eq!(
+            llm("OPENROUTER_API_KEY", true, true).daemon_env_warning(),
+            None
+        );
+        // A keyless provider (claude-cli, ollama) has no variable to be missing.
+        assert_eq!(llm("", true, true).daemon_env_warning(), None);
+        // A key that does not resolve at all is a louder, more basic problem, and
+        // `print` already says so — two overlapping paragraphs would bury both.
+        assert_eq!(
+            llm("OPENROUTER_API_KEY", false, false).daemon_env_warning(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_only_key_warns_but_does_not_block_installing_the_daemon() {
+        // Deliberate: someone running the daemon under their own supervisor, or with
+        // a systemd drop-in carrying EnvironmentFile=, has a working setup this cannot
+        // see. And an unreachable provider no longer takes the daemon down with it
+        // (`sync_cmd::run_foreground_until`), so being wrong here costs claims, not
+        // capture.
+        let (_dir, mut report) = healthy_report().await;
+        report.llm = Some(llm("OPENROUTER_API_KEY", true, false));
+        assert!(
+            report.blocks_service_install().is_empty(),
+            "got: {:?}",
+            report.blocks_service_install()
+        );
+        assert!(
+            report.llm.as_ref().unwrap().daemon_env_warning().is_some(),
+            "it must still be said, loudly"
+        );
+    }
+
     #[test]
     fn llm_check_is_skipped_when_the_mode_never_needs_a_batch_key() {
         let cfg = Config::new("file:///tmp/lake", "myteam", "cc-01");
@@ -855,6 +965,8 @@ mod tests {
             env_var: String::new(),
             resolves: true,
             reachable: Some(Ok(())),
+            // Keyless: there is no variable for the daemon to be missing.
+            daemon_will_resolve: true,
         });
         assert!(
             report.blocks_service_install().is_empty(),
@@ -870,6 +982,8 @@ mod tests {
             env_var: String::new(),
             resolves: true,
             reachable: Some(Err("claude is not on PATH".to_string())),
+            // Keyless: there is no variable for the daemon to be missing.
+            daemon_will_resolve: true,
         });
         let blockers = report.blocks_service_install();
         assert_eq!(blockers.len(), 1, "{blockers:?}");
@@ -890,6 +1004,8 @@ mod tests {
             env_var: "CTXLAKE_TEST_KEY_NOT_SET".to_string(),
             resolves: false,
             reachable: None,
+            // Keyless: there is no variable for the daemon to be missing.
+            daemon_will_resolve: true,
         });
         let blockers = report.blocks_service_install();
         assert_eq!(blockers.len(), 1, "{blockers:?}");
@@ -909,6 +1025,8 @@ mod tests {
             env_var: "OPENROUTER_API_KEY".to_string(),
             resolves: true,
             reachable: Some(Err("401 Unauthorized".to_string())),
+            // Keyless: there is no variable for the daemon to be missing.
+            daemon_will_resolve: true,
         });
         let blockers = report.blocks_service_install();
         assert_eq!(blockers.len(), 1, "{blockers:?}");
@@ -922,6 +1040,8 @@ mod tests {
             env_var: "OPENROUTER_API_KEY".to_string(),
             resolves: true,
             reachable: Some(Ok(())),
+            // Keyless: there is no variable for the daemon to be missing.
+            daemon_will_resolve: true,
         });
         assert!(report.blocks_service_install().is_empty());
     }

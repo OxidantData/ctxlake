@@ -285,6 +285,6 @@ is unreachable, agents run degraded, not broken.
 
 ## Next steps
 
-- [reference.md](reference.md) — `[summarize]` keys, `ctxlake claims`, the MCP tools
-- [adding-it.md](adding-it.md) — seeding the belief layer from conventions you wrote
-- [security.md](security.md) — why anything read from the lake is untrusted input
+- [Reference](reference.md) — `[summarize]` keys, `ctxlake claims`, the MCP tools
+- [Adding it](adding-it.md) — seeding the belief layer from conventions you wrote
+- [Security](security.md) — why anything read from the lake is untrusted input

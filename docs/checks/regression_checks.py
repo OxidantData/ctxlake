@@ -568,12 +568,103 @@ def check_no_real_identities() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# The daemon's environment.
+#
+# Two real installs failed the same way: `ctxlake doctor` and `ctxlake sync install`
+# ran in an interactive shell and passed, then the daemon ran under launchd/systemd
+# with a different HOME and a near-empty PATH and could not find what the checks had
+# just verified. The docs now promise the unit pins both. This asserts the templates
+# actually do, because a promise in prose that the template does not keep is exactly
+# the shape of the original bug.
+# ---------------------------------------------------------------------------
+
+def strip_comments(text: str, suffix: str) -> str:
+    """Drop `#` lines and `<!-- -->` blocks, leaving only directives."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+
+SERVICE_TEMPLATES = (
+    "packaging/service/ctxlake-sync.service.tmpl",
+    "packaging/service/com.oxidantdata.ctxlake-sync.plist.tmpl",
+)
+
+
+def check_units_pin_the_environment_the_docs_promise() -> None:
+    reference = norm(read("reference.md"))
+    if "pins `HOME` and `PATH`" not in reference:
+        fail(
+            "reference.md no longer says the unit pins HOME and PATH — if that "
+            "changed, this check should change with it, deliberately"
+        )
+
+    for rel in SERVICE_TEMPLATES:
+        path = ROOT / rel
+        if not path.exists():
+            fail(f"{rel}: missing — the docs describe a unit rendered from it")
+            continue
+        # Comments stripped first. Both templates document their own placeholders in
+        # a header comment, so searching the raw text would let a template that only
+        # *mentions* {{PATH}} satisfy a check about whether it *sets* it — which is
+        # how the first version of this check passed a template with the directive
+        # deleted.
+        text = strip_comments(path.read_text(encoding="utf-8"), path.suffix)
+        for var in ("HOME", "PATH"):
+            if f"{{{{{var}}}}}" not in text:
+                fail(
+                    f"{rel}: no {{{{{var}}}}} placeholder, but reference.md promises "
+                    f"the unit pins {var}. A supervisor supplies its own, and the "
+                    f"pre-install checks would again be verifying a different "
+                    f"environment from the one the daemon runs in"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Every command the reference documents has to exist.
+#
+# Cheap, and it covers the whole surface rather than one command: the reference's
+# command table is the first thing a reader trusts, and a table listing something
+# `ctxlake --help` does not have is worse than no table.
+# ---------------------------------------------------------------------------
+
+
+def check_documented_commands_exist() -> None:
+    reference = read("reference.md")
+    table = re.search(r"^## Commands\s*$(.*?)^### ", reference, re.M | re.S)
+    if table is None:
+        fail("reference.md: no '## Commands' table — page shape changed")
+        return
+    documented = set(re.findall(r"^\| `ctxlake ([a-z-]+)`", table.group(1), re.M))
+    if not documented:
+        fail("reference.md: the commands table lists no commands")
+        return
+
+    main_rs = (ROOT / "crates/ctxlake-cli/src/main.rs").read_text(encoding="utf-8")
+    enum = re.search(r"enum Command \{(.*?)\n\}", main_rs, re.S)
+    if enum is None:
+        fail("crates/ctxlake-cli/src/main.rs: no `enum Command` — update this check")
+        return
+    # clap derives the subcommand name by kebab-casing each variant.
+    variants = re.findall(r"^\s{4}([A-Z][A-Za-z0-9]*)", enum.group(1), re.M)
+    implemented = {
+        re.sub(r"(?<!^)(?=[A-Z])", "-", v).lower() for v in variants
+    }
+
+    for cmd in sorted(documented - implemented):
+        fail(f"reference.md documents `ctxlake {cmd}`, which is not a subcommand")
+    for cmd in sorted(implemented - documented):
+        fail(f"`ctxlake {cmd}` exists but the reference.md command table omits it")
+
+
 def main() -> int:
     check_scaling_arithmetic()
     check_runtime_verification_honesty()
     check_hermes_import_fidelity()
     check_tier2_wiring_matches_the_docs()
     check_no_real_identities()
+    check_units_pin_the_environment_the_docs_promise()
+    check_documented_commands_exist()
 
     if failures:
         print(f"FAIL — {len(failures)} regression check(s) failed:\n")

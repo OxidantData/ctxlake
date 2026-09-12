@@ -4,7 +4,7 @@
 
   Rendered by `ctxlake sync install` into
   ~/Library/LaunchAgents/com.oxidantdata.ctxlake-sync.plist.
-  Placeholders: {{EXEC}} {{CONFIG}} {{HOME}} {{LOG_DIR}}
+  Placeholders: {{EXEC}} {{CONFIG}} {{HOME}} {{LOG_DIR}} {{PATH}}
 
   A LaunchAgent, not a LaunchDaemon: agents run as the logged-in user, which is whose
   spool and credentials this needs. A daemon runs as root and would reach neither.
@@ -35,6 +35,12 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>{{HOME}}</string>
+    <!-- launchd's default PATH is /usr/bin:/bin:/usr/sbin:/sbin, which contains
+         neither Homebrew nor ~/.local/bin — so `[summarize.batch] provider =
+         "claude-cli"` passes `ctxlake doctor` in a terminal and then fails here with
+         "`claude` is not on PATH", forever. This is the PATH `ctxlake sync install`
+         ran with, so the check and the daemon resolve the same binary. -->
+    <key>PATH</key><string>{{PATH}}</string>
   </dict>
 
   <key>WorkingDirectory</key>

@@ -21,6 +21,13 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # The docs carry cost arithmetic and honesty claims that a reviewer already
+      # caught being wrong once. This script recomputes the arithmetic independently
+      # and asserts the runtime pages do not claim verification that has not happened.
+      # It needs no dependencies, so it runs before the Node setup.
+      - name: Docs regression checks
+        run: python3 docs/checks/regression_checks.py
+
       - run: npm ci
       # The build fails on dead links, which is the point: docs/ is read both on
       # GitHub and on the site, and a link that works in one place and not the other

@@ -63,7 +63,7 @@ added, matched by a stable marker, leaving anything else in the file untouched.
 
 ## Import fidelity: metadata and prompts only, and why
 
-`ctxlake import --cursor` backfills whatever history is already on disk from past
+`ctxlake import --runtime cursor` backfills whatever history is already on disk from past
 Cursor sessions — but only **metadata and prompt text**, not full transcripts or tool
 call bodies. This is a deliberate refusal, not a missing feature, and the reason is the
 storage format itself.
@@ -87,7 +87,7 @@ blob layout would silently produce garbage — or worse, plausible-looking-but-w
 data — the moment Cursor ships an update that changes it, with no version check that
 could catch the drift before it corrupts an import. Bronze is immutable
 ([../concepts.md](../concepts.md)): a bad import isn't a bug you patch forward, it's bad data
-sitting permanently in `sessions/`. `ctxlake import --cursor` reads only what's safe and
+sitting permanently in `sessions/`. `ctxlake import --runtime cursor` reads only what's safe and
 stable to interpret from outside the blob — row-level metadata (timestamps, workspace
 and session identifiers) and prompt text where it's recoverable in a readable form —
 and leaves everything inside `data` uncaptured rather than guess at it.

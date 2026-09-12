@@ -46,6 +46,30 @@
 //! says is the safe one: a crash between the two leaves an orphaned blob (harmless)
 //! or simply never swaps the pointer (also harmless — readers keep the old
 //! snapshot).
+//!
+//! **The gate is a property of the artifact, not of one crate's function.**
+//! `docs/summarization.md`'s shadow mode runs "the whole chain — extraction, gates,
+//! snapshot — with agent reads disabled," so `publish` always folds and writes the
+//! *full* claim log regardless of mode (`agent_reads_enabled` never skips a row in
+//! [`SCHEMA_SQL`]'s `claims` table — that table is this module's arithmetic, and it
+//! stays complete for audit and for `ctxlake claims --status ...`). What
+//! `agent_reads_enabled` controls is narrower and load-bearing: [`FoldedClaim`]s are
+//! marked `visible_to_agents` only when they are `status = "promoted"` **and** the
+//! caller says agent reads are enabled, and `claims_fts` — the index an MCP
+//! memory-recall tool would actually query into a context window — is populated
+//! from *only* those rows. A caller that passes `agent_reads_enabled: false` (the
+//! `shadow`/`none` case) still gets a valid, fully-folded snapshot; it just cannot
+//! contain a single FTS5-searchable row, by construction, not by a downstream
+//! reader remembering to check a flag. This mirrors (without depending on — see the
+//! module doc above on why this crate's extraction/gate modules are not this
+//! module's dependency) the belief wave's own `claims::claims_visible_to_agents`
+//! rule: only `Promoted` claims are ever agent-visible, `Contested`/`Retired` never
+//! are regardless of mode, and *how* `agent_reads_enabled` gets computed from
+//! `ctxlake.toml`'s `[summarize] mode` is this wave's caller's job, not this
+//! module's — today [`crate::run::run`] takes it as a plain `bool` because no
+//! config-reading wave has wired `ctxlake.toml` into the maintenance chain yet;
+//! that wiring is a follow-up, not a silent "always visible" default smuggled in
+//! here.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -83,6 +107,11 @@ CREATE TABLE claims (
     confidence        REAL NOT NULL,
     evidence_json     TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
+    -- 1 exactly when status = 'promoted' AND the publishing run was told agent
+    -- reads are enabled; 0 otherwise, always — never derived by a downstream
+    -- reader re-checking status or mode itself. See the module doc's "the gate
+    -- is a property of the artifact" paragraph.
+    visible_to_agents INTEGER NOT NULL,
     -- 256-dim f32, little-endian (1024 bytes) when present; NULL when the
     -- proposing call had no embedder wired up. See the module doc.
     embedding         BLOB
@@ -345,7 +374,10 @@ fn embedding_to_blob(v: &[f32]) -> Vec<u8> {
 /// side, where a plain temp file gives the exact same bytes this function needs to
 /// publish through ordinary, safe file I/O — this artifact's home is object storage
 /// either way, so "file-shaped from the start" costs nothing.
-fn build_sqlite_bytes(claims: &[FoldedClaim]) -> Result<Vec<u8>, MaintError> {
+fn build_sqlite_bytes(
+    claims: &[FoldedClaim],
+    agent_reads_enabled: bool,
+) -> Result<Vec<u8>, MaintError> {
     let file =
         tempfile::NamedTempFile::new().map_err(|e| MaintError::Other(format!("tempfile: {e}")))?;
     let path = file.path().to_path_buf();
@@ -364,17 +396,30 @@ fn build_sqlite_bytes(claims: &[FoldedClaim]) -> Result<Vec<u8>, MaintError> {
             "INSERT INTO snapshot_meta (key, value) VALUES ('embedding_dimensions', ?1)",
             rusqlite::params![EMBEDDING_DIMENSIONS.to_string()],
         )?;
+        // Recorded so a reader can sanity-check the whole artifact's mode at a
+        // glance, without scanning every row's `visible_to_agents` — see the
+        // module doc's "the gate is a property of the artifact" paragraph.
+        conn.execute(
+            "INSERT INTO snapshot_meta (key, value) VALUES ('agent_reads_enabled', ?1)",
+            rusqlite::params![agent_reads_enabled.to_string()],
+        )?;
 
         {
             let mut stmt = conn.prepare(
                 "INSERT INTO claims (claim_id, claim, claim_type, subject, scope, observed_by, \
-                 status, evidence_count, independent_count, confidence, evidence_json, updated_at, embedding) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 status, evidence_count, independent_count, confidence, evidence_json, updated_at, \
+                 visible_to_agents, embedding) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for c in claims {
                 let evidence_json = serde_json::to_string(&c.evidence)?;
                 let evidence_count = evidence_session_count(&c.evidence);
                 let embedding_blob = c.embedding.as_deref().map(embedding_to_blob);
+                // Only a claim that actually passed the gate (`status ==
+                // "promoted"`) is ever a candidate for agent visibility — a
+                // candidate or contested claim is invisible regardless of mode,
+                // matching the belief wave's own `claims_visible_to_agents` rule.
+                let visible_to_agents = agent_reads_enabled && c.status == "promoted";
                 stmt.execute(rusqlite::params![
                     c.claim_id,
                     c.claim,
@@ -388,14 +433,22 @@ fn build_sqlite_bytes(claims: &[FoldedClaim]) -> Result<Vec<u8>, MaintError> {
                     c.confidence,
                     evidence_json,
                     c.updated_at,
+                    visible_to_agents,
                     embedding_blob,
                 ])?;
             }
         }
 
+        // Only rows the gate promoted *and* that this run's mode allows to be
+        // read ever enter the search index — this is the one table a
+        // memory-recall MCP tool would actually query into a context window, so
+        // it is the one table that must be structurally incapable of surfacing a
+        // shadow-mode or un-gated claim, not merely conventionally filtered by
+        // whoever queries it later. See the module doc.
         conn.execute_batch(
             "INSERT INTO claims_fts (claim_id, claim, subject) \
-             SELECT claim_id, claim, subject FROM claims ORDER BY claim_id;",
+             SELECT claim_id, claim, subject FROM claims \
+             WHERE visible_to_agents = 1 ORDER BY claim_id;",
         )?;
     } // conn dropped and file closed before we read its bytes back.
 
@@ -407,6 +460,10 @@ fn build_sqlite_bytes(claims: &[FoldedClaim]) -> Result<Vec<u8>, MaintError> {
 pub struct SnapshotOutcome {
     pub content_hash: String,
     pub claim_count: usize,
+    /// Echoes the `agent_reads_enabled` this run was called with — see the module
+    /// doc. A different value for logically identical claims produces a different
+    /// `content_hash`, which is correct: the mode is part of the published bytes.
+    pub agent_reads_enabled: bool,
     /// False when the blob at this hash already existed (a re-run over an unchanged
     /// claim log) — no bytes were re-uploaded.
     pub blob_written: bool,
@@ -417,11 +474,15 @@ pub struct SnapshotOutcome {
 }
 
 /// Fold `claims/events/` and publish the result. See the module doc for the full
-/// contract, including why this is safe to call with an empty event log.
-pub async fn publish(store: &dyn ObjectStore) -> Result<SnapshotOutcome, MaintError> {
+/// contract, including why this is safe to call with an empty event log, and for
+/// what `agent_reads_enabled` does and does not gate.
+pub async fn publish(
+    store: &dyn ObjectStore,
+    agent_reads_enabled: bool,
+) -> Result<SnapshotOutcome, MaintError> {
     let claims = fold_claim_events(store).await?;
     let claim_count = claims.len();
-    let bytes = build_sqlite_bytes(&claims)?;
+    let bytes = build_sqlite_bytes(&claims, agent_reads_enabled)?;
     let full_hash = hash::content_hash(&bytes);
     let content_hash = full_hash.trim_start_matches("sha256:").to_string();
 
@@ -489,6 +550,7 @@ pub async fn publish(store: &dyn ObjectStore) -> Result<SnapshotOutcome, MaintEr
     Ok(SnapshotOutcome {
         content_hash,
         claim_count,
+        agent_reads_enabled,
         blob_written,
         pointer_updated,
     })
@@ -561,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn folding_an_empty_log_produces_a_valid_sqlite_file_with_the_right_shape() {
         let store = InMemory::new();
-        let outcome = publish(&store).await.unwrap();
+        let outcome = publish(&store, true).await.unwrap();
         assert_eq!(outcome.claim_count, 0);
         assert!(outcome.blob_written);
         assert!(outcome.pointer_updated);
@@ -633,7 +695,7 @@ mod tests {
         )
         .await;
 
-        let outcome = publish(&store).await.unwrap();
+        let outcome = publish(&store, true).await.unwrap();
         assert_eq!(outcome.claim_count, 2);
 
         let blob = store
@@ -674,27 +736,54 @@ mod tests {
         assert_eq!(independent_count, 2);
         assert!((confidence - 0.75).abs() < 1e-9);
 
-        let claim2_status: String = conn
+        let (claim2_status, claim2_visible): (String, i64) = conn
             .query_row(
-                "SELECT status FROM claims WHERE claim_id = 'claim-2'",
+                "SELECT status, visible_to_agents FROM claims WHERE claim_id = 'claim-2'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(
             claim2_status, "candidate",
             "a merely-proposed claim is a candidate"
         );
+        assert_eq!(
+            claim2_visible, 0,
+            "a candidate must never be marked agent-visible, even with reads enabled"
+        );
 
-        // FTS5 must actually find it by text.
-        let hits: i64 = conn
+        // The promoted claim must be visible and FTS5-searchable...
+        let claim1_visible: i64 = conn
+            .query_row(
+                "SELECT visible_to_agents FROM claims WHERE claim_id = 'claim-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim1_visible, 1);
+        let just_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims_fts WHERE claims_fts MATCH 'just'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(just_hits, 1);
+
+        // ...but the merely-candidate claim-2 must not be, even though this run
+        // had agent reads enabled: promotion, not mode, is the FTS5 gate for an
+        // individual row.
+        let ssh_hits: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM claims_fts WHERE claims_fts MATCH 'ssh'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(hits, 1);
+        assert_eq!(
+            ssh_hits, 0,
+            "a candidate claim must never be FTS5-searchable, promoted or not"
+        );
     }
 
     #[tokio::test]
@@ -711,7 +800,7 @@ mod tests {
             promoted("never-proposed", 1, 0.5),
         )
         .await;
-        let outcome = publish(&store).await.unwrap();
+        let outcome = publish(&store, true).await.unwrap();
         assert_eq!(outcome.claim_count, 0);
     }
 
@@ -730,7 +819,7 @@ mod tests {
             serde_json::json!({"kind": "superseded", "claim_id": "claim-1", "at": "2026-09-11T00:00:00Z", "by": "claim-9"}),
         )
         .await;
-        let outcome = publish(&store).await.unwrap();
+        let outcome = publish(&store, true).await.unwrap();
         let blob = store
             .get(&ctxlake_store::layout::snapshot(&outcome.content_hash))
             .await
@@ -761,7 +850,7 @@ mod tests {
             proposed("claim-1", "x", &["s1"], Some(vector.clone())),
         )
         .await;
-        let outcome = publish(&store).await.unwrap();
+        let outcome = publish(&store, true).await.unwrap();
         let blob = store
             .get(&ctxlake_store::layout::snapshot(&outcome.content_hash))
             .await
@@ -797,8 +886,8 @@ mod tests {
             )
             .await;
         }
-        let outcome_a = publish(&store_a).await.unwrap();
-        let outcome_b = publish(&store_b).await.unwrap();
+        let outcome_a = publish(&store_a, true).await.unwrap();
+        let outcome_b = publish(&store_b, true).await.unwrap();
         assert_eq!(
             outcome_a.content_hash, outcome_b.content_hash,
             "identical logical claim state must hash identically — this is a \
@@ -815,11 +904,11 @@ mod tests {
             proposed("claim-1", "x", &[], None),
         )
         .await;
-        let first = publish(&store).await.unwrap();
+        let first = publish(&store, true).await.unwrap();
         assert!(first.blob_written);
         assert!(first.pointer_updated);
 
-        let second = publish(&store).await.unwrap();
+        let second = publish(&store, true).await.unwrap();
         assert_eq!(second.content_hash, first.content_hash);
         assert!(
             !second.blob_written,
@@ -848,10 +937,88 @@ mod tests {
         )
         .await;
 
-        let outcome = publish(&store).await.unwrap();
+        let outcome = publish(&store, true).await.unwrap();
         assert_eq!(
             outcome.claim_count, 1,
             "the one well-formed event must still fold"
         );
+    }
+
+    /// The regression for the review finding: publishing with agent reads
+    /// disabled must still run the full fold (arithmetic doesn't skip in shadow
+    /// mode, per `docs/summarization.md`), but the artifact it produces must be
+    /// structurally incapable of serving that promoted claim to an agent — no
+    /// FTS5 hit, no `visible_to_agents` row — rather than merely trusting every
+    /// future reader to remember to check the mode themselves.
+    #[tokio::test]
+    async fn shadow_mode_still_folds_but_publishes_nothing_agent_queryable() {
+        let store = InMemory::new();
+        append_claim_event(
+            &store,
+            "claims/events/dt=2026-09-10/agent=cc-01/01A.json",
+            proposed("claim-1", "this repo uses just, not make", &["s1"], None),
+        )
+        .await;
+        append_claim_event(
+            &store,
+            "claims/events/dt=2026-09-11/agent=_gate/01B.json",
+            promoted("claim-1", 2, 0.9),
+        )
+        .await;
+
+        let outcome = publish(&store, false).await.unwrap();
+        assert_eq!(
+            outcome.claim_count, 1,
+            "the fold itself must not be gated by agent_reads_enabled"
+        );
+        assert!(!outcome.agent_reads_enabled);
+
+        let blob = store
+            .get(&ctxlake_store::layout::snapshot(&outcome.content_hash))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let (_guard, conn) = open_published(&blob);
+
+        // The full audit row survives — this is not an empty snapshot.
+        let (status, visible): (String, i64) = conn
+            .query_row(
+                "SELECT status, visible_to_agents FROM claims WHERE claim_id = 'claim-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "promoted");
+        assert_eq!(
+            visible, 0,
+            "a promoted claim must not be marked agent-visible when reads are disabled"
+        );
+
+        // ...but it must be structurally absent from the servable, queryable
+        // index — this is the one table an MCP memory-recall tool would query
+        // into a context window.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims_fts WHERE claims_fts MATCH 'just'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hits, 0,
+            "a shadow-mode snapshot must publish zero FTS5-discoverable claims, \
+             even ones that were fully promoted"
+        );
+
+        let meta_flag: String = conn
+            .query_row(
+                "SELECT value FROM snapshot_meta WHERE key = 'agent_reads_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta_flag, "false");
     }
 }

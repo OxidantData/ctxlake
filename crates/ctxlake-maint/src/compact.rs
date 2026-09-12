@@ -23,19 +23,36 @@
 //! `ctxlake_store::layout::sessions_compaction_marker` names this as the very
 //! contract the marker exists to make checkable.
 //!
-//! **Deduped on content_hash, but only where content_hash means something.**
-//! `Envelope::new`'s default `content_hash` is `hash::content_hash("")` — the same
-//! value on *every* envelope that never set `content` (which, per
-//! `ctxlake-hook`'s adapters, is every plain `ToolCall`: the call's payload lives in
-//! `tool.input`/`tool.result`, not the envelope's own `content` field). Deduping on
-//! that shared value would silently collapse every contentless tool call fleet-wide
-//! into one row — including the very repeated `cargo test` failures
-//! `ctxlake_maint::digest`'s friction detection depends on counting exactly.
-//! `dedup_by_content_hash` below refuses to do that: only envelopes whose
-//! `content_hash` differs from `hash::content_hash("")` (real, non-empty content —
-//! the `AGENTS.md`/`CLAUDE.md` text this module doc's own dedup rationale is about)
-//! are ever collapsed against each other; every "empty" row is passed through
-//! individually, exactly once, regardless of how many others share that hash.
+//! **Deduped on `(session_id, content_hash)`, never on `content_hash` alone.** The
+//! motivating case is one session pasting the same large, unchanging text (say, the
+//! whole of `AGENTS.md`) into more than one turn — collapsing *that* to one row per
+//! session is a real, safe space saving. Keying on `content_hash` alone instead
+//! (this module's first-shipped version did exactly that, and a review caught it)
+//! collapses three *different* agents in three *different* sessions who all hit the
+//! identical content into one surviving row, silently owned by whichever session's
+//! event happened to sort first: `sessions/compacted/` would then no longer be a
+//! faithful repack of the partition it claims to be — every per-agent or per-session
+//! aggregate run against it undercounts — and, worse for the belief layer, three
+//! independent agents corroborating the same observation is exactly the
+//! evidence-session signal `docs/memory.md`'s independence gate exists to count;
+//! collapsing them to one row before extraction ever runs erases that signal before
+//! it can be measured. `session_id` leading the dedup key makes that structurally
+//! impossible: two envelopes only ever collapse into one when they are both the same
+//! session *and* the same content, so no compaction run can merge events across two
+//! sessions or two agents no matter what they contain.
+//!
+//! **Only where content_hash means something.** `Envelope::new`'s default
+//! `content_hash` is `hash::content_hash("")` — the same value on *every* envelope
+//! that never set `content` (which, per `ctxlake-hook`'s adapters, is every plain
+//! `ToolCall`: the call's payload lives in `tool.input`/`tool.result`, not the
+//! envelope's own `content` field). Deduping on that shared value would silently
+//! collapse every contentless tool call in a session into one row — including the
+//! very repeated `cargo test` failures `ctxlake_maint::digest`'s friction detection
+//! depends on counting exactly. `dedup_by_content_hash` below refuses to do that:
+//! only envelopes whose `content_hash` differs from `hash::content_hash("")` (real,
+//! non-empty content) are ever collapsed against each other; every "empty" row is
+//! passed through individually, exactly once, regardless of how many others in the
+//! same session share that hash.
 //!
 //! Callers must hold `live/leases/_maintenance` before calling anything here — this
 //! module does not acquire it itself, the same convention
@@ -67,6 +84,13 @@ pub struct CompactionOutcome {
     pub rows_in: usize,
     pub rows_out: usize,
     pub parts_written: usize,
+    /// The generation this run's output lives under — see
+    /// `ctxlake_store::layout::sessions_compacted_part`'s doc. Two runs over the
+    /// same sealed-session set always compute the same generation (that's the
+    /// idempotency contract); a different sealed-session set always computes a
+    /// different one, so callers never need to guess which `gen=` directory holds
+    /// this run's parts.
+    pub generation: String,
     /// True when this run found the partition already compacted (its sealed-session
     /// set matched the existing marker) and did no reading or writing at all.
     pub skipped: bool,
@@ -112,11 +136,13 @@ fn sessions_hash(markers: &[Path]) -> String {
     hash::content_hash(joined)
 }
 
-/// Collapse envelopes that share a *meaningful* `content_hash` into one
-/// representative row each, in a deterministic order. See the module doc for why
-/// `hash::content_hash("")` — the shared value of every envelope that never set
-/// `content` — is explicitly exempted from this collapse rather than treated as "one
-/// more hash to dedup on."
+/// Collapse envelopes that share a *meaningful* `content_hash` **within the same
+/// session** into one representative row each, in a deterministic order. See the
+/// module doc for why the key is `(session_id, content_hash)`, never `content_hash`
+/// alone — collapsing across sessions or agents is exactly the bug a review caught
+/// here, and why `hash::content_hash("")` (the shared value of every envelope that
+/// never set `content`) is explicitly exempted from this collapse rather than
+/// treated as "one more hash to dedup on."
 fn dedup_by_content_hash(mut envelopes: Vec<Envelope>) -> Vec<Envelope> {
     // Deterministic output order given an identical input set: by (session_id,
     // event_id). event_id alone is only monotonic within one session's single
@@ -126,14 +152,20 @@ fn dedup_by_content_hash(mut envelopes: Vec<Envelope>) -> Vec<Envelope> {
     envelopes.sort_by(|a, b| (&a.session_id, &a.event_id).cmp(&(&b.session_id, &b.event_id)));
 
     let empty_hash = hash::content_hash("");
-    let mut seen: HashSet<String> = HashSet::new();
+    // Keyed by (session_id, content_hash): two envelopes only ever collapse when
+    // they belong to the *same session* and share the *same* meaningful content.
+    // A bare `HashSet<String>` of `content_hash` alone (this module's first draft)
+    // silently merges different sessions' — and different agents' — events the
+    // moment their content happens to match; see the module doc's dedup paragraph
+    // for exactly why that is a correctness bug, not a stronger optimization.
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     envelopes
         .into_iter()
         .filter(|e| {
             if e.content_hash == empty_hash {
                 return true; // never dedup contentless rows against each other.
             }
-            seen.insert(e.content_hash.clone())
+            seen.insert((e.session_id.clone(), e.content_hash.clone()))
         })
         .collect()
 }
@@ -197,6 +229,11 @@ pub async fn run_with_part_size(
 ) -> Result<CompactionOutcome, MaintError> {
     let markers = sealed_session_markers(store, date, fleet_id).await?;
     let current_hash = sessions_hash(&markers);
+    // The path-safe form of `current_hash`, and this run's generation identity —
+    // see `ctxlake_store::layout::sessions_compacted_part`'s doc for why every
+    // run's output lives under its own `gen=` directory instead of overwriting
+    // fixed filenames a concurrent reader might be mid-read of.
+    let generation = current_hash.trim_start_matches("sha256:").to_string();
 
     let marker_path = ctxlake_store::layout::sessions_compaction_marker(date, fleet_id);
     if let Ok(res) = store.get(&marker_path).await {
@@ -210,6 +247,7 @@ pub async fn run_with_part_size(
                     rows_in: existing.rows_in,
                     rows_out: existing.rows_out,
                     parts_written: existing.parts,
+                    generation,
                     skipped: true,
                 });
             }
@@ -227,6 +265,7 @@ pub async fn run_with_part_size(
             rows_in: 0,
             rows_out: 0,
             parts_written: 0,
+            generation,
             skipped: false,
         });
     }
@@ -241,12 +280,19 @@ pub async fn run_with_part_size(
 
     let parts = chunk_into_parts(&deduped, max_part_bytes)?;
     for (i, bytes) in parts.iter().enumerate() {
-        let part_path = ctxlake_store::layout::sessions_compacted_part(date, fleet_id, i as u32);
+        let part_path =
+            ctxlake_store::layout::sessions_compacted_part(date, fleet_id, &generation, i as u32);
         store
             .put(&part_path, PutPayload::from(bytes.clone()))
             .await?;
     }
 
+    // Written last, after every part of *this* generation is durably in place —
+    // the same write-blob(s)-then-swap-pointer order `snapshot::publish` uses for
+    // the identical class of problem. A crash between a part PUT and this marker
+    // write leaves an orphaned, never-pointed-to `gen=` directory (harmless) or
+    // simply never advances the pointer (also harmless — readers keep following
+    // the old, still-fully-intact generation).
     write_marker(
         store,
         &marker_path,
@@ -265,6 +311,7 @@ pub async fn run_with_part_size(
         rows_in,
         rows_out,
         parts_written: parts.len(),
+        generation,
         skipped: false,
     })
 }
@@ -423,7 +470,12 @@ mod tests {
         assert_eq!(outcome.rows_out, 2);
         assert_eq!(outcome.parts_written, 1);
 
-        let part = ctxlake_store::layout::sessions_compacted_part("2026-09-11", "oxidant", 0);
+        let part = ctxlake_store::layout::sessions_compacted_part(
+            "2026-09-11",
+            "oxidant",
+            &outcome.generation,
+            0,
+        );
         let bytes = store.get(&part).await.unwrap().bytes().await.unwrap();
         let decoded = ctxlake_sync::codec::decode(&bytes).unwrap();
         assert_eq!(decoded.len(), 2);
@@ -472,6 +524,7 @@ mod tests {
             .get(&ctxlake_store::layout::sessions_compacted_part(
                 "2026-09-11",
                 "oxidant",
+                &first.generation,
                 0,
             ))
             .await
@@ -486,11 +539,16 @@ mod tests {
             "an unchanged partition must be recognized and skipped"
         );
         assert_eq!(second.rows_out, first.rows_out);
+        assert_eq!(
+            second.generation, first.generation,
+            "an unchanged sealed-session set must resolve to the same generation"
+        );
 
         let part_after = store
             .get(&ctxlake_store::layout::sessions_compacted_part(
                 "2026-09-11",
                 "oxidant",
+                &second.generation,
                 0,
             ))
             .await
@@ -534,8 +592,116 @@ mod tests {
         assert_eq!(second.rows_out, 2);
     }
 
+    /// The review finding this regression test guards: every prior version of
+    /// this module wrote a recompaction's parts to the *same* fixed filenames
+    /// (`part-000000.parquet`, ...) the previous generation used, across multiple
+    /// non-atomic PUTs with no pointer protecting a reader from seeing a mix of
+    /// the two. This test proves a newer generation can never rewrite an older
+    /// one's bytes in place, by keeping the older generation's exact bytes around
+    /// to compare against after the new run completes.
     #[tokio::test]
-    async fn the_same_content_hash_across_50_sessions_is_stored_once() {
+    async fn recompaction_never_overwrites_a_previous_generations_part_files() {
+        let store = InMemory::new();
+        seal_session(
+            &store,
+            "2026-09-11",
+            "oxidant",
+            "sess-1",
+            &[sample_envelope("sess-1", 0, Some("hello"))],
+        )
+        .await;
+        let first = run(&store, "2026-09-11", "oxidant").await.unwrap();
+        let first_part = ctxlake_store::layout::sessions_compacted_part(
+            "2026-09-11",
+            "oxidant",
+            &first.generation,
+            0,
+        );
+        let first_bytes = store.get(&first_part).await.unwrap().bytes().await.unwrap();
+
+        seal_session(
+            &store,
+            "2026-09-11",
+            "oxidant",
+            "sess-2",
+            &[sample_envelope("sess-2", 0, Some("world"))],
+        )
+        .await;
+        let second = run(&store, "2026-09-11", "oxidant").await.unwrap();
+        assert_ne!(
+            second.generation, first.generation,
+            "a different sealed-session set must resolve to a different generation"
+        );
+
+        // The old generation's part file must still exist, byte-for-byte
+        // unchanged — a concurrent reader mid-way through the second run, still
+        // looking at the first generation's directory, must never observe a
+        // torn write or a silently replaced file.
+        let first_bytes_after = store.get(&first_part).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            first_bytes, first_bytes_after,
+            "recompaction must never rewrite a prior generation's part files in place"
+        );
+
+        // And the new generation's own parts are readable at their own, different
+        // path, with both sessions folded in.
+        let second_part = ctxlake_store::layout::sessions_compacted_part(
+            "2026-09-11",
+            "oxidant",
+            &second.generation,
+            0,
+        );
+        let second_bytes = store
+            .get(&second_part)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let decoded = ctxlake_sync::codec::decode(&second_bytes).unwrap();
+        assert_eq!(
+            decoded.len(),
+            2,
+            "the new generation must contain both sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_within_one_session_is_stored_once() {
+        // The dedup this module actually wants: one session pasting the same
+        // large, unchanging text into two different turns collapses to one row.
+        let store = InMemory::new();
+        seal_session(
+            &store,
+            "2026-09-11",
+            "oxidant",
+            "sess-1",
+            &[
+                sample_envelope("sess-1", 0, Some("the entire text of AGENTS.md")),
+                sample_envelope("sess-1", 1, Some("the entire text of AGENTS.md")),
+            ],
+        )
+        .await;
+
+        let outcome = run(&store, "2026-09-11", "oxidant").await.unwrap();
+        assert_eq!(outcome.rows_in, 2);
+        assert_eq!(
+            outcome.rows_out, 1,
+            "identical content repeated within one session must dedup to one row"
+        );
+    }
+
+    /// The review finding this regression test guards: `dedup_by_content_hash`
+    /// once keyed on `content_hash` alone, which silently collapsed 50 different
+    /// agents' sessions that all happened to hit identical content into a single
+    /// misattributed row (`the_same_content_hash_across_50_sessions_is_stored_once`,
+    /// this test's predecessor, asserted exactly that collapse as if it were
+    /// correct). This is precisely the corroboration signal
+    /// `docs/memory.md`'s independence gate depends on counting — three agents
+    /// independently observing the same thing must never be compacted down to
+    /// one observer before extraction gets a chance to see it.
+    #[tokio::test]
+    async fn the_same_content_hash_across_different_sessions_is_never_collapsed() {
         let store = InMemory::new();
         for i in 0..50 {
             let session = format!("sess-{i}");
@@ -557,8 +723,28 @@ mod tests {
         assert_eq!(outcome.sealed_session_count, 50);
         assert_eq!(outcome.rows_in, 50);
         assert_eq!(
-            outcome.rows_out, 1,
-            "50 sessions with byte-identical content must dedup to one row"
+            outcome.rows_out, 50,
+            "50 different sessions with byte-identical content must never be \
+             collapsed into each other — only within-session repeats dedup"
+        );
+
+        // Not just a count: every one of the 50 sessions must actually still be
+        // represented, not merely "50 rows, most of them the same session
+        // repeated" — that would pass the count assertion above while still
+        // being the misattribution bug.
+        let part = ctxlake_store::layout::sessions_compacted_part(
+            "2026-09-11",
+            "oxidant",
+            &outcome.generation,
+            0,
+        );
+        let bytes = store.get(&part).await.unwrap().bytes().await.unwrap();
+        let decoded = ctxlake_sync::codec::decode(&bytes).unwrap();
+        let sessions: HashSet<&str> = decoded.iter().map(|e| e.session_id.as_str()).collect();
+        assert_eq!(
+            sessions.len(),
+            50,
+            "every distinct session must survive compaction, not just some subset of 50 rows"
         );
     }
 
@@ -626,8 +812,12 @@ mod tests {
         // Every row must still be recoverable, exactly once, across all parts.
         let mut total = 0usize;
         for i in 0..outcome.parts_written {
-            let part =
-                ctxlake_store::layout::sessions_compacted_part("2026-09-11", "oxidant", i as u32);
+            let part = ctxlake_store::layout::sessions_compacted_part(
+                "2026-09-11",
+                "oxidant",
+                &outcome.generation,
+                i as u32,
+            );
             let bytes = store.get(&part).await.unwrap().bytes().await.unwrap();
             total += ctxlake_sync::codec::decode(&bytes).unwrap().len();
         }

@@ -64,11 +64,18 @@ threshold, a session abandoned after a run of failures). See
 **`sessions/compacted/`** is where `ctxlake maint compact` writes — never into the
 `dt=.../session=.../` directories above. Bronze is immutable, so compaction only ever
 *adds* a derived, queryable rewrite of a whole `(date, fleet)` partition into fewer,
-larger files, deduped on `content_hash` (with one deliberate exception: an envelope
-that never set `content` — every plain tool call — is never deduped against another
-one just because both hash the same empty string; see the module's own doc for why
-that distinction matters). `_COMPACTED` records exactly which sealed sessions were
-folded in, so a second run over an unchanged partition is a no-op, not a duplication.
+larger files, deduped on `(session_id, content_hash)` — never on `content_hash`
+alone, which would silently merge different sessions' (and different agents')
+events that happen to share content into one misattributed row (with one deliberate
+exception: an envelope that never set `content` — every plain tool call — is never
+deduped against another one just because both hash the same empty string; see the
+module's own doc for why that distinction matters). Each output part file lives
+under a `gen=<hash-of-the-sealed-session-set>/` directory, never a fixed filename
+reused across runs — see the module's own doc for why a recompaction must never
+overwrite a still-live generation's files — and `_COMPACTED` names which generation
+is current, so a second run over an unchanged partition is a no-op, not a
+duplication, and a reader always follows the marker rather than globbing the
+directory directly.
 
 **`claims/events/` vs `claims/fleet/`** are deliberately two different prefixes, not
 one with a status field, because they have different write permissions: any agent can

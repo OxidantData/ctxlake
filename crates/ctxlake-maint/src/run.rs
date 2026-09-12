@@ -48,11 +48,20 @@ pub enum RunOutcome {
 /// Run the full maintenance chain for `fleet_id`, under the maintenance lease,
 /// identifying this attempt as `holder` (an operator- or host-stable string — see
 /// `docs/coordination.md` on lease holder identity).
+///
+/// `agent_reads_enabled` is the boolean form of `docs/summarization.md`'s
+/// `[summarize] mode` (`shadow`/`none` -> `false`, everything else -> `true`) —
+/// see `snapshot`'s module doc for exactly what it does and does not gate. It is
+/// a plain `bool`, not that config enum, because no wave has wired
+/// `ctxlake.toml`-reading into this crate yet; whoever adds that wiring computes
+/// this value and passes it in, rather than this function reaching into a config
+/// module this crate's task brief excludes ("NOT extraction or gates").
 pub async fn run(
     store: &dyn ObjectStore,
     clock: &dyn Clock,
     fleet_id: &str,
     holder: &str,
+    agent_reads_enabled: bool,
 ) -> Result<RunOutcome, MaintError> {
     let lease_key = ctxlake_store::layout::lease_maintenance();
     // A one-time, pre-contention step normally run by `ctxlake init` (see
@@ -76,7 +85,8 @@ pub async fn run(
         lease::AcquireOutcome::NotAcquired { .. } => return Ok(RunOutcome::LeaseHeldElsewhere),
     };
 
-    let report = run_maintenance_chain(store, clock, fleet_id, &mut handle).await;
+    let report =
+        run_maintenance_chain(store, clock, fleet_id, &mut handle, agent_reads_enabled).await;
 
     // Release regardless of whether the chain succeeded. A lease abandoned mid-crash
     // is exactly the advisory-expiry case AGENTS.md invariant 5 already accounts
@@ -112,6 +122,7 @@ async fn run_maintenance_chain(
     clock: &dyn Clock,
     fleet_id: &str,
     handle: &mut LeaseHandle,
+    agent_reads_enabled: bool,
 ) -> Result<MaintenanceReport, MaintError> {
     let mut dates_compacted = Vec::new();
     for date in compact::discover_dates(store).await? {
@@ -130,7 +141,7 @@ async fn run_maintenance_chain(
     }
     renew_or_stop(store, clock, handle).await?;
 
-    let snapshot = snapshot::publish(store).await?;
+    let snapshot = snapshot::publish(store, agent_reads_enabled).await?;
 
     Ok(MaintenanceReport {
         dates_compacted,
@@ -188,7 +199,9 @@ mod tests {
         let clock = SystemClock;
         seal_a_session(&store).await;
 
-        let outcome = run(&store, &clock, "oxidant", "host-a").await.unwrap();
+        let outcome = run(&store, &clock, "oxidant", "host-a", true)
+            .await
+            .unwrap();
         let RunOutcome::Ran(report) = outcome else {
             panic!("expected the chain to run");
         };
@@ -214,8 +227,12 @@ mod tests {
         let clock = SystemClock;
         seal_a_session(&store).await;
 
-        run(&store, &clock, "oxidant", "host-a").await.unwrap();
-        let RunOutcome::Ran(second) = run(&store, &clock, "oxidant", "host-a").await.unwrap()
+        run(&store, &clock, "oxidant", "host-a", true)
+            .await
+            .unwrap();
+        let RunOutcome::Ran(second) = run(&store, &clock, "oxidant", "host-a", true)
+            .await
+            .unwrap()
         else {
             panic!("lease was released; a second run must be able to acquire it");
         };
@@ -259,7 +276,9 @@ mod tests {
             panic!("host-a should have acquired the never-before-held lease");
         };
 
-        let outcome_b = run(&store, &clock, "oxidant", "host-b").await.unwrap();
+        let outcome_b = run(&store, &clock, "oxidant", "host-b", true)
+            .await
+            .unwrap();
         assert!(
             matches!(outcome_b, RunOutcome::LeaseHeldElsewhere),
             "host-b must not run the chain while host-a holds the lease: {outcome_b:?}"
@@ -286,7 +305,9 @@ mod tests {
     async fn a_run_that_finds_nothing_still_exits_cleanly_and_releases() {
         let store = InMemory::new();
         let clock = SystemClock;
-        let RunOutcome::Ran(report) = run(&store, &clock, "oxidant", "host-a").await.unwrap()
+        let RunOutcome::Ran(report) = run(&store, &clock, "oxidant", "host-a", true)
+            .await
+            .unwrap()
         else {
             panic!("an idle fleet still owns the lease briefly to publish an empty snapshot");
         };
@@ -298,5 +319,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.holder, None);
+    }
+
+    /// `run`'s `agent_reads_enabled` parameter must actually reach `snapshot::publish`
+    /// — not get lost or hardcoded somewhere in the chain — since it is the only
+    /// thing standing between a shadow-mode fleet and a servable snapshot. See
+    /// `snapshot`'s own test suite for what the flag does once it arrives there.
+    #[tokio::test]
+    async fn agent_reads_enabled_threads_through_to_the_published_snapshot() {
+        let store = InMemory::new();
+        let clock = SystemClock;
+
+        let RunOutcome::Ran(report) = run(&store, &clock, "oxidant", "host-a", false)
+            .await
+            .unwrap()
+        else {
+            panic!("expected the chain to run");
+        };
+        assert!(
+            !report.snapshot.agent_reads_enabled,
+            "run(..., agent_reads_enabled: false) must not silently publish a \
+             reads-enabled snapshot"
+        );
     }
 }

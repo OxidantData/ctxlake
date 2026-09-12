@@ -1,7 +1,7 @@
 # systemd user unit for the ctxlake sync daemon.
 #
 # Rendered by `ctxlake sync install` into ~/.config/systemd/user/ctxlake-sync.service.
-# Placeholders: {{EXEC}} {{HOME}} {{FLEET_ID}} {{AGENT_ID}}
+# Placeholders: {{EXEC}} {{CONFIG}} {{HOME}}
 #
 # A USER unit, not a system one: the daemon reads this user's spool and writes with
 # this user's store credentials. A system unit would run as root and reach neither.
@@ -22,22 +22,29 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# --foreground: systemd owns supervision, so the daemon must not fork away from it.
-ExecStart={{EXEC}} sync run --foreground
+# --config is passed explicitly because a unit does not inherit the shell's idea of
+# where ctxlake.toml lives, and --foreground because systemd owns supervision: the
+# daemon must not fork away from the process systemd is watching.
+ExecStart="{{EXEC}}" --config "{{CONFIG}}" sync run --foreground
 WorkingDirectory={{HOME}}
-Environment="CTXLAKE_FLEET_ID={{FLEET_ID}}"
-Environment="CTXLAKE_AGENT_ID={{AGENT_ID}}"
+# Pinned, not inherited. Every local path ctxlake uses — the spool the hook writes,
+# the cache the briefing is read from, the pidfile — hangs off $HOME, so a daemon
+# that resolves a different one than the installing shell did silently drains a
+# spool nobody is filling. systemd already sets this correctly for a user unit;
+# recording it here is what makes the unit say which home it was installed for.
+Environment="HOME={{HOME}}"
 
 # on-failure, not always: `ctxlake sync stop` exits 0 and must stay stopped.
 Restart=on-failure
 RestartSec=5
 # 78 is EX_CONFIG — a missing or invalid ctxlake.toml. Restarting cannot fix that, and
-# a restart loop would bury the real error in the journal.
+# a restart loop would bury the real error in the journal. `ctxlake` exits 78 for
+# exactly this case; crates/ctxlake-cli/src/main.rs has the matching constant.
 RestartPreventExitStatus=78
 
 KillMode=mixed
 KillSignal=SIGTERM
-# The daemon flushes its spool and releases its presence entry on SIGTERM. Cutting it
+# The daemon flushes its spool and clears its presence entry on SIGTERM. Cutting it
 # short costs the flush, so give it room.
 TimeoutStopSec=30
 

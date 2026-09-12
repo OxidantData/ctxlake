@@ -133,7 +133,13 @@ jobs:
           cp README.md LICENSE NOTICE "$stage/" 2>/dev/null || true
 
           archive="ctxlake-${{ matrix.target }}.tar.xz"
-          tar -cJf "$archive" -C "$stage" .
+          # Name each member explicitly rather than `.`, which stores them as
+          # `./ctxlake`. GNU tar matches member names literally, so a consumer
+          # asking for `ctxlake` finds nothing in a `./`-prefixed archive while
+          # bsdtar matches it fine — v0.1.0 shipped that way and broke install on
+          # Linux only. packaging/install.sh no longer depends on either behaviour,
+          # but there is no reason to keep emitting the awkward form.
+          tar -cJf "$archive" -C "$stage" ctxlake ctxlake-hook README.md LICENSE NOTICE
 
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$archive" > "${archive}.sha256"

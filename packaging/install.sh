@@ -93,9 +93,24 @@ fi
 [ "$expected" = "$actual" ] || die "checksum mismatch for ${archive}: expected ${expected}, got ${actual}"
 
 mkdir -p "$INSTALL_DIR"
-tar -xJf "${workdir}/${archive}" -C "$workdir" ctxlake ctxlake-hook
-mv "${workdir}/ctxlake" "${workdir}/ctxlake-hook" "$INSTALL_DIR/"
-chmod +x "${INSTALL_DIR}/ctxlake" "${INSTALL_DIR}/ctxlake-hook"
+
+# Extract everything, then find the binaries — rather than naming members on the
+# tar command line.
+#
+# GNU tar matches member names literally, so `tar -x ... ctxlake` does NOT match an
+# entry stored as `./ctxlake`, and fails with "Not found in archive". bsdtar (macOS)
+# normalizes the prefix away and matches happily. v0.1.0's archives were built with
+# `tar -C stage .`, which stores the `./` form — so naming members worked on macOS
+# and failed on every Linux box. Extracting wholesale depends on neither tar's
+# matching rules nor on how a given release happened to be packed.
+tar -xJf "${workdir}/${archive}" -C "$workdir"
+
+for bin in ctxlake ctxlake-hook; do
+  found="$(find "$workdir" -type f -name "$bin" -print | head -n 1)"
+  [ -n "$found" ] || die "${archive} does not contain ${bin}"
+  mv "$found" "${INSTALL_DIR}/${bin}"
+  chmod +x "${INSTALL_DIR}/${bin}"
+done
 
 log "installed ctxlake and ctxlake-hook ${version} to ${INSTALL_DIR}"
 case ":$PATH:" in

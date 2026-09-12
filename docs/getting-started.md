@@ -17,15 +17,65 @@ is doing.
 
 ## 1. Install
 
+Four ways in, all installing the same two binaries (`ctxlake`, `ctxlake-hook`) —
+pick whichever fits how you manage tools on this machine.
+
+> **Status: pre-alpha, no release has been cut yet.** Everything below describes
+> what `.github/workflows/release.yml` produces once a tag is pushed and the
+> release workflow is run (`gh workflow run release.yml --ref <tag> -f
+> tag=<tag>` — see that file's header comment for why it's fired this way rather
+> than a plain tag push). Until then, `cargo install --git` is the only path that
+> actually works today.
+
+**Homebrew** (macOS and Linux):
+
 ```sh
 brew install oxidantdata/tap/ctxlake
 ```
 
-Or build from source:
+**`curl | sh`** — downloads the right prebuilt archive for your OS/arch, verifies
+it against the release's `SHA256SUMS`, and installs to `~/.local/bin`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/OxidantData/ctxlake/main/packaging/install.sh | sh
+```
+
+Override the version or install directory with env vars if you need to:
+
+```sh
+CTXLAKE_VERSION=v0.1.0 CTXLAKE_INSTALL_DIR="$HOME/bin" sh install.sh
+```
+
+See [`packaging/install.sh`](../packaging/install.sh) for exactly what it does —
+it is plain POSIX `sh`, short enough to read before you pipe it into a shell.
+
+**`cargo install`** — builds from source, works on any platform `rustc` targets,
+needs no release to exist:
 
 ```sh
 cargo install --git https://github.com/OxidantData/ctxlake ctxlake-cli
+cargo install --git https://github.com/OxidantData/ctxlake ctxlake-hook
 ```
+
+**Prebuilt archives** — grab the `.tar.xz` for your target directly from the
+[Releases page](https://github.com/OxidantData/ctxlake/releases), matching one
+of `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSfLO \
+  https://github.com/OxidantData/ctxlake/releases/download/<tag>/ctxlake-<target>.tar.xz
+curl --proto '=https' --tlsv1.2 -sSfLO \
+  https://github.com/OxidantData/ctxlake/releases/download/<tag>/SHA256SUMS
+grep "ctxlake-<target>.tar.xz\$" SHA256SUMS | shasum -a 256 -c -
+tar -xJf ctxlake-<target>.tar.xz
+```
+
+This is exactly what `install.sh` automates — reach for it directly when you
+want to pin an exact archive, inspect it before running anything, or install
+somewhere the script's assumptions don't fit (an unusual `$PATH` layout, a
+locked-down `/usr/local`, packaging it into an image build).
 
 ## 2. Point it at a store
 

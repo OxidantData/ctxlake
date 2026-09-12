@@ -89,6 +89,89 @@ error, because it looks like it worked. Executing the primitive and checking the
 before it becomes a lost-update bug in production instead of a line in a preflight
 report.
 
+`doctor` also prints which backend it thinks it's talking to, before any of the probe
+lines — a best-effort label from `ctxlake_store::backend::describe`, sniffed from the
+scheme plus (for `s3://`/`s3a://` URLs) the endpoint override, never a hard-coded branch
+in the code path that actually builds the store. It exists so the caveats below don't
+require a human to already know which vendor they're pointed at:
+
+```text
+$ ctxlake doctor
+store   s3://my-bucket/ctxlake
+backend: s3-compatible (MinIO)
+  caveat: no put-if-absent (minio/minio#20346) — ctxlake never relies on it; leases are
+          CAS-only (AGENTS.md invariant 4)
+  put-if-absent (If-None-Match: *)  ... UNSUPPORTED (412 on retry, not 200 as expected)
+  compare-and-swap                  ... ok
+  ...
+```
+
+A hostname that doesn't obviously say "minio" or "r2.cloudflarestorage.com" (a MinIO
+behind a corporate proxy on its own domain, say) falls back to the honest
+`s3-compatible (unrecognized vendor)` rather than guessing wrong — this is a display
+label for a human, and it is *never* consulted by [`backend::build`], which sets
+`S3ConditionalPut::ETagMatch` unconditionally for every `s3`/`s3a` URL regardless of
+what `describe` calls it (see that module's own doc: "one setting, every S3-shaped
+backend in scope"). Getting the label wrong costs a slightly less specific line in a
+report; nothing downstream branches on it.
+
+## GCS and Cloudflare R2: what's verified here, and what isn't
+
+Both of these get their own paragraph because "the matrix table says it works" and
+"this was checked against something real" are different claims, and this codebase has
+a house rule against blurring them.
+
+**Cloudflare R2** speaks the S3 API, so it takes the *exact same* `s3://`/`s3a://` code
+path as MinIO in `crates/ctxlake-store/src/backend.rs` — there is no `r2://` scheme and
+no R2-specific branch, by design. `build()` sets `S3ConditionalPut::ETagMatch`
+unconditionally for that scheme regardless of which S3-compatible endpoint you point it
+at, so R2 gets exactly the treatment MinIO does with no extra code to keep in sync.
+
+That splits into two separate claims, each pinned to its own test, because
+`object_store`'s `AmazonS3` client exposes no public accessor for the conditional-put
+mode it ends up using — only its *builder* does, via `get_config_value`, and only
+before `.build()` discards that state. Construction succeeding for an R2-shaped
+endpoint, with no special-casing keyed off recognizing it as R2, is asserted by
+`r2_endpoint_builds_with_the_same_etag_conditional_put_as_minio`. That the conditional-
+put mode itself is `ETagMatch` for both a MinIO- and an R2-shaped endpoint — and stays
+`ETagMatch` even against a hostile `AWS_CONDITIONAL_PUT=disabled` in the operator's own
+environment — is asserted by `s3_builder_forces_etag_conditional_put_for_minio_and_r2_alike`
+and `s3_builder_overrides_a_hostile_aws_conditional_put_env_var`, both of which
+introspect `s3_builder` (the piece `build()`'s `s3`/`s3a` branch was factored into
+expressly so this is checkable at all) rather than inferring the mode from `build()`
+merely not erroring. All four are **verified by running those tests**, not by reasoning
+about the code — an earlier version of this paragraph cited only the first pair for
+the *mode* claim, which those two tests never actually checked: deleting
+`.with_conditional_put(ETagMatch)` from `s3_builder` outright left every test in this
+file passing, since `ETagMatch` is `object_store`'s own default and nothing exercised
+the one case (a hostile env var) where the explicit call is what saves you. What is
+still **not** verified: an actual write against a real R2 bucket in this environment.
+R2's own documented footgun stands as written above — a bucket created in the wrong
+conditional-write mode returns success codes for a write whose condition silently did
+not apply — and nothing in this repo has exercised that failure mode against a live R2
+account. `doctor`'s cas-update/cas-conflict-detection probes are what would actually
+catch it; run them against your own bucket before trusting it.
+
+**GCS** does not use ETags at all. Reading `object_store` 0.14.1's own GCS client source
+(`src/gcp/client.rs`) shows `PutMode::Create` sends the header
+`x-goog-if-generation-match: 0` and `PutMode::Update(v)` sends
+`x-goog-if-generation-match: <generation>` — GCS's `generation` number fills the same
+role an ETag does for S3, and `object_store` maps it onto `PutMode` without ctxlake's
+`backend::build` needing to configure anything extra (contrast the S3 branch, which must
+opt into `ETagMatch` explicitly — see AGENTS.md invariant 4). One consequence worth
+noting: unlike S3, GCS's `PutMode::Create` is a **real put-if-absent** (`generation=0`
+means "does not exist yet"), so the "put-if-absent: not supported" row in the matrix
+above is an S3/MinIO-family gap, not a universal one — ctxlake still never relies on it
+anywhere, since the lease design has to work on the backend that lacks it regardless.
+This is **verified by reading the vendored dependency's source**, which is what
+`describe_recognizes_gcs_and_flags_generation_preconditions_as_unverified_live` in
+`backend.rs` pins down (the test name says exactly that: the claim is a source-read, not
+a live check). What is **not** verified: no GCS bucket was reachable from this
+environment, so nothing here has issued a real `x-goog-if-generation-match` request
+against Google's servers and watched it succeed or fail. Treat GCS support as
+"implemented and read carefully," not "field-proven," until someone runs `ctxlake
+doctor` against a real bucket and this paragraph gets to cite that instead.
+
 ## The local filesystem backend
 
 Local FS has no ETags or generation numbers, so its CAS is implemented directly rather

@@ -127,6 +127,16 @@ pub struct ProposedClaim {
     /// that candidate rather than refusing to check it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// RFC3339: when this prediction is due to be checked against reality.
+    /// `None` for every claim type except `hypothesis` — see
+    /// `docs/memory.md`'s "Confidence is derived, not claimed" and
+    /// `crate::calibrate::resolve`, which reads this to decide "nobody ever
+    /// answered this" (past due, no matching outcome) apart from "still
+    /// pending" (not due yet). A hypothesis with no resolution date can still
+    /// be resolved early by a matching outcome claim landing, it just never
+    /// expires on the calendar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolves_at: Option<String>,
 }
 
 /// One append to the claim event log. `#[serde(tag = "kind")]` makes every stored
@@ -161,16 +171,76 @@ pub enum ClaimEvent {
         at: String,
         by: String,
     },
+    /// A per-agent calibration record — see `crate::calibrate`'s module doc.
+    /// Not about any one claim (there is no `claim_id`, on purpose: this is
+    /// the observing agent's aggregate track record, not a mutation of a
+    /// claim's own state), so it lives in this same append-only log purely
+    /// for the reason docs/memory.md gives: auditable and replayable like
+    /// everything else here, rather than a number computed silently at read
+    /// time with no history of how it moved. Every field is the *cumulative*
+    /// total as of this event — the fold in `crate::calibrate::fold_scores`
+    /// takes the latest one per agent, the same "current state is the last
+    /// event" rule [`fold`] applies to a claim.
+    CalibrationScored {
+        agent_id: String,
+        at: String,
+        resolved_count: u32,
+        correct_count: u32,
+        incorrect_count: u32,
+        /// Tracked for visibility only — an agent whose hypotheses keep
+        /// expiring unresolved is a different (milder) signal than one whose
+        /// hypotheses keep resolving wrong, and collapsing the two into one
+        /// number would erase that distinction. Never enters `brier_score`.
+        expired_count: u32,
+        brier_score: f64,
+        /// Mirrors `crate::calibrate::AgentScore::low_sample` at the moment
+        /// this event was written — carried on the event itself (not just
+        /// recomputed from `resolved_count` by every reader) so a reader
+        /// folding history doesn't need to re-import the threshold constant
+        /// to render an old score honestly.
+        low_sample: bool,
+    },
+    /// The kill switch (docs/memory.md: "one flag per agent"). Its own event
+    /// kind, not a boolean flipped in place, for the same append-only reason
+    /// as everything else in this log: which agent was quarantined, when,
+    /// and why must stay on the record even after it is reversed —
+    /// `crate::calibrate::fold_quarantine` replays `AgentQuarantined` /
+    /// [`AgentUnquarantined`] in order to answer "quarantined right now,"
+    /// but neither event is ever deleted or overwritten to get there.
+    AgentQuarantined {
+        agent_id: String,
+        at: String,
+        reason: String,
+    },
+    /// Reverses the most recent [`AgentQuarantined`] for `agent_id`. Does
+    /// **not** itself restore any claim this agent had already been demoted
+    /// out of `promoted` because of the quarantine — see
+    /// `crate::calibrate`'s module doc for why that stays a one-way ratchet
+    /// requiring a human to actually re-review a contested claim, same as
+    /// any other contradiction.
+    AgentUnquarantined {
+        agent_id: String,
+        at: String,
+    },
 }
 
 impl ClaimEvent {
-    pub fn claim_id(&self) -> &str {
+    /// `None` for the two agent-scoped event kinds ([`ClaimEvent::CalibrationScored`],
+    /// [`ClaimEvent::AgentQuarantined`], [`ClaimEvent::AgentUnquarantined`]) —
+    /// they are not about any single claim, so returning a fake or empty
+    /// `claim_id` for them would let a caller silently misattribute a
+    /// per-agent record to a claim. See `crate::calibrate`'s own folds for
+    /// how those three are read instead.
+    pub fn claim_id(&self) -> Option<&str> {
         match self {
-            ClaimEvent::Proposed(p) => &p.claim_id,
+            ClaimEvent::Proposed(p) => Some(&p.claim_id),
             ClaimEvent::Promoted { claim_id, .. }
             | ClaimEvent::Contested { claim_id, .. }
             | ClaimEvent::Retired { claim_id, .. }
-            | ClaimEvent::Superseded { claim_id, .. } => claim_id,
+            | ClaimEvent::Superseded { claim_id, .. } => Some(claim_id),
+            ClaimEvent::CalibrationScored { .. }
+            | ClaimEvent::AgentQuarantined { .. }
+            | ClaimEvent::AgentUnquarantined { .. } => None,
         }
     }
 }
@@ -196,6 +266,11 @@ pub struct ClaimState {
     pub confidence: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// See [`ProposedClaim::resolves_at`]; carried through the fold the same
+    /// way `embedding` is — set from whichever `Proposed` event created the
+    /// claim, never overwritten by a later corroborating one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolves_at: Option<String>,
 }
 
 impl ClaimState {
@@ -233,6 +308,9 @@ pub fn fold<'a>(events: impl IntoIterator<Item = &'a ClaimEvent>) -> BTreeMap<St
                         if s.embedding.is_none() {
                             s.embedding = p.embedding.clone();
                         }
+                        if s.resolves_at.is_none() {
+                            s.resolves_at = p.resolves_at.clone();
+                        }
                     })
                     .or_insert_with(|| ClaimState {
                         claim_id: p.claim_id.clone(),
@@ -247,6 +325,7 @@ pub fn fold<'a>(events: impl IntoIterator<Item = &'a ClaimEvent>) -> BTreeMap<St
                         independent_count: 0,
                         confidence: 0.0,
                         embedding: p.embedding.clone(),
+                        resolves_at: p.resolves_at.clone(),
                     });
             }
             ClaimEvent::Promoted {
@@ -271,6 +350,13 @@ pub fn fold<'a>(events: impl IntoIterator<Item = &'a ClaimEvent>) -> BTreeMap<St
                     s.status = ClaimStatus::Retired;
                 }
             }
+            // Agent-scoped, not claim-scoped — see `ClaimEvent`'s own doc on
+            // these three variants. Folding a single claim's state is not
+            // what they're for; `crate::calibrate::fold_scores` and
+            // `fold_quarantine` fold this same event stream for those.
+            ClaimEvent::CalibrationScored { .. }
+            | ClaimEvent::AgentQuarantined { .. }
+            | ClaimEvent::AgentUnquarantined { .. } => {}
         }
     }
     out
@@ -468,6 +554,7 @@ mod tests {
             observed_at: "2026-09-09T00:00:00Z".into(),
             evidence: vec![evidence(session, "m1")],
             embedding: None,
+            resolves_at: None,
         })
     }
 
@@ -589,6 +676,7 @@ mod tests {
             independent_count: 2,
             confidence: 0.8,
             embedding: None,
+            resolves_at: None,
         };
         let states = vec![promoted];
         assert_eq!(
@@ -630,6 +718,7 @@ mod tests {
             independent_count: 1,
             confidence: 0.6,
             embedding: None,
+            resolves_at: None,
         }
     }
 
@@ -646,11 +735,12 @@ mod tests {
             observed_at: "2026-09-09T00:00:00Z".into(),
             evidence: vec![evidence("s1", "m1")],
             embedding: None,
+            resolves_at: None,
         };
         append_proposed(&store, "2026-09-09", &p).await.unwrap();
         let events = list_events(&store).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].claim_id(), "c1");
+        assert_eq!(events[0].claim_id(), Some("c1"));
     }
 
     #[tokio::test]

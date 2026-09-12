@@ -130,17 +130,39 @@ assertion. That difference is the entire safety margin, and it costs a few token
 
 ## Quarantine: the kill switch
 
-```sh
-ctxlake quarantine <agent_id>
-```
-
-One flag per agent. Its claims stop promoting, its already-promoted claims move to
-`contested`, and **its capture continues** — you want the record of the failure, not a
-gap where it used to be. Reversible, auditable, one line.
+One flag per agent, reversible, auditable, one line: its claims stop promoting, its
+already-promoted claims move to `contested`, and **its capture continues** — you want the
+record of the failure, not a gap where it used to be.
 
 The signal to reach for it: a rising contradiction rate from one agent. That usually means
 its extraction has drifted, and it is the early warning that lets you act before the pool
-is polluted rather than after.
+is polluted rather than after — `crate::calibrate::contradiction_rates` computes exactly
+this ratio (contested / (promoted + contested)) per agent from the current claim log, so
+an operator can watch it rise before reaching for the flag rather than discovering the
+pool is polluted afterwards.
+
+**The real kill switch lives in the gate, not in a CLI flag — and as of this wave the two
+are not yet the same thing.** `crate::calibrate::quarantine`/`unquarantine` append
+`AgentQuarantined`/`AgentUnquarantined` events to the same claim event log everything else
+here lives in; `crate::gate::run_gate` checks that log *before* any of the four gates (a
+fifth, separate lever, not one of them — a quarantined agent's candidate never even
+reaches the evidence check), and `crate::gate::run` demotes that agent's already-`Promoted`
+claims to `contested` on *every* run, not only the run right after quarantine was flagged —
+a standing invariant re-checked every time, not a one-time reaction. Un-quarantining is
+real and reversible but is not a rollback: a claim already demoted to `contested` stays
+there for a human to review, exactly like any other contradiction. Lifting quarantine only
+restores the *ability* to promote again.
+
+> **Known gap: `ctxlake quarantine <agent_id>`, the CLI command, does not call any of
+> this yet.** It writes a marker under `claims/quarantine/` and edits the *local* fleet
+> cache mirror directly — bookkeeping an operator can read back, but `gate::run_gate` and
+> `gate::run` never consult either of those, only the `AgentQuarantined` event log above.
+> Today there is no command-line entry point to the kill switch that actually stops
+> promotion; running the documented command demotes the local cache view of an agent's
+> claims without touching what the gate will do on its next run. Wiring the CLI command to
+> append the real event (or retiring the marker-file path entirely) is the natural next
+> step, and until it lands, treat the two as separate mechanisms rather than assuming the
+> command name implies the effect described above.
 
 ## Confidence is derived, not claimed
 
@@ -155,6 +177,47 @@ from track record instead:
 
 This only works because provenance and independence were kept from the start. It is the
 payoff that justifies the discipline on the rest of this page.
+
+`crate::calibrate::resolve` is that join: among the `outcome` claims on a hypothesis's own
+`subject`, observed no earlier than the hypothesis itself, **already `Promoted` by the
+gate**, and **observed by a different agent than the hypothesis**, the earliest is the
+answer. The last two of those are enforced by `resolve` itself, not left to a caller to
+remember: without them, `memory_propose("outcome", ...)` lets any agent manufacture its
+own track record — propose a hypothesis, then propose an agreeing "outcome" under its own
+identity, and score itself `Correct` with no gate ever having compared either to reality.
+Requiring a different observer closes that off, because an agent's identity is fixed by
+its adapter for the life of a session, not a field a tool call can set; requiring
+`Promoted` means the "outcome" had to survive real evidence and provenance checks first,
+not merely exist. Whether the matched outcome *agrees* with the hypothesis is its own
+proxy — see the honest-limitations section below for exactly what it does and does not
+catch, and why it is deliberately not the same check the contradiction gate uses despite
+the resemblance. A hypothesis whose resolution date has passed with no matching outcome at
+all is `Expired`,
+which is deliberately **not** the same outcome as `Incorrect`: an unanswered question must
+never lower a score the way a wrong answer does, or the calibration loop would punish an
+agent for questions nobody ever answered. `crate::calibrate::score_agent` keeps that
+distinction all the way through — `expired_count` is tracked for visibility but never
+enters the Brier-style score, which is mean squared error over `{0, 1}` (`correct` → 0,
+`incorrect` → 1) across resolved predictions only.
+
+That score is deliberately hard to over-trust on a small sample: an agent's true score is
+blended with a neutral prior weighted by a fixed pseudo-count (Bayesian shrinkage), so
+three resolved predictions — even three-for-three — cannot swing an agent's trust nearly
+as far as three hundred can. `AgentScore::low_sample` flags the raw case explicitly on top
+of that, so nothing downstream can present "1.00" from three data points as if it meant
+what "1.00" from three hundred would mean. Every score is itself an event —
+`ClaimEvent::CalibrationScored`, carrying the cumulative total as of that moment — in the
+same append-only log everything else in this page lives in, for the identical reason: an
+agent's track record must be exactly as auditable and replayable as the claims it is
+scoring.
+
+The payoff lands in `crate::gate::derive_confidence`: a newly-promoted claim's confidence
+is still a structural function of `independent_count` (unchanged), scaled by the observing
+agent's `trust_multiplier` — neutral (`1.0`) for an agent with no resolved track record
+yet, above `1.0` for a proven-reliable one, below `1.0` for a proven-unreliable one. There
+is no self-reported confidence anywhere on a proposed claim for this to silently fall back
+to — the schema simply carries no such field — so the only way an agent's assertions carry
+more or less weight is by earning it.
 
 ## Where this lives, and what's still a placeholder
 
@@ -205,8 +268,18 @@ payoff that justifies the discipline on the rest of this page.
   claim into an agent's context window must go through the two agent-facing functions,
   never `fold`/`list_events` directly; see `claims_visible_to_agents`'s doc for why
   that boundary is enforced by convention there, not by the type system.
+- **Calibration** — `crates/ctxlake-maint/src/calibrate.rs`. `resolve` joins due
+  `hypothesis` claims to the `outcome` claims that answer them; `score_agent` turns
+  resolved predictions into a shrinkage-adjusted, low-sample-flagged `AgentScore`,
+  appended to the same event log as `ClaimEvent::CalibrationScored`; `derive_confidence`
+  (in `gate.rs`) folds that score into a promoted claim's confidence. `quarantine` /
+  `unquarantine` append `AgentQuarantined` / `AgentUnquarantined` events that
+  `run_gate`/`run` consult directly — see the "Quarantine" section above for exactly
+  what each one does and does not do. `require_maintenance_lease` (factored out of
+  `gate::run`) is the one check every writer in both modules shares, so quarantine,
+  calibration, and promotion can never interleave a write to the same log.
 
-Two things this wave deliberately does not claim to have solved:
+One thing this wave deliberately does not claim to have solved:
 
 - **Contradiction detection is a proxy, not semantics.** There is no NLI model here to
   tell "confirms" from "contradicts" apart. The gate treats "same subject, high cosine
@@ -215,10 +288,41 @@ Two things this wave deliberately does not claim to have solved:
   send some genuine corroboration to `contested` for a human to wave through, and that
   false-positive rate is the intentional trade against the alternative (silently
   trusting two similar-but-different claims to agree).
-- **Confidence is a placeholder formula**, not the resolver described above. It climbs
-  with `independent_count` and is bounded, which is all today's gate logic depends on
-  it for. The hypothesis-to-outcome resolver that would make confidence mean "this
-  agent's track record" is future work.
+- **`calibrate::resolve`'s agreement check is a *different* proxy from the contradiction
+  gate's, on purpose, not the same one reused.** An earlier version of this module did
+  reuse `find_contradiction`'s exact threshold check and read a hit as *agreement*
+  instead of *conflict* — which inverted the one thing a bag-of-words overlap score
+  cannot do: tell "X" from "not X" apart. A negation shares nearly every word with what
+  it refutes, so that version scored a hypothesis flatly contradicted by its own outcome
+  (`"the flake is a colima scheduling artifact"` vs. `"the flake is **not** a colima
+  scheduling artifact"`) as `Correct`. That direction of error is the dangerous one:
+  it inflates the very `trust_multiplier` this whole module exists to keep honest, on
+  exactly the agents whose predictions are most reliably wrong, with nothing downstream
+  able to tell the difference from an earned score. `outcome_agrees` now requires
+  identical claim text, or embedding similarity with no lopsided negation between the two
+  texts, before it will call anything `Correct`; everything else — including high
+  *lexical* overlap alone — resolves `Incorrect`.
+- **The residual risk runs in both directions, and the honest one is now the milder
+  one.** An outcome phrased very differently from a hypothesis it actually confirms, with
+  no embedding on either side, still misreads as `Incorrect` — that costs an agent
+  unearned credit, which a later, better-worded outcome can still recover, and it is the
+  direction this design deliberately biases toward (see above). The negation guard is
+  itself only a word-list check, not real negation parsing: a refutation that avoids
+  every listed negation word and cue ("the scheduler theory turned out to be wrong",
+  say, with no embedding available to catch the semantic reversal) can still slip through
+  as an unwarranted `Correct` if its lexical overlap were ever read as agreement again —
+  which is exactly why this function no longer reads lexical overlap as agreement at
+  all, only as a signal it explicitly refuses to trust in that direction. Watch this in
+  shadow mode like every other proxy on this page, not as a settled classifier.
+- **Extraction does not yet ask the model for a resolution date.** `resolves_at` exists on
+  `ProposedClaim`/`ClaimState` and `calibrate::resolve` reads it, but `extract.rs`'s
+  `RawClaim` — the schema the LLM's structured output is parsed into — has no such field
+  today, so every hypothesis extraction currently produces has `resolves_at: None`. That
+  degrades gracefully rather than silently: a hypothesis with no resolution date simply
+  never `Expired`s on the calendar, it can still resolve early the moment a matching
+  `outcome` claim lands (see `calibrate::resolve`'s doc) — but the "the pool doesn't fester
+  with stale, permanently-unresolved hypotheses" property this page describes needs a real
+  date, and wiring the extraction prompt/schema to produce one is the natural next step.
 
 ## Anti-goals
 

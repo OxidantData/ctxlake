@@ -701,6 +701,7 @@ pub fn claim_from_raw(
         observed_at: observed_at.to_string(),
         evidence,
         embedding: None,
+        resolves_at: None,
     })
 }
 
@@ -1320,6 +1321,7 @@ mod tests {
                 independent_count: 1,
                 confidence: 0.65,
                 embedding: None,
+                resolves_at: None,
             },
         );
 
@@ -1366,6 +1368,7 @@ mod tests {
                 independent_count: 1,
                 confidence: 0.65,
                 embedding: None,
+                resolves_at: None,
             },
         );
 

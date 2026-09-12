@@ -32,9 +32,16 @@
 //! - [`claims`] — the append-only claim event log and its fold into current state.
 //! - [`extract`] — Tier 2 batch extraction over sealed sessions.
 //! - [`gate`] — the four promotion gates, including shadow mode's agent-read cutoff.
+//! - [`calibrate`] — the calibration loop: joins `hypothesis` claims to the
+//!   `outcome` claims that resolve them, scores each agent's track record, and
+//!   feeds that score back into [`gate`]'s confidence — plus the quarantine
+//!   kill switch, which is the same "an agent's track record has real
+//!   consequences" idea taken to its limit. See `docs/memory.md`'s
+//!   "Confidence is derived, not claimed."
 
 mod error;
 
+pub mod calibrate;
 pub mod claims;
 pub mod compact;
 pub mod digest;

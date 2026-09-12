@@ -1,12 +1,11 @@
-//! Where write-shaped tool calls land: `fleet_claim`, `fleet_release`,
-//! `fleet_handoff`, and `memory_propose` all append one JSON line here rather than
-//! touching the object store — see `paths.rs` and AGENTS.md invariant 1.
+//! Where write-shaped tool calls land: `fleet_handoff` and `memory_propose` both
+//! append one JSON line here rather than touching the object store — see
+//! `paths.rs` and AGENTS.md invariant 1.
 //!
 //! Layout: `<spool_root>/mcp/<fleet_id>.ndjson`, one record per line, each tagged
-//! with `kind` so a future `ctxlake sync` can dispatch on it (a lease acquire
-//! attempt for `claim_request`, a CAS release for `release_request`, an append to
-//! `claims/events/` for `claim_propose`, a handoff note for whoever picks up this
-//! repo next). Nothing in this codebase drains this file yet — that daemon-side
+//! with `kind` so a future `ctxlake sync` can dispatch on it (an append to
+//! `claims/events/` for `proposed`, a handoff note for whoever picks up this repo
+//! next). Nothing in this codebase drains this file yet — that daemon-side
 //! consumer is later work — so every tool that appends here must say so honestly in
 //! its own result rather than implying the write already reached the fleet.
 //!
@@ -22,8 +21,8 @@
 //! the spool yet, so an idle laptop must not fill its disk silently" — see that
 //! module's docs. The identical gap exists here: nothing drains `mcp/*.ndjson`
 //! either, every agent in a fleet shares one file per fleet, and every write-shaped
-//! tool call (`fleet_claim`, `fleet_release`, `fleet_handoff`, `memory_propose`)
-//! appends to it. An agent looping on any of those grows that one file without
+//! tool call (`fleet_handoff`, `memory_propose`) appends to it. An agent looping
+//! on either grows that one file without
 //! bound unless something here refuses to keep growing it. Unlike the hook, this
 //! crate has a real return channel to the caller — a JSON-RPC tool result — so
 //! hitting the cap comes back as an honest error the calling agent can see and act

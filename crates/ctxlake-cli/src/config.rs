@@ -11,40 +11,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// What happens when two agents' declared work overlaps. Advisory either way — see
-/// AGENTS.md invariant 5 — this only controls how loudly ctxlake says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CollisionPolicy {
-    /// Note the overlap in the briefing and in `ctxlake status`; never stop anyone.
-    #[default]
-    Warn,
-    /// Additionally have the hook's pre-tool-use check refuse the call outright.
-    /// Still advisory in the sense AGENTS.md means it (a lease can't be enforced by
-    /// the store), but the *hook* can decline to let its own agent proceed.
-    Block,
-}
-
-impl std::fmt::Display for CollisionPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            CollisionPolicy::Warn => "warn",
-            CollisionPolicy::Block => "block",
-        })
-    }
-}
-
-impl std::str::FromStr for CollisionPolicy {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "warn" => Ok(CollisionPolicy::Warn),
-            "block" => Ok(CollisionPolicy::Block),
-            other => Err(format!("expected \"warn\" or \"block\", got {other:?}")),
-        }
-    }
-}
-
 /// docs/summarization.md's three tiers, selected by name. `None` still runs Tier 0
 /// (structural digests) — there is no way to turn *that* off, since it costs no LLM
 /// call and derives entirely from captured events.
@@ -137,10 +103,6 @@ fn summarize_is_default(s: &SummarizeConfig) -> bool {
     s.mode == SummarizeMode::Agent && s.batch.is_none()
 }
 
-fn default_collision_policy() -> CollisionPolicy {
-    CollisionPolicy::Warn
-}
-
 /// The full contents of `ctxlake.toml`. See `docs/config.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -148,13 +110,11 @@ pub struct Config {
     /// `ctxlake_store::backend::build`.
     pub store: String,
     /// The boundary of who sees whom (docs/getting-started.md). Everyone sharing a
-    /// fleet id sees each other's roster entries, leases, and briefings.
+    /// fleet id sees each other's roster entries and briefings.
     pub fleet_id: String,
     /// Stable across restarts by convention (AGENTS.md's knob table) — nothing here
     /// enforces that, but reusing an id from two hosts merges their roster identity.
     pub agent_id: String,
-    #[serde(default = "default_collision_policy")]
-    pub collision_policy: CollisionPolicy,
     #[serde(default, skip_serializing_if = "summarize_is_default")]
     pub summarize: SummarizeConfig,
 }
@@ -169,7 +129,6 @@ impl Config {
             store: store.into(),
             fleet_id: fleet_id.into(),
             agent_id: agent_id.into(),
-            collision_policy: CollisionPolicy::default(),
             summarize: SummarizeConfig::default(),
         }
     }
@@ -237,8 +196,8 @@ mod tests {
 
     #[test]
     fn defaults_apply_to_a_minimal_file() {
-        // A hand-written minimal file (no collision_policy, no [summarize]) must
-        // still parse — these are genuinely optional, not just "usually present."
+        // A hand-written minimal file (no [summarize] at all) must still parse —
+        // it is genuinely optional, not just "usually present."
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ctxlake.toml");
         std::fs::write(
@@ -247,7 +206,6 @@ mod tests {
         )
         .unwrap();
         let cfg = load(&path).unwrap();
-        assert_eq!(cfg.collision_policy, CollisionPolicy::Warn);
         assert_eq!(cfg.summarize.mode, SummarizeMode::Agent);
         assert!(cfg.summarize.batch.is_none());
     }
@@ -289,18 +247,5 @@ mod tests {
         std::fs::write(&path, "this is not [ toml").unwrap();
         let err = load(&path).unwrap_err();
         assert!(err.to_string().contains("parsing config"));
-    }
-
-    #[test]
-    fn collision_policy_parses_from_str() {
-        assert_eq!(
-            "warn".parse::<CollisionPolicy>().unwrap(),
-            CollisionPolicy::Warn
-        );
-        assert_eq!(
-            "block".parse::<CollisionPolicy>().unwrap(),
-            CollisionPolicy::Block
-        );
-        assert!("loud".parse::<CollisionPolicy>().is_err());
     }
 }

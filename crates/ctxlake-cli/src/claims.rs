@@ -32,7 +32,7 @@
 //! (`ctxlake_store::layout::claim_event`). [`load_candidates`] lists and reads
 //! that same prefix directly from the store — an operator-triggered, occasional
 //! read, not a hook-path one, so AGENTS.md invariant 1 does not apply here any
-//! more than it does to `ctxlake status`'s live lease listing.
+//! more than it does to `ctxlake doctor`'s own store round trip.
 //!
 //! **Where promoted/contested claims live.** Nothing writes those to the object
 //! store yet (no gate exists). The only place they can be read from today is the
@@ -448,7 +448,7 @@ async fn print_candidates(cfg: &Config, explain_flag: bool) -> Result<()> {
         // `claim`/`observed_by` are free text another agent wrote — untrusted per
         // AGENTS.md's house rule, sanitized here at render time like every other
         // peer-authored field this crate prints (see `status.rs`'s identical
-        // choice for lease holders/reasons).
+        // choice for roster tasks/paths).
         println!(
             "[{}] {}",
             sanitize(&group.claim_type),

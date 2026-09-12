@@ -1,6 +1,6 @@
 [package]
 name = "ctxlake-cli"
-description = "The ctxlake binary: init, doctor, install, import, status, claim, sync, mcp, maint."
+description = "The ctxlake binary: init, doctor, install, import, status, sync, mcp, maint."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -83,12 +83,10 @@ tempfile.workspace = true
 # ctxlake-hook is a normal dependency now (see above); the briefing round-trip test
 # that first pulled it in as a dev-dependency still needs both halves in one binary,
 # or neither notices the other changing shape.
-# Test-only: the concurrent-first-claim regression test wraps a real `ObjectStore`
-# to force the exact interleaving `ensure_provisioned` (claim.rs) must survive.
-# `object_store::ObjectStore` is itself defined with `#[async_trait]`
-# (ctxlake-store/Cargo.toml carries the identical dependency for the same reason —
-# its own `PutModeSpy` test double), so implementing it requires the same macro.
-async-trait = "0.1"
+#
+# `async-trait` was here for the concurrent-first-claim regression test's ObjectStore
+# double. That test went with `ctxlake claim`; nothing in this crate implements an
+# async trait any more, so the dependency goes too.
 # `briefing.rs`'s tests build fixture `snapshot.bin` files through
 # `ctxlake_mcp::snapshot::test_support` rather than hand-rolling a second copy of
 # its schema — see that module's doc. Cargo only applies this feature to test

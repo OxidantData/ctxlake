@@ -30,9 +30,9 @@
 
 use std::path::PathBuf;
 
-/// Where write-shaped tool calls (`fleet_claim`, `fleet_release`, `fleet_handoff`,
-/// `memory_propose`) queue their output for `ctxlake sync` to apply. Same root and
-/// same env var `ctxlake-hook` uses, so one daemon drains one tree.
+/// Where write-shaped tool calls (`fleet_handoff`, `memory_propose`) queue their
+/// output for `ctxlake sync` to apply. Same root and same env var `ctxlake-hook`
+/// uses, so one daemon drains one tree.
 pub fn spool_root() -> PathBuf {
     ctxlake_core::paths::spool_root()
 }

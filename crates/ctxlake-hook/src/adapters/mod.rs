@@ -28,11 +28,12 @@ pub fn parse_runtime(s: &str) -> Runtime {
 
 /// The instant, payload-independent response written before stdin is touched (see
 /// `main.rs`'s latency trick). Wave 1 captures only: it never blocks a tool call or
-/// injects a briefing, because both need data — a lease read, a synthesized digest —
-/// that only the daemon (a later wave) can supply without putting the store on the
-/// hook path (AGENTS.md invariant 1). `runtime` is read directly from argv rather than
-/// parsed through [`parse_runtime`], because an unrecognized runtime should still get
-/// *some* runtime's safe default rather than a made-up third shape.
+/// injects a briefing, because both need data — a synthesized digest, a rendered
+/// briefing — that only the daemon (a later wave) can supply without putting the
+/// store on the hook path (AGENTS.md invariant 1). `runtime` is read directly from
+/// argv rather than parsed through [`parse_runtime`], because an unrecognized
+/// runtime should still get *some* runtime's safe default rather than a made-up
+/// third shape.
 pub fn response_for(runtime: &str, event: &str) -> String {
     match runtime {
         "cursor" => cursor::response_for(event),

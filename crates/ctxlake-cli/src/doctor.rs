@@ -9,9 +9,10 @@
 //! Exit code policy: **only a backend that cannot be written to and read from at
 //! all breaks capture** — the write path (`hook -> spool -> daemon -> sessions/`)
 //! needs nothing but a plain `put`/`get`. Every other backend gap (no
-//! put-if-absent, no conditional-GET 304) degrades *coordination* — leases,
-//! roster fan-in cost — without stopping a single event from reaching the lake, so
-//! those are loud in the printed report and do not flip the exit code.
+//! put-if-absent, no conditional-GET 304) degrades *coordination* — the roster
+//! fan-in's cost, the snapshot pointer's safety — without stopping a single event
+//! from reaching the lake, so those are loud in the printed report and do not flip
+//! the exit code.
 
 use std::time::{Duration, SystemTime};
 
@@ -60,7 +61,7 @@ pub struct MaintReport {
     /// Age since `snapshot/latest.json` was last published, read straight from
     /// the store's own `last_modified` for that object (never this host's clock
     /// for anything CAS-related — AGENTS.md invariant 6 — though this is a plain
-    /// read for display, not a lease decision). `None` when the store is
+    /// read for display, not a coordination decision). `None` when the store is
     /// unreachable or nothing has ever published a snapshot.
     ///
     /// This is a **proxy**, not a real completion marker: `ctxlake-maint` (the
@@ -265,12 +266,14 @@ fn meaning(probe: &str) -> &'static str {
     match probe {
         "put-if-absent" => {
             "expected on MinIO (minio/minio#20346) — ctxlake never relies on this; \
-             leases and roster heartbeats are CAS-only by design (AGENTS.md invariant 4)"
+             roster heartbeats and the snapshot pointer are CAS-only by design \
+             (AGENTS.md invariant 4)"
         }
         "cas-update" | "cas-conflict-detection" => {
-            "leases and the roster fan-in cannot work correctly on this backend — CAS \
-             is the one primitive coordination depends on. Capture (writing sessions) \
-             is unaffected; this breaks live/, not sessions/."
+            "the roster fan-in and the snapshot publish cannot work correctly on \
+             this backend — CAS is the one primitive coordination depends on. \
+             Capture (writing sessions) is unaffected; this breaks live/, not \
+             sessions/."
         }
         "conditional-get-304" => {
             "roster polling will cost a full GET every cycle instead of a cheap 304 \

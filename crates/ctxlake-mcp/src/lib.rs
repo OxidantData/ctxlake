@@ -22,8 +22,7 @@
 //! ## Module map
 //! - [`protocol`] — JSON-RPC 2.0 framing: parsing, dispatch, error codes.
 //! - [`tools`] — the `tools/list` catalog and `tools/call` routing.
-//! - [`fleet`] — `fleet_status` / `fleet_claim` / `fleet_release` / `fleet_history`
-//!   / `fleet_handoff`.
+//! - [`fleet`] — `fleet_status` / `fleet_history` / `fleet_handoff`.
 //! - [`memory`] — `memory_search` / `memory_propose` / `memory_timeline`, wired to
 //!   the real claim store (see [`snapshot`]). `memory_propose` is a real spool
 //!   write today, as it always has been (AGENTS.md invariant 9: never a promoted

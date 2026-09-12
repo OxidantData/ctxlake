@@ -9,8 +9,8 @@
 //! `fail_closed` is meaningful on exactly one event — `pre_tool_call`, the sole
 //! blocking hook — and Hermes logs a warning if it is set anywhere else (per
 //! docs/runtimes/hermes.md), so this installer only ever writes it there, left at
-//! `false`: a collision check is advisory, and a hook crash must never wedge a
-//! session (AGENTS.md invariant 5's reasoning, applied to the hook itself).
+//! `false`: a hook crash must never wedge a session (AGENTS.md invariant 1's
+//! reasoning, applied to the hook itself — it fails open, always).
 
 use anyhow::{anyhow, Result};
 use serde_yaml::{Mapping, Value};

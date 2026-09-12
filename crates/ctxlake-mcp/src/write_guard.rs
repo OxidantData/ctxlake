@@ -2,11 +2,11 @@
 //! guards the read path.
 //!
 //! AGENTS.md invariant 7: redaction runs before the spool, on every path, no
-//! exceptions. Every write-shaped tool in this crate (`fleet_claim`,
-//! `fleet_release`, `fleet_handoff`, `memory_propose`) accepts free-text fields
-//! from whatever runtime is hosting this MCP server — a claim, a handoff note, a
-//! release reason, an evidence citation — and that text can contain whatever the
-//! calling agent decided to paste, including a real credential copied out of a
+//! exceptions. Every write-shaped tool in this crate (`fleet_handoff`,
+//! `memory_propose`) accepts free-text fields from whatever runtime is hosting
+//! this MCP server — a claim, a handoff note, an evidence citation — and that
+//! text can contain whatever the calling agent decided to paste, including a
+//! real credential copied out of a
 //! shell error into a handoff note. Once a line lands in `spool.rs`'s ndjson file,
 //! `ctxlake sync` (later work) drains it into bronze, and bronze is immutable: no
 //! pass after this one can un-leak it. So the scrub has to happen here, before

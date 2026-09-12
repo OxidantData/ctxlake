@@ -56,30 +56,6 @@ fn tool_result(text: &str, is_error: bool) -> Value {
 fn call_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<Value, ToolError> {
     match name {
         "fleet_status" => Ok(fleet::status(&ctx.cache_root, &ctx.fleet_id)),
-        "fleet_claim" => {
-            let paths = required_string_array(args, "paths")?;
-            let reason = required_str(args, "reason")?;
-            let ttl = optional_u64(args, "ttl_secs")?;
-            fleet::claim(
-                &ctx.spool_root,
-                &ctx.fleet_id,
-                &ctx.agent_id,
-                &paths,
-                reason,
-                ttl,
-            )
-            .map_err(ToolError::Execution)
-        }
-        "fleet_release" => {
-            let paths = optional_string_array(args, "paths")?;
-            fleet::release(
-                &ctx.spool_root,
-                &ctx.fleet_id,
-                &ctx.agent_id,
-                paths.as_deref(),
-            )
-            .map_err(ToolError::Execution)
-        }
         "fleet_history" => {
             let repo = optional_str(args, "repo")?;
             let since = optional_str(args, "since")?;
@@ -175,35 +151,6 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, ToolE
     }
 }
 
-fn required_string_array(args: &Value, key: &str) -> Result<Vec<String>, ToolError> {
-    let arr = args.get(key).and_then(Value::as_array).ok_or_else(|| {
-        ToolError::Params(format!(
-            "tool argument `{key}` must be a non-empty array of strings"
-        ))
-    })?;
-    string_array(arr, key)
-}
-
-fn optional_string_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, ToolError> {
-    match args.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(arr)) => Ok(Some(string_array(arr, key)?)),
-        Some(_) => Err(ToolError::Params(format!(
-            "tool argument `{key}` must be an array of strings"
-        ))),
-    }
-}
-
-fn string_array(arr: &[Value], key: &str) -> Result<Vec<String>, ToolError> {
-    arr.iter()
-        .map(|v| {
-            v.as_str().map(str::to_string).ok_or_else(|| {
-                ToolError::Params(format!("every element of `{key}` must be a string"))
-            })
-        })
-        .collect()
-}
-
 fn required_array(args: &Value, key: &str) -> Result<Vec<Value>, ToolError> {
     args.get(key)
         .and_then(Value::as_array)
@@ -227,34 +174,12 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>, ToolError> {
 pub fn tool_definitions() -> Value {
     let object_schema = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required });
     let string_prop = |desc: &str| json!({ "type": "string", "description": desc });
-    let string_array_prop =
-        |desc: &str| json!({ "type": "array", "items": { "type": "string" }, "description": desc });
 
     json!([
         {
             "name": "fleet_status",
-            "description": "Who else in this fleet is active right now, and what they currently hold, as of the last local cache refresh. Never blocks on the network; an empty roster can mean either \"nobody's active\" or \"not synced yet\" and the result says which.",
+            "description": "Who else in this fleet is active right now, and what they're doing, as of the last local cache refresh. Never blocks on the network; an empty roster can mean either \"nobody's active\" or \"not synced yet\" and the result says which.",
             "inputSchema": object_schema(json!({}), &[]),
-        },
-        {
-            "name": "fleet_claim",
-            "description": "Request an advisory lease on one or more paths. Never touches the object store directly — queues the request to the local spool for ctxlake sync to apply as a CAS-guarded acquire. Returns once the request is durably queued, not once a lease is confirmed held. Leases are advisory even when granted: this cannot stop another agent from writing anyway.",
-            "inputSchema": object_schema(
-                json!({
-                    "paths": string_array_prop("Repo-relative paths or globs to claim"),
-                    "reason": string_prop("Short human-readable reason, shown to peers"),
-                    "ttl_secs": { "type": "integer", "description": "How long the claim should live before it's considered stale (default 300s)" },
-                }),
-                &["paths", "reason"],
-            ),
-        },
-        {
-            "name": "fleet_release",
-            "description": "Release a previously claimed lease. Omit `paths` to request release of everything this agent currently holds.",
-            "inputSchema": object_schema(
-                json!({ "paths": string_array_prop("Paths to release; omit for all of this agent's claims") }),
-                &[],
-            ),
         },
         {
             "name": "fleet_history",
@@ -358,13 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn fleet_claim_with_no_paths_is_a_params_error() {
-        let (_dir, ctx) = test_ctx();
-        let err = call_tool("fleet_claim", &json!({"reason": "x"}), &ctx);
-        assert!(matches!(err, Err(ToolError::Params(_))));
-    }
-
-    #[test]
     fn memory_propose_with_empty_evidence_is_an_execution_error_not_a_params_error() {
         // Calling the tool correctly (right shape, right types) with evidence
         // that fails the no-evidence-no-claim rule is a normal outcome of using
@@ -395,14 +313,27 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_succeeds_for_a_well_formed_fleet_claim() {
+    fn tools_call_succeeds_for_a_well_formed_fleet_status() {
         let (_dir, ctx) = test_ctx();
-        let result = tools_call(
-            &json!({"name": "fleet_claim", "arguments": {"paths": ["crates/foo/**"], "reason": "refactor"}}),
-            &ctx,
-        )
-        .unwrap();
+        let result = tools_call(&json!({"name": "fleet_status", "arguments": {}}), &ctx).unwrap();
         assert_eq!(result["isError"], false);
+    }
+
+    #[test]
+    fn no_tool_definition_advertises_claiming_a_resource() {
+        // Regression for the lease removal: nothing in the tool catalog should
+        // read as an invitation to reserve a path or resource any more.
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"fleet_claim"));
+        assert!(!names.contains(&"fleet_release"));
+        let catalog = serde_json::to_string(&defs).unwrap().to_lowercase();
+        assert!(!catalog.contains("lease"), "{catalog}");
     }
 
     /// Regression: `fleet_history`'s `limit` argument must actually reach

@@ -1,0 +1,158 @@
+/*
+ * Oxidant design tokens for the ctxlake docs.
+ *
+ * Source of truth: oxidant-website/src/styles/theme.css. Copied rather than imported,
+ * per the workspace convention — the engine UI and the platform console each keep
+ * their own annotated copy for the same reason (separate repos, no shared package).
+ * If the palette changes there, change it here.
+ *
+ * One deliberate inversion: the website is dark-first on a bare :root with light
+ * opt-in via [data-theme="light"]. VitePress is the opposite — :root is light and
+ * `.dark` is the toggle. So the token values are assigned the way VitePress expects
+ * while the rendered result matches the website exactly. `appearance: 'dark'` in
+ * config.mts keeps dark as the default a first-time reader sees.
+ */
+
+:root {
+  /* --- Oxidant tokens: LIGHT --- */
+  --oxidant-bg: #ffffff;
+  --oxidant-bg-subtle: #fafafa;
+  --oxidant-surface: #ffffff;
+  --oxidant-raised: #f5f5f5;
+  --oxidant-border: #e5e5e5;
+  --oxidant-border-strong: #d4d4d4;
+  --oxidant-text: #0a0a0a;
+  --oxidant-text-secondary: #525252;
+  --oxidant-text-muted: #737373; /* AA-safe on white; #a3a3a3 is decorative-only */
+  --oxidant-solid: #0a0a0a;
+  --oxidant-solid-hover: #262626;
+  --oxidant-on-solid: #ffffff;
+
+  /* Semantic status and the code surface are identical across themes. */
+  --oxidant-success: #22c55e;
+  --oxidant-success-tint: rgba(34, 197, 94, 0.12);
+  --oxidant-warning: #eab308;
+  --oxidant-warning-tint: rgba(234, 179, 8, 0.12);
+  --oxidant-code-bg: #0a0a0b;
+  --oxidant-code-text: #e5e5e5;
+  --oxidant-code-text-dim: #737373;
+
+  --oxidant-font-ui: Geist, Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --oxidant-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --oxidant-radius: 8px;
+}
+
+.dark {
+  /* --- Oxidant tokens: DARK (the website's bare :root) --- */
+  --oxidant-bg: #111112;
+  --oxidant-bg-subtle: #171719;
+  --oxidant-surface: #171719;
+  --oxidant-raised: #242428;
+  --oxidant-border: rgba(255, 255, 255, 0.09);
+  --oxidant-border-strong: rgba(255, 255, 255, 0.16);
+  --oxidant-text: #f5f5f5;
+  --oxidant-text-secondary: #a3a3a3;
+  --oxidant-text-muted: #737373;
+  --oxidant-solid: #fafafa;
+  --oxidant-solid-hover: #e5e5e5;
+  --oxidant-on-solid: #111112;
+}
+
+/* --- Map VitePress's variables onto the tokens above --- *
+ * There is deliberately no decorative accent hue: emphasis comes from contrast and
+ * weight. So VitePress's "brand" color resolves to the monochrome solid slab rather
+ * than the default green.
+ */
+:root {
+  --vp-c-bg: var(--oxidant-bg);
+  --vp-c-bg-alt: var(--oxidant-bg-subtle);
+  --vp-c-bg-soft: var(--oxidant-surface);
+  --vp-c-bg-elv: var(--oxidant-raised);
+
+  --vp-c-divider: var(--oxidant-border);
+  --vp-c-border: var(--oxidant-border);
+  --vp-c-gutter: var(--oxidant-border);
+
+  --vp-c-text-1: var(--oxidant-text);
+  --vp-c-text-2: var(--oxidant-text-secondary);
+  --vp-c-text-3: var(--oxidant-text-muted);
+
+  --vp-c-brand-1: var(--oxidant-text);
+  --vp-c-brand-2: var(--oxidant-text-secondary);
+  --vp-c-brand-3: var(--oxidant-border-strong);
+  --vp-c-brand-soft: var(--oxidant-raised);
+
+  --vp-button-brand-bg: var(--oxidant-solid);
+  --vp-button-brand-hover-bg: var(--oxidant-solid-hover);
+  --vp-button-brand-text: var(--oxidant-on-solid);
+  --vp-button-brand-border: transparent;
+
+  --vp-c-tip-1: var(--oxidant-text);
+  --vp-c-tip-soft: var(--oxidant-raised);
+  --vp-c-warning-1: var(--oxidant-warning);
+  --vp-c-warning-soft: var(--oxidant-warning-tint);
+
+  --vp-font-family-base: var(--oxidant-font-ui);
+  --vp-font-family-mono: var(--oxidant-font-mono);
+
+  /* The code surface stays dark in both themes — one step below the page. */
+  --vp-code-block-bg: var(--oxidant-code-bg);
+  --vp-code-block-color: var(--oxidant-code-text);
+  --vp-code-line-highlight-color: rgba(255, 255, 255, 0.06);
+
+  --vp-layout-max-width: 1440px;
+  --vp-sidebar-width: 260px;
+}
+
+/* Matches the website's `h1,h2,h3 { letter-spacing: -0.02em }`. */
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3 {
+  letter-spacing: -0.02em;
+}
+
+/* Inline code reads as a quiet chip rather than a second accent color. */
+.vp-doc :not(pre) > code {
+  background-color: var(--oxidant-raised);
+  color: var(--oxidant-text);
+  border: 1px solid var(--oxidant-border);
+  border-radius: var(--oxidant-radius-sm, 6px);
+  font-size: 0.875em;
+}
+
+/* Tables carry most of the reference material in these docs, so they get real
+   attention rather than the default near-invisible treatment. */
+.vp-doc table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.vp-doc th {
+  font-weight: 600;
+  color: var(--oxidant-text);
+  background-color: var(--oxidant-bg-subtle);
+}
+.vp-doc td,
+.vp-doc th {
+  border-color: var(--oxidant-border);
+}
+
+/* `> **Bold lead:** ...` blockquotes are the house callout. Give them a hairline rule
+   instead of the default indent so they read as an admonition. */
+.vp-doc blockquote {
+  border-left: 2px solid var(--oxidant-border-strong);
+  padding-left: 1rem;
+  color: var(--oxidant-text-secondary);
+}
+.vp-doc blockquote strong {
+  color: var(--oxidant-text);
+}
+
+/* Mermaid diagrams render on a light card in both themes; the generated SVG bakes in
+   dark strokes, so a dark page background would make them unreadable. */
+.vp-doc .mermaid {
+  background: #ffffff;
+  border-radius: var(--oxidant-radius);
+  padding: 1rem;
+  overflow-x: auto;
+}

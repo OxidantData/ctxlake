@@ -1,0 +1,57 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "site/**", "package.json", ".github/workflows/docs.yml"]
+  pull_request:
+    paths: ["docs/**", "site/**", "package.json", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      # The build fails on dead links, which is the point: docs/ is read both on
+      # GitHub and on the site, and a link that works in one place and not the other
+      # is a defect we want to catch here rather than in someone's browser.
+      - run: npm run docs:build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: site/.vitepress/dist
+          retention-days: 7
+
+  deploy:
+    # Inert until an OIDC role scoped to the docs bucket exists. Set the repo
+    # variables AWS_DOCS_DEPLOY_ROLE_ARN, DOCS_S3_BUCKET and DOCS_CLOUDFRONT_ID to
+    # turn it on; until then this job is skipped rather than failing every push.
+    needs: build
+    if: github.ref == 'refs/heads/main' && vars.AWS_DOCS_DEPLOY_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docs-site
+          path: dist
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DOCS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - run: aws s3 sync dist "s3://${{ vars.DOCS_S3_BUCKET }}" --delete
+      - run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.DOCS_CLOUDFRONT_ID }}" --paths "/*"

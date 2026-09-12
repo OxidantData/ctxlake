@@ -17,6 +17,7 @@ that is the red/green this script exists to prove, since diffing markdown by
 eye is exactly how the original errors survived review once already.
 """
 
+import pathlib
 import re
 from pathlib import Path
 
@@ -459,11 +460,75 @@ def check_tier2_wiring_matches_the_docs() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# No real identities in anything published.
+#
+# This repository is public. Its docs, fixtures and tests must use placeholder
+# identities — `alice`, `cc-01`, `myteam` — never a real person's name, login,
+# hostname, home directory or account number. That rule was in force from the
+# start and was still broken: a `--agent-id <a real person's laptop>` example
+# reached docs/getting-started.md and was published.
+#
+# Relying on remembering did not work, so this checks instead. The list is
+# deliberately specific: a generic "looks like a name" heuristic would flag
+# `claude`, `anthropic` and half the prose on every page, get suppressed, and
+# protect nothing.
+# ---------------------------------------------------------------------------
+
+FORBIDDEN_IDENTITIES = [
+    # Maintainer identity, in every form it has previously leaked — including the
+    # slug encoding (`-Users-vamsi-...`) a transcript path produces, which a plain
+    # search for the home directory does not catch.
+    "vamsi",
+    "kothapalli",
+    # AWS account ids and private infrastructure.
+    "810738286322",
+    "ts.net",
+    ".tailscale",
+]
+
+SCANNED_DIRS = ["docs", "crates", "packaging", "site/.vitepress"]
+SCANNED_FILES = ["README.md", "AGENTS.md", "CHANGELOG.md"]
+SCANNED_SUFFIXES = (".md", ".rs", ".py", ".toml", ".yml", ".yaml", ".mts", ".tmpl", ".sh", ".json")
+
+
+def check_no_real_identities() -> None:
+    import os
+
+    offenders = []
+    paths = [ROOT / f for f in SCANNED_FILES]
+    for d in SCANNED_DIRS:
+        for dirpath, dirnames, filenames in os.walk(ROOT / d):
+            dirnames[:] = [x for x in dirnames if x not in {"node_modules", "target", ".git"}]
+            paths.extend(pathlib.Path(dirpath) / f for f in filenames)
+
+    for path in paths:
+        if not path.is_file() or not path.name.endswith(SCANNED_SUFFIXES):
+            continue
+        # This file necessarily names every forbidden token in order to look for it.
+        if path.name == "regression_checks.py":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        for token in FORBIDDEN_IDENTITIES:
+            if token in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {token!r}")
+
+    for o in offenders:
+        fail(
+            f"{o} — this repository is public; use a placeholder identity "
+            f"(alice, cc-01, myteam) instead"
+        )
+
+
 def main() -> int:
     check_scaling_arithmetic()
     check_runtime_verification_honesty()
     check_hermes_import_fidelity()
     check_tier2_wiring_matches_the_docs()
+    check_no_real_identities()
 
     if failures:
         print(f"FAIL — {len(failures)} regression check(s) failed:\n")

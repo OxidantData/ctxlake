@@ -33,7 +33,7 @@ Prebuilt `.tar.xz` archives for `{aarch64,x86_64}-apple-darwin` and
 ## 2. Point it at a store
 
 ```sh
-ctxlake init --store s3://my-bucket/ctxlake --fleet myteam --agent-id vamsi-mbp
+ctxlake init --store s3://my-bucket/ctxlake --fleet myteam --agent-id cc-01
 ctxlake init --store file://~/ctxlake-demo --fleet local   # no cloud account needed
 ```
 
@@ -45,9 +45,10 @@ ctxlake init --store file://~/ctxlake-demo --fleet local   # no cloud account ne
 > **Give every machine a distinct `--agent-id`.** Two hosts sharing one merge into a
 > single roster entry, and their claims are attributed to the same agent — which also
 > makes the independence gate treat two separate observations as one. The default is
-> derived from the hostname, so collisions are unlikely, but a hostname of `Mac` or
+> derived from the hostname, so collisions are unlikely — but a hostname of `Mac` or
 > `localhost` is worth replacing with something you would recognise in
-> `ctxlake status`. Change it later with `--agent-id <name> --force`.
+> `ctxlake status`, like `cc-01` or `build-runner-2`. Change it later with
+> `--agent-id <name> --force`.
 
 The `file://` form runs roster and briefings fine; what you lose is a second machine
 joining, so use it to evaluate, not to run a fleet.

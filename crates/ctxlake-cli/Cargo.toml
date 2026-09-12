@@ -27,6 +27,22 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 glob.workspace = true
 time.workspace = true
+object_store.workspace = true
+url.workspace = true
+futures.workspace = true
+# Scoped to this crate only (never linked into ctxlake-hook, AGENTS.md invariant 2
+# governs that crate's tree, not this one's): the installer must merge into a real
+# `~/.hermes/config.yaml` without clobbering key order or an operator's other entries.
+# `serde_json::Value` (a BTreeMap under the hood) would re-sort every key on write, and
+# turning on its `preserve_order` feature here would leak into the whole workspace's
+# build via Cargo's feature unification for any command that builds more than just this
+# crate — exactly the risk not worth taking for invariant 2's sake. `json` keeps object
+# insertion order by construction, with no shared feature flag to reason about.
+json = "0.12"
+# Hermes' config is YAML, and nothing in the workspace parses YAML yet. `serde_yaml`'s
+# `Mapping` preserves insertion order internally, so merging into an existing
+# `config.yaml` doesn't reshuffle keys the operator never touched.
+serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile.workspace = true

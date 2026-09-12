@@ -5,11 +5,16 @@
 # `release` job, after the four target archives and their checksums exist) and
 # the *rendered* file is attached to the GitHub Release as `ctxlake.rb`.
 #
-# Publishing that rendered file into OxidantData/homebrew-tap is a manual step,
-# deliberately: this workflow does not hold a token scoped to the tap repo, and
-# pushing a formula automatically is a bigger blast radius than the benefit of
-# saving that one `cp` + commit. See docs/getting-started.md's Homebrew section
-# and packaging/README.md for the exact command.
+# OxidantData/homebrew-tap pulls that asset itself, hourly, via its own
+# `sync-formulae` workflow — the tap writes only to itself and reads only public
+# releases, so nothing here needs a token scoped to another repo.
+#
+# This used to say the copy was a manual step, "deliberately", on the reasoning
+# that a cross-repo push token outweighed saving one `cp`. The reasoning was fine
+# and the outcome was not: the `cp` never happened for any release, so
+# `brew install oxidantdata/tap/ctxlake` failed for every user while the docs
+# advertised it. A documented step nobody runs is worse than an automated one,
+# because everyone downstream assumes it ran.
 #
 # Shape matches ../../homebrew-tap/Formula/oxidant.rb (the house style: one
 # `if OS.mac? / if Hardware::CPU.arm?` branch per platform+arch, not a loop) —

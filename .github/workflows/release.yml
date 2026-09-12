@@ -1,7 +1,7 @@
 # Builds `ctxlake` and `ctxlake-hook` for four targets, archives each as a
 # `.tar.xz`, checksums the lot, and attaches everything to a GitHub Release —
-# plus a filled-in Homebrew formula template (packaging/README.md documents
-# the manual step of publishing that into OxidantData/homebrew-tap).
+# plus a filled-in Homebrew formula template, which OxidantData/homebrew-tap
+# pulls into itself hourly (see that repo's sync-formulae workflow).
 #
 # Fired by `workflow_dispatch`, not `on: push: tags`, on purpose: the sibling
 # Oxidant repo (../Oxidant/.github/workflows/binaries.yml) learned this the

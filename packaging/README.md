@@ -20,18 +20,21 @@ fills it in and prints the rendered formula to stdout; `release.yml`'s `release`
 runs this once the four archives and checksums exist and attaches the result to the
 GitHub Release as `ctxlake.rb`.
 
-**This script does not push to `OxidantData/homebrew-tap`.** `release.yml` holds no
-token scoped to that repo, and auto-committing a formula into someone else's tap on
-every release is more blast radius than the convenience is worth. Publishing a new
-version is a manual step after each release:
+**This script does not push to `OxidantData/homebrew-tap` — the tap pulls.** Its own
+`sync-formulae` workflow runs hourly, downloads `ctxlake.rb` from this repo's latest
+release, checks it parses, and commits it. Nothing here needs a token scoped to
+another repo, which was the original objection to automating it.
+
+It can also be triggered immediately:
 
 ```sh
-# from a checkout of OxidantData/homebrew-tap
-curl -sSfL -o Formula/ctxlake.rb \
-  "https://github.com/OxidantData/ctxlake/releases/download/<tag>/ctxlake.rb"
-git commit -am "ctxlake <version>"
-git push
+gh workflow run sync-formulae.yml --repo OxidantData/homebrew-tap
 ```
+
+> This was a manual step for the project's first three releases, and it was never
+> once performed — so `brew install oxidantdata/tap/ctxlake` failed for everyone
+> while `docs/getting-started.md` advertised it. If you are tempted to document
+> another manual post-release step, that is the precedent.
 
 Sanity-check a rendered formula without a release existing yet:
 

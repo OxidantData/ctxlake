@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.1.3
+
+A redaction audit, and the Homebrew install path that never worked.
+
+### Redaction caught less than it claimed
+
+Redaction always ran in the right place — inside the hook, before the spool, on
+every path including import. Probing it with real inputs rather than reading its
+documentation found that several things went to the lake untouched:
+
+- **`.env` was not on the denylist.** Only `/.hermes/.env` was, while the docs
+  said `.env` reads were dropped entirely. Unless a `.env` happened to contain a
+  recognisable marker like `AKIA`, it was captured in full — and most hold things
+  like `DATABASE_PASSWORD=hunter2`, which no marker matches.
+- Database URLs with inline passwords (`postgres://admin:hunter2@…`), Slack and
+  Discord webhooks, Groq / HuggingFace / npm / xAI / SendGrid / DigitalOcean /
+  Shopify tokens, Google OAuth tokens, bare `Bearer` headers, `PGPASSWORD`,
+  **credit card numbers** and **US SSNs**.
+- Missing deny paths: `.git-credentials`, `*.pem` / `*.key` / `*.p12`,
+  `terraform.tfstate`, `~/.gnupg/`, gcloud ADC, `~/.azure/`.
+
+All covered now, each with a test. There are two kinds of rule: a **marker** says
+a credential is nearby but not where it ends, so it withholds the whole value; a
+**structural** match knows its extent exactly, so it replaces just that span and
+leaves the rest readable. Dropping a 5,000-line log because one line held a card
+number teaches people to switch redaction off.
+
+False positives are tested as carefully as true ones — git SHAs, order numbers,
+epoch milliseconds, phone numbers, zip+4 and database URLs with no credential all
+stay clean. Card detection is Luhn-gated; SSNs must be in dashed form.
+
+Cost: +0.10ms per scrub and +0.18ms once per process, about 5% of the hook's 5ms
+budget.
+
+### `brew install oxidantdata/tap/ctxlake` works
+
+It never had. The release workflow rendered `ctxlake.rb` and attached it, but
+copying it into the tap was documented as a manual step and was never performed
+for any release — so the command failed while the docs advertised it. The tap now
+pulls each project's formula from its latest release on a schedule, needing no
+cross-repo token, which was the original objection to automating it.
+
 ## v0.1.2
 
 Tier 2 actually works now, the daemon runs maintenance itself, and `ctxlake sync

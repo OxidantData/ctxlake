@@ -72,6 +72,17 @@ enum Command {
     /// Stop one agent's claims from promoting; its already-promoted claims move
     /// to contested. Capture continues.
     Quarantine(QuarantineCmd),
+    /// Serve the MCP tool surface over stdio.
+    ///
+    /// `install` writes this command into each runtime's MCP config, so it has to be
+    /// reachable as `ctxlake mcp` and not only as a separate binary.
+    Mcp,
+    /// Render the session briefing, or write it to the local cache for the hook to read.
+    ///
+    /// The hook cannot render this itself — rendering needs the lake, and the hook may
+    /// not touch the object store (AGENTS.md invariant 1). So the expensive half runs
+    /// here and the hook only reads the result.
+    Briefing(BriefingCmd),
 }
 
 #[derive(Args)]
@@ -181,6 +192,16 @@ struct ClaimsCmd {
 }
 
 #[derive(Args)]
+struct BriefingCmd {
+    /// Write the rendered briefing to the local cache instead of printing it.
+    ///
+    /// This is what the daemon calls. Without it, the command shows exactly what a
+    /// session would be told — the first thing to check when a briefing looks wrong.
+    #[arg(long)]
+    write: bool,
+}
+
+#[derive(Args)]
 struct QuarantineCmd {
     agent_id: String,
 }
@@ -275,6 +296,23 @@ async fn main() -> Result<()> {
         Command::Quarantine(args) => {
             let cfg = load_config(&config_path)?;
             claims::quarantine(&cfg, &args.agent_id).await
+        }
+        // Blocking, and deliberately so: the MCP server owns stdio for the life of the
+        // process and speaks a synchronous JSON-RPC loop. Nothing after it runs.
+        Command::Mcp => {
+            ctxlake_mcp::run_stdio();
+            Ok(())
+        }
+        Command::Briefing(args) => {
+            let cfg = load_config(&config_path)?;
+            let text = briefing::render_briefing_for_fleet(&cfg.fleet_id);
+            if args.write {
+                let path = briefing::write_to_cache(&cfg.fleet_id, &text)?;
+                println!("wrote {}", path.display());
+            } else {
+                print!("{text}");
+            }
+            Ok(())
         }
     }
 }

@@ -24,8 +24,19 @@
 //! the installer's hook command line (a later wave), not from stdin, which is
 //! exactly what makes the latency trick below possible.
 
-use ctxlake_hook::{adapters, spool};
+use ctxlake_hook::{adapters, briefing, hostinfo, spool};
 use std::io::{self, Read, Write};
+
+/// Which event each runtime calls "the session is starting, here is your chance to
+/// inject". Hermes's is `pre_llm_call` rather than `on_session_start`: only the former
+/// has an injection channel, so injecting on the latter would be silently dropped
+/// (docs/runtimes/hermes.md).
+fn is_session_start(runtime: &str, event: &str) -> bool {
+    matches!(
+        (runtime, event),
+        ("claude_code", "SessionStart") | ("hermes", "pre_llm_call")
+    )
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -36,7 +47,18 @@ fn main() {
     // only on (runtime, event), both already in argv, so it is written and flushed
     // before stdin is touched at all. The agent's turn is never blocked on anything
     // below this line.
-    print_response(&adapters::response_for(runtime_arg, event));
+    // SessionStart is the one event with something to say before stdin is read: the
+    // briefing is already rendered in the local cache, so emitting it costs a file read
+    // and keeps the latency trick intact. Every other event keeps the payload-
+    // independent default. A missing or unreadable cache falls back to that default —
+    // the hook fails open, always (see briefing.rs).
+    let response = if is_session_start(runtime_arg, event) {
+        briefing::session_start_response(runtime_arg, &hostinfo::fleet_id())
+            .unwrap_or_else(|| adapters::response_for(runtime_arg, event))
+    } else {
+        adapters::response_for(runtime_arg, event)
+    };
+    print_response(&response);
 
     let mut raw = String::new();
     // A truncated, empty, or non-UTF-8 pipe is not worth surfacing to the agent — the

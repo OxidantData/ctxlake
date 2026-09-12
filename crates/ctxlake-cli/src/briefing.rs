@@ -385,3 +385,67 @@ mod tests {
         assert!(out.contains("real claim"));
     }
 }
+
+/// Write a rendered briefing to `<cache_root>/<fleet_id>/briefing.json`, where
+/// `ctxlake-hook` reads it on session start.
+///
+/// This is the link that closes the read path. Everything upstream — roster, digests,
+/// promoted claims, attribution, sanitization — is finished by the time it lands here,
+/// because the hook has a 5ms budget and may not touch the object store (AGENTS.md
+/// invariants 1 and 2). What it reads must already be a string.
+///
+/// Written atomically via a temp file in the same directory plus a rename. A hook can
+/// read this file at any instant, including mid-write, and a torn briefing is worse
+/// than a stale one: stale is merely out of date, torn is malformed JSON the hook
+/// silently discards, which presents as "the briefing stopped working" with no error
+/// anywhere. Same-directory matters — a rename across filesystems is not atomic.
+pub fn write_to_cache(fleet_id: &str, text: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = ctxlake_core::paths::fleet_cache_dir(fleet_id);
+    std::fs::create_dir_all(&dir)?;
+    let final_path = dir.join("briefing.json");
+    let body = serde_json::json!({
+        "text": text,
+        "rendered_at": ctxlake_core::envelope::next_event_id(),
+    })
+    .to_string();
+    let tmp = dir.join(".briefing.json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &final_path)?;
+    Ok(final_path)
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    #[test]
+    fn a_written_briefing_is_exactly_what_the_hook_reads_back() {
+        // The two halves of this contract live in different crates, so a test that only
+        // checked the writer would not notice the reader disagreeing about the shape.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(cache.join("f1")).unwrap();
+        let body = serde_json::json!({ "text": "## Fleet\n- cc-01 active" }).to_string();
+        std::fs::write(cache.join("f1").join("briefing.json"), body).unwrap();
+
+        let got = ctxlake_hook::briefing::read_at(&cache, "f1").expect("hook must read it");
+        assert!(got.contains("cc-01 active"), "got: {got}");
+    }
+
+    #[test]
+    fn the_temp_file_is_never_left_behind() {
+        // A stray .briefing.json.tmp would be invisible to the hook but would
+        // accumulate one file per refresh, forever.
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("CTXLAKE_CACHE_DIR", dir.path()) };
+        let path = write_to_cache("f-tmp", "hello").unwrap();
+        unsafe { std::env::remove_var("CTXLAKE_CACHE_DIR") };
+        let parent = path.parent().unwrap();
+        let strays: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left behind: {strays:?}");
+    }
+}

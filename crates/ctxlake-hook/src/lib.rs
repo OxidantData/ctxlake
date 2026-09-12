@@ -7,6 +7,7 @@
 //! an HTTP stack, or an object store.
 
 pub mod adapters;
+pub mod briefing;
 pub mod clock;
 pub mod hostinfo;
 pub mod spool;

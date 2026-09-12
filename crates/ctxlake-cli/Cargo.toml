@@ -65,6 +65,10 @@ serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile.workspace = true
+# The briefing's writer lives in this crate and its reader lives in ctxlake-hook.
+# The round-trip test needs both halves, or neither notices the other changing shape —
+# which is precisely the failure this whole link was added to close.
+ctxlake-hook = { path = "../ctxlake-hook" }
 # Test-only: the concurrent-first-claim regression test wraps a real `ObjectStore`
 # to force the exact interleaving `ensure_provisioned` (claim.rs) must survive.
 # `object_store::ObjectStore` is itself defined with `#[async_trait]`

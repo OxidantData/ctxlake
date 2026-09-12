@@ -681,6 +681,7 @@ dependencies = [
  "async-trait",
  "clap",
  "ctxlake-core",
+ "ctxlake-hook",
  "ctxlake-maint",
  "ctxlake-mcp",
  "ctxlake-store",

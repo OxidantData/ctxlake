@@ -73,7 +73,7 @@ nothing to drift. See [`infra/README.md`](infra/README.md) for how it is served.
 Not for coordination. Session digests are derived mechanically from tool calls, and
 handoff notes are written by the agent that did the work, on the key it already uses.
 An API key is needed only for the optional belief layer that extracts durable claims
-across sessions — see [`docs/summarization.md`](docs/summarization.md). Local models
+across sessions — see [`docs/memory.md`](docs/memory.md). Local models
 via Ollama are a first-class option; no transcript has to leave the host.
 
 ## License

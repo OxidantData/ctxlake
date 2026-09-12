@@ -78,10 +78,26 @@ jobs:
           CTXLAKE_TEST_S3_BUCKET: ctxlake-test
         run: |
           set -o pipefail
-          cargo test -p ctxlake-store --test cas_torture -- --nocapture 2>&1 | tee /tmp/torture.log
-          if grep -q "skipping MinIO suite" /tmp/torture.log; then
+          # The target is `cas`, not `cas_torture`: the torture suite proved CAS by
+          # acquiring and releasing leases in a loop, and leases are gone. `cargo test
+          # --test <name>` errors on an unknown target rather than running nothing, which
+          # is how this rename got caught — keep it that way, never `--test '*'`.
+          cargo test -p ctxlake-store --test cas -- --nocapture 2>&1 | tee /tmp/cas.log
+          if grep -q "skipping MinIO suite" /tmp/cas.log; then
             echo "::error::The MinIO CAS suite skipped. MinIO is the backend without \
           put-if-absent, so skipping it defeats the purpose of running it."
+            exit 1
+          fi
+          # The grep above only proves the suite did not *say* it skipped. Name the
+          # test that has to have passed: renaming or deleting `cas_torture_minio`
+          # would satisfy every check above this line while testing MinIO not at all.
+          # No `$` anchor: --nocapture interleaves stderr, so another test's output can
+          # land on the tail of this line. "... ok" is still unambiguous — a failure
+          # reads "... FAILED".
+          if ! grep -qE "^test cas_torture_minio \.\.\. ok" /tmp/cas.log; then
+            echo "::error::cas_torture_minio did not run and pass. MinIO is the only \
+          backend without put-if-absent; losing it loses the coverage this job exists for."
+            cat /tmp/cas.log
             exit 1
           fi
           echo "MinIO CAS suite ran against a real endpoint."

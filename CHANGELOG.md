@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.1.5
+
+Fixes for everything the first real installs turned up. If you are on v0.1.4,
+upgrade — `ctxlake sync install` refuses to run on it whenever a keyless model
+provider is configured.
+
+### `sync install` refused a correctly configured host
+
+`claude-cli` uses the subscription its binary is signed in to, and `ollama` is a
+local endpoint, so neither has an `api_key_env`. `doctor` checked the empty
+variable anyway, concluded the key was missing, and blocked the install with
+`[summarize.batch] is configured but  is not set` — a blank where the variable
+name belongs. Keyless providers now go straight to the live probe.
+
+### `doctor` warned that shadow mode was not enforced. It is.
+
+That note was written when `ctxlake-maint` was an empty scaffold and
+`memory_search` consulted no mode, and it outlived both — so an operator reading
+their own `doctor` output would reasonably conclude a safety property they had
+been promised was not in effect.
+
+Enforcement is at the publish point, which is stronger than a read-time check:
+`snapshot::publish` builds `claims_fts` — the only index `memory_search` queries —
+from rows marked `visible_to_agents`, and shadow marks none. The claims are not
+there to serve, rather than present and skipped by a reader who has to remember.
+
+### Every macOS host defaulted to the same agent id
+
+`ctxlake init` produced `agent_id: unnamed-agent` on macOS, where `HOSTNAME` is
+not exported, `COMPUTERNAME` is a Windows convention and there is no
+`/etc/hostname`. `agent_id` is a host's identity in its fleet, so two hosts
+sharing one merge into a single roster entry, have their claims attributed to the
+same author, and let the independence gate count two separate observations as one
+agent reporting twice. It now falls back to `hostname -s`.
+
+`--agent-id` is documented in getting-started, along with what it and `--fleet`
+each decide.
+
+### Also
+
+- A real person's machine name reached the public docs as an example. Replaced,
+  and a check now fails the build on identities derived from the machine it runs
+  on, so no name has to be written down to be guarded against.
+- Published release artifacts are immutable. The workflow fires twice for one tag
+  (a tag push and an explicit dispatch), Rust builds are not byte-reproducible, and
+  the second run used to `--clobber` the first — which broke `brew install` for
+  v0.1.4 with a checksum mismatch on a release that looked complete and green.
+
 ## v0.1.4
 
 `ctxlake init` configures the model, Tier 2 can run on a Claude Code subscription

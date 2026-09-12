@@ -74,6 +74,53 @@ human — newest never wins.
 `ctxlake.toml` stores the *name* of an env var, never a value. `doctor` reports whether a
 name resolves, never what it resolves to.
 
+## Hard-won facts
+
+Each of these cost real effort to establish and several contradict what the documentation
+of the system in question implies. Do not re-derive them, and do not "correct" them back.
+
+**`object_store` 0.14's `LocalFileSystem` has no `PutMode::Update`.** It returns
+`NotImplemented` (`src/local.rs:399`). `ctxlake_store::local_cas::CasLocalFileSystem`
+wraps it to provide real CAS via `std::fs::File::lock`; `backend::build` uses it for
+`file://` automatically. Without it the CAS suite — the test that proves this design —
+would have nowhere to run by default.
+
+**MinIO is not on Docker Hub any more.** `minio/minio` returns 401 with zero listed tags
+and `bitnami/minio:latest` 404s. CI pulls from `quay.io/minio/minio`. It also cannot be a
+service container, because the image needs `server /data` as its command and GitHub service
+containers cannot set one.
+
+**Cursor double-encodes `tool_output`.** It is a JSON *string* containing
+`{"output":…, "exitCode":N}`. Its `cwd` key exists but arrives empty — the real path is
+`workspace_roots[0]`. `duration` is a float, so `as_u64()` silently yields nothing. And
+every payload carries `user_email`, which must never reach the envelope. See
+`crates/ctxlake-hook/tests/fixtures/cursor-verified/README.md`.
+
+**Hermes supports Claude Code-compatible shell hooks.** Its stdin is
+`{hook_event_name, tool_name, tool_input, session_id, cwd, extra}` and `exit 2` blocks, so
+one binary serves all three runtimes. But `result` and `duration_ms` are nested under
+`extra`, not top-level. Verified against Hermes's own source; see
+[`docs/runtimes/hermes.md`](docs/runtimes/hermes.md).
+
+**The spool is partitioned by runtime, not fleet/agent.** A hook knows its runtime for
+certain; `fleet_id`/`agent_id` come from the environment and may be unset, and a path built
+from an unset value cannot be found later.
+
+## How these were found, and the lesson
+
+Every bug in the list above **failed silently**. No panic, no error — just a field quietly
+missing from every event of one runtime. Two rules follow, and they are not optional:
+
+**A fixture written from the same source as the implementation agrees with it by
+construction.** The Cursor `duration` bug survived review because its hand-written fixture
+used the integer `42` while the real payload sends `1089.021`. The test passed and agreed
+with the bug. Where a third party's wire format is involved, capture a real payload.
+
+**Verify that a regression test bites.** Break the code, watch it go red, restore, watch it
+pass. And if your editing tool reformats the file, confirm the mutation actually applied —
+a silently-missed mutation makes a useless test look verified. That has happened here more
+than once.
+
 ## House rules
 
 - **Every change ships guarding tests.** Prefer test-first. A bug fix without a test that

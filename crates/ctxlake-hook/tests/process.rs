@@ -170,11 +170,20 @@ fn pre_tool_use_never_warns_or_blocks_on_the_touched_path() {
 }
 
 #[test]
-fn a_leaked_secret_never_reaches_the_spool_file() {
+fn a_leaked_secret_in_tool_output_never_reaches_the_spool_file() {
+    // `cat .env` is the canonical leak. This used to assert the output was scrubbed and
+    // the envelope marked `quarantined`. The guarantee is now stronger and simpler: the
+    // hook reads no tool output at all for Claude Code, so there is nothing on this path
+    // to scrub, mark, or miss.
+    //
+    // The redaction obligation did not disappear — it moved. Tool output now arrives via
+    // the session transcript, read by the daemon, and the equivalent end-to-end
+    // assertion lives with that reader. If you are here because you are moving output
+    // capture back onto the hook path, restore the `quarantined` assertion too.
     let tmp = tempfile::tempdir().unwrap();
     let mut cmd = hook_cmd(&tmp);
     cmd.arg("PostToolUse").arg("claude_code");
-    let stdin = br#"{"session_id":"s1","tool_use_id":"tu-1","tool_name":"Bash","tool_input":{"command":"cat .env"},"tool_result":"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}"#;
+    let stdin = br#"{"session_id":"s1","tool_use_id":"tu-1","tool_name":"Bash","tool_input":{"command":"cat .env"},"tool_response":"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"}"#;
     let (code, _stdout) = run(cmd, stdin);
     assert_eq!(code, 0);
 
@@ -184,7 +193,12 @@ fn a_leaked_secret_never_reaches_the_spool_file() {
         !spooled.contains("AKIAIOSFODNN7EXAMPLE"),
         "a real secret reached the spool file: {spooled}"
     );
-    assert!(spooled.contains("\"quarantined\""), "got: {spooled}");
+    assert!(
+        !spooled.contains("\"result\""),
+        "the hook must carry no tool output at all: {spooled}"
+    );
+    // The call itself is still recorded — losing the event would be its own bug.
+    assert!(spooled.contains("\"tu-1\""), "got: {spooled}");
 }
 
 /// The latency trick this crate exists to copy: the response is written and flushed

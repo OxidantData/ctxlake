@@ -7,11 +7,20 @@ use ctxlake_core::envelope::Redaction;
 use ctxlake_core::redact::{RedactionOutcome, Redactor};
 use serde_json::Value;
 
-/// Cap on any single string field before it is hashed, redacted, or stored. Two
-/// reasons, both from AGENTS.md invariant 2's 5ms budget: Aho-Corasick scanning and
-/// SHA-256 hashing are cheap per byte but not free, and `spool.rs`'s single-syscall
-/// write is safer the smaller the line — see its module docs.
-pub const MAX_FIELD_BYTES: usize = 32 * 1024;
+/// Cap on any single string field before it is hashed, redacted, or stored **on the
+/// hook path**.
+///
+/// This is a **latency guard, not a storage guard**, and the distinction decides its
+/// value. Both reasons come from AGENTS.md invariant 2's 5ms budget: Aho-Corasick
+/// scanning and SHA-256 hashing are cheap per byte but not free, and `spool.rs`'s
+/// single-syscall write is safer the smaller the line.
+///
+/// Raised from 32 KiB to 1 MiB — 32x more generous, and still around a millisecond to
+/// scan and write, so the budget CI enforces with `hyperfine` holds. Content that
+/// genuinely wants to be large (raw command output) does not travel this path at all:
+/// it is read from the session transcript by the daemon, which has no latency budget
+/// and its own, far larger cap. See `ctxlake-cli/src/import/claude_code.rs`.
+pub const MAX_FIELD_BYTES: usize = 1024 * 1024;
 
 pub fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)

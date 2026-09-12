@@ -9,7 +9,7 @@
       "file_path": "/Users/dev/projects/ctxlake/.env"
     },
     "tool_use_id": "tu-101",
-    "tool_result": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+    "tool_response": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
   },
   "expect": {
     "event_type": "tool_call",
@@ -26,5 +26,6 @@
         "denied_path"
       ]
     }
-  }
+  },
+  "_note": "Output key renamed from the invented `tool_result` to the plausible real name; either way the hook reads neither. What this fixture proves is that the denied-path quarantine still fires from the tool INPUT alone, which is the path a `.env` read leaks through."
 }

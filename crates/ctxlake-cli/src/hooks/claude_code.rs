@@ -132,6 +132,36 @@ pub fn count_entries(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// Every event the installer wires must be one the adapter accepts.
+    ///
+    /// These two lists live in different crates and drifted apart silently.
+    /// `SubagentStop` was in `EVENTS` from the start and missing from the adapter's
+    /// match, so Claude Code faithfully invoked the hook for every subagent turn and the
+    /// hook rejected each one with "unknown claude_code event" — 39 of them on a single
+    /// machine, visible only in `~/.ctxlake/hook-errors.log`, which nothing reads.
+    ///
+    /// Asserted by *calling* the adapter rather than by comparing two hand-maintained
+    /// lists, because a second list would be the same kind of thing that drifted.
+    #[test]
+    fn every_installed_event_is_one_the_adapter_accepts() {
+        for event in super::EVENTS {
+            let payload = serde_json::json!({
+                "session_id": "s1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "true"},
+                "prompt": "hi",
+            });
+            let result = ctxlake_hook::adapters::claude_code::normalize(event, &payload);
+            assert!(
+                result.is_ok(),
+                "`ctxlake install claude-code` wires {event}, but the adapter rejects \
+                 it: {:?}. Every event fired by the runtime would be dropped to the \
+                 hook error log.",
+                result.err()
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

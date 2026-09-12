@@ -60,9 +60,13 @@ pass/fail matrix rather than assuming.
 
 ## Documentation
 
-Start with [`docs/getting-started.md`](docs/getting-started.md). The full index is in
+**<https://drf9zt30vjszj.cloudfront.net/>** — or read the same files on GitHub, starting
+with [`docs/getting-started.md`](docs/getting-started.md); the full index is in
 [`docs/README.md`](docs/README.md). If you are debugging,
 [`docs/architecture.md`](docs/architecture.md) is an operator's map of every component.
+
+The site is built from `docs/` by VitePress, so there is one copy of everything and
+nothing to drift. See [`infra/README.md`](infra/README.md) for how it is served.
 
 ## Does it need an LLM?
 

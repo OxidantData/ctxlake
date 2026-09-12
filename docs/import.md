@@ -124,6 +124,12 @@ contiguous run of compacted rows, stamped at the run's last message**, because t
 instant is where the discarded region ends. One per row would report a 500-message
 compaction as 500 compactions.
 
+`compacted = 1` means *this message was compacted away*, not *this message is the
+compaction summary* — the latter is a separate `_compressed_summary` flag. Verified two
+ways: Hermes's own tests assert compaction sets `active = 0, compacted = 1` together,
+and across a real 17,329-message database every one of the 2,835 `compacted = 1` rows
+also had `active = 0`, with no exceptions.
+
 The consequence is worth stating plainly: for Hermes, an *imported* session can be
 richer than a *captured* one. Everywhere else in this document import is the lossy
 path.

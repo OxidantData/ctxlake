@@ -695,7 +695,11 @@ fn build_session(
         if run_ends {
             // Hermes has no compaction *hook* — `docs/runtimes/hermes.md`'s
             // compaction gap is real for live capture — but the database records the
-            // fact after the event. One marker per contiguous run of `compacted = 1`
+            // fact after the event. `compacted = 1` means the message was compacted
+            // AWAY (Hermes sets `active = 0, compacted = 1` together — its own tests
+            // assert this, and across a real 17,329-message database all 2,835 such
+            // rows had `active = 0`). The summary message carries a separate
+            // `_compressed_summary` flag. One marker per contiguous run of `compacted = 1`
             // rows, stamped at the run's last message: that instant is where the
             // discarded region ends, which is the thing a reader wants to know. One
             // per row would report a 500-message compaction as 500 compactions.

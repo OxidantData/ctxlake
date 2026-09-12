@@ -28,6 +28,26 @@ path = "src/bin/ctxlake-mcp.rs"
 ctxlake-core = { path = "../ctxlake-core" }
 serde.workspace = true
 serde_json.workspace = true
+# `snapshot.rs` opens `<cache_root>/<fleet_id>/snapshot.bin` — a plain local file
+# ctxlake-sync's cache leg already mirrors byte-for-byte from the object store, so
+# reading it is ordinary synchronous file I/O, not a new way to reach the network.
+# `bundled` compiles sqlite in-process (no system libsqlite version skew, no
+# dynamic-linking surprise) and pulls in neither object_store nor tokio, so
+# AGENTS.md invariant 1's boundary for this crate is unchanged.
+rusqlite = { workspace = true, features = ["bundled"] }
+# `memory_propose`'s spooled record now mirrors `ctxlake-maint::claims`'s real
+# `ClaimEvent::Proposed` wire shape (see `wire.rs`), which carries a real
+# `observed_at` timestamp — this crate has no clock of its own otherwise. Adds no
+# network or async runtime dependency; already a pinned workspace version used
+# by `ctxlake-store`/`ctxlake-cli`.
+time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# Exposes `snapshot::test_support` (a fixture-`snapshot.bin` builder matching
+# `ctxlake-maint::snapshot`'s real schema) to other crates' tests — see that
+# module's doc. Never enabled outside `[dev-dependencies]`, so it never reaches a
+# release binary.
+test-support = []

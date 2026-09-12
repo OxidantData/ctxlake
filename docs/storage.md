@@ -77,8 +77,9 @@ ownership of the bucket, only of its own root.
   fleet.json                                     # fleet_id, created_at, schema_version — written once by `ctxlake init`
 
   live/                                          # control plane — CAS only
-    agents/<agent_id>.json                       # roster heartbeat: runtime, repo, branch, current tool, expires_at
-    intents/<agent_id>.json                      # declared "about to touch" — advisory, no contention
+    fleets/<fleet_id>/
+      agents/<agent_id>.json                     # heartbeat + intent: runtime, repo, branch, task, paths, updated_at
+      roster.json                                # fan-in of this fleet's agents — one GET instead of N
 
   sessions/                                      # data plane — single-writer append, bronze, immutable
     dt=<date>/fleet=<id>/runtime=<rt>/agent=<id>/session=<id>/
@@ -154,7 +155,7 @@ excluded from both tables. Doubling the fleet roughly quadruples discovery cost.
 
 ### Roster fan-in: O(N) instead of O(N²)
 
-Once per cycle, one aggregation step `LIST`s `live/agents/`, `GET`s each of the `N`
+Once per cycle, one aggregation step `LIST`s `live/fleets/<fleet_id>/agents/`, `GET`s each of the `N`
 heartbeats, and `PUT`s one merged snapshot; every agent then does one `GET` of it instead
 of `N-1` peer fetches. That merged-snapshot `PUT` is cost the naive scheme never pays, so
 it belongs in the model:

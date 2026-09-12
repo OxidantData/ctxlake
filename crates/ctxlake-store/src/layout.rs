@@ -21,23 +21,59 @@ pub fn fleet_meta() -> Path {
     Path::from("_meta").join("fleet.json")
 }
 
-/// The `live/agents/` prefix, for listing (the roster's direct-list fallback and the
-/// probe both need to enumerate every agent's intent without going through the
-/// roster fan-in).
-pub fn agents_prefix() -> Path {
-    Path::from("live").join("agents")
+/// Everything `live/` holds for one fleet.
+///
+/// **`live/` is partitioned by fleet, and that is load-bearing rather than tidy.**
+/// These keys used to be flat — `live/agents/<agent_id>.json` and
+/// `live/roster.json` — which had two consequences on a bucket holding more than one
+/// fleet, both seen on a real lake:
+///
+/// - **The roster listed every fleet's agents.** `docs/getting-started.md` calls
+///   `--fleet` "the boundary of who sees whom", and `ctxlake status` was reporting
+///   "fleet oxidantdata-dev · 3 agent(s) active" with one of the three belonging to a
+///   different fleet entirely. It reached the briefing too, so another fleet's agents
+///   were being described into agents' context windows.
+/// - **Two fleets sharing an `agent_id` shared a key.** `cc-01` in one fleet and
+///   `cc-01` in another overwrote each other's presence — silent, and not a display
+///   bug but a data one.
+///
+/// Scoping the prefix also makes the listing cheaper: the roster build enumerates one
+/// fleet rather than the whole bucket, which is what `docs/storage.md`'s O(N) fan-in
+/// arithmetic assumed all along.
+fn fleet_live_prefix(fleet_id: &str) -> Path {
+    Path::from("live").join("fleets").join(fleet_id)
+}
+
+/// The prefix listing one fleet's agent intents (the roster's direct-list fallback
+/// and the probe both enumerate this without going through the roster fan-in).
+pub fn agents_prefix(fleet_id: &str) -> Path {
+    fleet_live_prefix(fleet_id).join("agents")
 }
 
 /// One agent's live intent. Overwritten in place by that agent alone — see the
 /// `intent` module doc for why this key needs no CAS.
-pub fn agent_intent(agent_id: &str) -> Path {
-    agents_prefix().join(format!("{agent_id}.json"))
+pub fn agent_intent(fleet_id: &str, agent_id: &str) -> Path {
+    agents_prefix(fleet_id).join(format!("{agent_id}.json"))
 }
 
-/// The fan-in of every agent's intent, published with a CAS write — see the
+/// The fan-in of one fleet's agent intents, published with a CAS write — see the
 /// `roster` module doc for why any number of daemons may build this concurrently
 /// rather than one elected builder.
-pub fn roster() -> Path {
+pub fn roster(fleet_id: &str) -> Path {
+    fleet_live_prefix(fleet_id).join("roster.json")
+}
+
+/// The pre-fleet-scoping locations, for `ctxlake maint --prune` to clean up.
+///
+/// Nothing writes these any more. They are named here rather than spelled out at the
+/// call site so the one place that still knows the old layout is the file that owns
+/// the layout.
+pub fn legacy_agents_prefix() -> Path {
+    Path::from("live").join("agents")
+}
+
+/// See [`legacy_agents_prefix`].
+pub fn legacy_roster() -> Path {
     Path::from("live").join("roster.json")
 }
 
@@ -259,8 +295,11 @@ mod tests {
     #[test]
     fn round_trips_every_documented_path() {
         assert_eq!(fleet_meta().as_ref(), "_meta/fleet.json");
-        assert_eq!(agent_intent("cc-01").as_ref(), "live/agents/cc-01.json");
-        assert_eq!(roster().as_ref(), "live/roster.json");
+        assert_eq!(
+            agent_intent("myteam", "cc-01").as_ref(),
+            "live/fleets/myteam/agents/cc-01.json"
+        );
+        assert_eq!(roster("myteam").as_ref(), "live/fleets/myteam/roster.json");
         assert_eq!(
             session_segment("2026-09-11", "oxidant", Runtime::ClaudeCode, "cc-01", "sess-1", 3)
                 .as_ref(),
@@ -337,10 +376,34 @@ mod tests {
         // would let one agent's intent write clobber fleet config instead of landing
         // harmlessly under live/agents/.
         let evil = "../../_meta/fleet";
-        let p = agent_intent(evil);
+        let p = agent_intent("myteam", evil);
         assert!(
-            p.as_ref().starts_with("live/agents/"),
+            p.as_ref().starts_with("live/fleets/myteam/agents/"),
             "escaped its directory: {p}"
+        );
+
+        // `fleet_id` became a dynamic path segment when `live/` was partitioned by
+        // fleet, so it needs the same guarantee the agent id already had — and it
+        // comes from the same place, another process's config file.
+        let pf = agent_intent(evil, "cc-01");
+        assert!(
+            pf.as_ref().starts_with("live/fleets/"),
+            "a fleet id escaped its directory: {pf}"
+        );
+        assert_eq!(
+            pf.as_ref().matches('/').count(),
+            4,
+            "an extra path separator survived encoding: {pf}"
+        );
+        let pr = roster(evil);
+        assert!(
+            pr.as_ref().starts_with("live/fleets/"),
+            "a fleet id escaped its directory: {pr}"
+        );
+        assert_eq!(
+            pr.as_ref().matches('/').count(),
+            3,
+            "an extra path separator survived encoding: {pr}"
         );
         // The literal characters ".." can still appear in the encoded segment
         // (percent-encoding a "/" doesn't touch the letters on either side of it)
@@ -350,7 +413,7 @@ mod tests {
         // was introduced.
         assert_eq!(
             p.as_ref().matches('/').count(),
-            2,
+            4,
             "an extra path separator survived encoding: {p}"
         );
 
@@ -373,7 +436,10 @@ mod tests {
         // suffix "c" collide with agent "a" + suffix "bc". join() makes each
         // dynamic value its own percent-encoded segment, so this cannot happen even
         // before the ".json" suffix is considered.
-        assert_ne!(agent_intent("ab"), agent_intent("a/b"));
+        assert_ne!(agent_intent("f", "ab"), agent_intent("f", "a/b"));
+        // And the same across the fleet segment, which is new: fleet "a" + agent
+        // "b/c" must not land where fleet "a/b" + agent "c" does.
+        assert_ne!(agent_intent("a", "b/c"), agent_intent("a/b", "c"));
     }
 
     #[test]

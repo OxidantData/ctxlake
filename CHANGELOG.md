@@ -2,6 +2,65 @@
 
 ## Unreleased
 
+### `--fleet` was not actually a boundary
+
+`docs/getting-started.md` calls `--fleet` "the boundary of who sees whom". It was a
+label. `live/agents/<agent_id>.json` and `live/roster.json` were flat, and
+`roster::build` took no fleet id at all — so on a bucket holding two fleets:
+
+- **`ctxlake status` reported another fleet's agents as its own.** Seen on a live lake:
+  "fleet oxidantdata-dev · 3 agent(s) active", one of which belonged to a fleet called
+  `demo`. It reached the briefing too, so another fleet's agents were being described
+  into agents' context windows.
+- **Two fleets using the same `agent_id` shared a key**, silently overwriting each
+  other's presence. Not a display bug but a data one.
+
+`live/` is now partitioned: `live/fleets/<fleet_id>/agents/<agent_id>.json` and
+`live/fleets/<fleet_id>/roster.json`. The build filters on the record's own `fleet_id`
+as well as the prefix, so an object mis-keyed by an older build or a restored backup
+cannot reintroduce the leak. Scoping also makes the listing cheaper — the roster
+enumerates one fleet rather than the whole bucket, which is what `docs/storage.md`'s
+O(N) fan-in arithmetic assumed all along.
+
+### Presence never expired
+
+`docs/how-it-works.md` said an agent that stops writing "simply ages out". Nothing
+implemented that: on a live lake a host that had been off for **226 minutes** was still
+listed as active. The roster now drops an intent whose `updated_at` is older than a
+5-minute TTL — five missed heartbeats. A timestamp in the *future* is kept rather than
+expired: there is no shared clock here, and making a live agent invisible to collision
+checks is the more expensive of the two mistakes.
+
+### `init --force` left the identity it replaced behind
+
+Renaming a host wrote a new `live/` record and abandoned the old one, written by nobody
+from then on. `init` now retires the previous identity when `--agent-id` or `--fleet`
+changes, and leaves it alone when they do not — `--force` is also how people change a
+model or a store URL, and deleting this host's own record on every such run would blank
+it from the fleet until the next heartbeat.
+
+### `ctxlake maint --prune`
+
+Nothing ever deleted a superseded `snapshot/<hash>.sqlite`, so a fleet republishing
+every five minutes accumulated one per change forever. `--prune` removes those (never
+the one `latest.json` points at, and never one younger than 24h — a reader that just
+resolved the pointer is about to fetch the blob it named) and the pre-fleet-scoping
+`live/` keys. Sessions, claim events, digests and compaction generations are never
+touched. `--dry-run` reports exactly what would go.
+
+Separate from the chain rather than a step in it: the chain only ever adds, which is
+what makes running it everywhere at once safe, and deleting should be something you ask
+for rather than something a five-minute timer does.
+
+### The identity guard cried wolf on its own placeholder
+
+`check_no_real_identities` derives its tokens from the machine so that it protects
+whoever runs it. The cost showed up here: on a Mac still named `MacBook-Pro` it matched
+the docs' own anonymous placeholder, `Alices-MacBook-Pro`, and failed a clean tree.
+Device-model words are now stripped from a hostname before it becomes a token, and a
+token made of nothing else is dropped. Verified still catching a planted real name.
+
+
 ### An unusable model stopped the entire maintenance chain
 
 v0.1.6 made an unreachable Tier 2 provider non-fatal at daemon *startup* and left the

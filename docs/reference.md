@@ -82,6 +82,16 @@ ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force] [--daemon]
 | `--llm-model` / `--llm-key-env` / `--llm-base-url` | Override the provider's defaults. The config stores the env var's *name*, never a key |
 | `--summarize-mode` | `none` · `agent` · `batch` · `both` · `shadow`. Defaults to `shadow` |
 
+> **`--fleet` is a real boundary in the store, not just a label.** Each fleet owns
+> `live/fleets/<fleet_id>/`, so two fleets sharing a bucket never see each other's
+> agents and two fleets using the same `agent_id` never share a key. Before v0.1.7 both
+> were flat, and both of those went wrong.
+>
+> **`--force` with a different `--agent-id` or `--fleet` retires the identity it
+> replaces**, deleting that agent's `live/` record. Without it the old name sits there
+> written by nobody, and `ctxlake status` reported it as an active agent until the
+> presence TTL expired it — which, before v0.1.7, was never.
+
 ### `ctxlake doctor`
 
 Run this before you let ctxlake touch a real config. Every row is a real request against
@@ -291,6 +301,31 @@ One chain, in order:
 is idempotent by content ([How it works](how-it-works.md)). Overlapping runs cost
 redundant work, never corrupted output. If nobody runs it, capture and coordination keep
 working; the lake just stays as fresh as the last pass.
+
+### `ctxlake maint --prune`
+
+```sh
+ctxlake maint --prune --dry-run   # report exactly what would go
+ctxlake maint --prune             # do it
+```
+
+Deliberately separate from the chain rather than a step in it. The chain only ever
+*adds*, which is what makes running it from every host at once safe; deleting is
+different in kind and should be something you ask for, not something that happens on a
+five-minute timer you forgot you installed.
+
+Two categories, and nothing else:
+
+| Removed | Why it is safe |
+|---|---|
+| Superseded `snapshot/<hash>.sqlite` older than 24h | Nothing ever removed these, so a fleet republishing every 5 minutes accumulated one per change forever. The blob `latest.json` points at is never a candidate, and neither is one younger than the grace window — a reader that just resolved the pointer is about to fetch the blob it named |
+| `live/agents/*.json`, `live/roster.json` | The pre-fleet-scoping layout. No current version writes them |
+
+**Sessions, claim events, digests and compaction generations are never touched.** They
+are either irreplaceable history or content-addressed inputs a lagging reader may still
+resolve — `--prune` is narrow so that a mistake there is impossible rather than
+unlikely. Deleting old session data is a decision about your own history; do it with
+your object store's own tooling, deliberately.
 
 ### `ctxlake claims`
 

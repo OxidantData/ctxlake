@@ -488,6 +488,33 @@ GENERIC_ACCOUNTS = {
     "ec2-user", "vagrant", "docker", "jenkins", "github", "home", "users",
 }
 
+# Device-model words that appear in a default hostname and identify nobody.
+#
+# This guard exists to stop a real person's name reaching a public repo, and it derives
+# its tokens from the machine rather than from a stored list so that it protects
+# whoever runs it. The cost of that design is this: a machine still called
+# "MacBook-Pro" makes the guard match the word "MacBook-Pro" — and the docs use
+# `Alices-MacBook-Pro` as the placeholder precisely *because* it is the canonical
+# anonymous example. The check failed on it, on a tree where nothing was wrong.
+#
+# A guard that cries wolf on its own placeholder gets switched off, so a hostname is
+# stripped of these words before it becomes a token, and a token that is nothing but
+# these words is dropped entirely.
+GENERIC_DEVICE_WORDS = {
+    "macbook", "mac", "pro", "air", "mini", "imac", "studio", "local",
+    "desktop", "laptop", "pc", "workstation", "server", "host", "localhost",
+    "ms", "lan", "home",
+}
+
+
+def _strip_generic_device_words(token: str) -> str:
+    """`Alices-MacBook-Pro` -> `alices`; `MacBook-Pro` -> `` (identifies nobody)."""
+    import re as _re
+
+    parts = [p for p in _re.split(r"[-_. ]+", token.lower()) if p]
+    kept = [p for p in parts if p not in GENERIC_DEVICE_WORDS]
+    return "-".join(kept)
+
 SCANNED_DIRS = ["docs", "crates", "packaging", "site/.vitepress"]
 SCANNED_FILES = ["README.md", "AGENTS.md", "CHANGELOG.md"]
 SCANNED_SUFFIXES = (".md", ".rs", ".py", ".toml", ".yml", ".yaml", ".mts", ".tmpl", ".sh", ".json")
@@ -508,10 +535,14 @@ def _local_identity_tokens() -> list[str]:
     if home:
         candidates.add(os.path.basename(home.rstrip("/")))
     host = socket.gethostname()
-    # A hostname's first label, plus the whole thing for tailnet-style names.
+    # A hostname's first label, plus the whole thing for tailnet-style names — each
+    # stripped of device-model words, which identify nobody and collide with the
+    # anonymous placeholders the docs are supposed to use.
     if host:
-        candidates.add(host)
-        candidates.add(host.split(".")[0])
+        for raw in (host, host.split(".")[0]):
+            stripped = _strip_generic_device_words(raw)
+            if stripped:
+                candidates.add(stripped)
 
     # An optional untracked file, for anything the environment cannot tell us
     # (a maintainer's other logins, an account id). One token per line.

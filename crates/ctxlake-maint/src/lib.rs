@@ -54,6 +54,7 @@ pub mod extract;
 pub mod gate;
 pub mod gate_inputs;
 pub mod partition;
+pub mod prune;
 pub mod run;
 pub mod snapshot;
 

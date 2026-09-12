@@ -46,7 +46,7 @@ pub struct Intent {
 
 /// Overwrite `intent.agent_id`'s live record.
 pub async fn write(store: &dyn ObjectStore, intent: &Intent) -> Result<(), StoreError> {
-    let path = layout::agent_intent(&intent.agent_id);
+    let path = layout::agent_intent(&intent.fleet_id, &intent.agent_id);
     let payload = PutPayload::from(serde_json::to_vec(intent)?);
     store.put(&path, payload).await?;
     Ok(())
@@ -54,11 +54,40 @@ pub async fn write(store: &dyn ObjectStore, intent: &Intent) -> Result<(), Store
 
 /// Read one agent's intent. `Ok(None)` means the agent has never published one (not
 /// yet started, or has been torn down) — not an error.
-pub async fn read(store: &dyn ObjectStore, agent_id: &str) -> Result<Option<Intent>, StoreError> {
-    let path = layout::agent_intent(agent_id);
+///
+/// Takes `fleet_id` because an `agent_id` is only unique within a fleet: two fleets
+/// sharing a bucket may both have a `cc-01`, and before `live/` was partitioned they
+/// shared its key and silently overwrote each other.
+pub async fn read(
+    store: &dyn ObjectStore,
+    fleet_id: &str,
+    agent_id: &str,
+) -> Result<Option<Intent>, StoreError> {
+    let path = layout::agent_intent(fleet_id, agent_id);
     match store.get(&path).await {
         Ok(res) => Ok(Some(serde_json::from_slice(&res.bytes().await?)?)),
         Err(OsError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove one agent's live record.
+///
+/// Used by `ctxlake init --force` when it changes this host's identity: the previous
+/// `agent_id`'s object is written by nobody after that, so without this it sits in
+/// `live/` forever, and — until the roster learned to expire entries — showed up in
+/// `ctxlake status` as a permanently active agent. A record that is already gone is
+/// success, not an error.
+pub async fn remove(
+    store: &dyn ObjectStore,
+    fleet_id: &str,
+    agent_id: &str,
+) -> Result<(), StoreError> {
+    match store
+        .delete(&layout::agent_intent(fleet_id, agent_id))
+        .await
+    {
+        Ok(()) | Err(OsError::NotFound { .. }) => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
@@ -89,14 +118,14 @@ mod tests {
         let store = InMemory::new();
         let intent = sample("cc-01");
         write(&store, &intent).await.unwrap();
-        let back = read(&store, "cc-01").await.unwrap().unwrap();
+        let back = read(&store, "oxidant", "cc-01").await.unwrap().unwrap();
         assert_eq!(back, intent);
     }
 
     #[tokio::test]
     async fn reading_an_agent_that_never_wrote_is_not_an_error() {
         let store = InMemory::new();
-        assert_eq!(read(&store, "nobody-home").await.unwrap(), None);
+        assert_eq!(read(&store, "oxidant", "nobody-home").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -108,7 +137,7 @@ mod tests {
         write(&store, &intent).await.unwrap();
         intent.task = Some("moved on to a different file".into());
         write(&store, &intent).await.unwrap();
-        let back = read(&store, "cc-01").await.unwrap().unwrap();
+        let back = read(&store, "oxidant", "cc-01").await.unwrap().unwrap();
         assert_eq!(back.task.as_deref(), Some("moved on to a different file"));
     }
 }

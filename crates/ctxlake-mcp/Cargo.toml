@@ -9,9 +9,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# ctxlake-core only, matching ctxlake-hook's own discipline (AGENTS.md invariant
+# 1/2, extended here on purpose): this process never touches the network, in
+# either direction (docs/architecture.md's component table), so it links neither
+# object_store nor tokio nor anything that could put the store on this path by
+# accident. Everything it does — read the local cache, append to the local spool
+# — is synchronous, ordinary filesystem I/O; an async runtime would buy nothing.
 ctxlake-core = { path = "../ctxlake-core" }
-ctxlake-store = { path = "../ctxlake-store" }
-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

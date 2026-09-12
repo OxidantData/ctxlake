@@ -740,12 +740,10 @@ dependencies = [
 name = "ctxlake-mcp"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "ctxlake-core",
- "ctxlake-store",
  "serde",
  "serde_json",
- "tokio",
+ "tempfile",
 ]
 
 [[package]]

@@ -25,14 +25,18 @@
 //!   with an FTS5 index, published via write-then-CAS-swap.
 //! - [`partition`] — parse a bronze session's identity back out of its object key;
 //!   the read-side inverse of `ctxlake_store::layout`'s write-side construction.
-//! - [`run`] — the maintenance chain (compact -> digest -> snapshot). Safe to run
-//!   concurrently from any number of hosts — nothing serializes it, because every
-//!   step is already idempotent by content; see that module's own doc.
+//! - [`run`] — the maintenance chain (compact -> digest -> extract -> gate ->
+//!   snapshot). Safe to run concurrently from any number of hosts — nothing
+//!   serializes it, because every step is already idempotent by content; see
+//!   that module's own doc.
 //!
 //! Module map — belief:
 //! - [`claims`] — the append-only claim event log and its fold into current state.
 //! - [`extract`] — Tier 2 batch extraction over sealed sessions.
 //! - [`gate`] — the four promotion gates, including shadow mode's agent-read cutoff.
+//! - [`gate_inputs`] — builds `gate::run`'s four context inputs (known agents,
+//!   session windows, injected-context lineage, excerpt resolution) from the
+//!   lake's own sealed sessions, rather than from a live roster.
 //! - [`calibrate`] — the calibration loop: joins `hypothesis` claims to the
 //!   `outcome` claims that resolve them, scores each agent's track record, and
 //!   feeds that score back into [`gate`]'s confidence — plus the quarantine
@@ -48,6 +52,7 @@ pub mod compact;
 pub mod digest;
 pub mod extract;
 pub mod gate;
+pub mod gate_inputs;
 pub mod partition;
 pub mod run;
 pub mod snapshot;

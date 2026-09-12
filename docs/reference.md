@@ -175,9 +175,16 @@ ctxlake maint             # loop forever, one cycle every 5 minutes
 ctxlake maint --once      # one cycle and exit — what cron/systemd should call
 ```
 
-Compacts small Parquet files, writes Tier 0 digests for newly sealed sessions, and
-publishes `snapshot/`. It does **not** yet run Tier 2 extraction or the promotion gate —
-see [memory.md](memory.md#turning-on-tier-2).
+One chain, in order:
+
+| Step | Runs when |
+|---|---|
+| Compact small Parquet files | always |
+| Write Tier 0 digests for newly sealed sessions | always |
+| Tier 2 batch extraction | `[summarize.batch]` is configured — see [memory.md](memory.md#turning-on-tier-2) |
+| Promotion gate | always, even with no Tier 2 config — `memory_propose` candidates still need gating |
+| Publish `snapshot/` | always, after the gate, so a claim promoted this run is in this run's snapshot |
+
 **Safe to schedule on every host, or none** — no lock, no primary host, because every step
 is idempotent by content ([how-it-works.md](how-it-works.md)). Overlapping runs cost
 redundant work, never corrupted output. If nobody runs it, capture and coordination keep

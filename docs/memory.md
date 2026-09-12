@@ -7,7 +7,7 @@ needs no LLM API key.** Only the third tier does, and it is optional.
 |---|---|---|---|
 | **0 — structural digest** | files touched, commands and exit codes, tests, commits, duration, cost, friction signals | No | Yes |
 | **1 — agent self-handoff** | a note attached to its own session. **Not a belief.** | No — the agent that did the work writes it, cache-warm, on a key you already pay for | Yes |
-| **2 — batch extraction** | candidate claims → four gates → promoted → snapshot → briefing | Yes | No — *and not yet wired into `ctxlake maint`; see below* |
+| **2 — batch extraction** | candidate claims → four gates → promoted → snapshot → briefing | Yes | No — needs `[summarize.batch]` configured |
 
 Tier 0 is pure arithmetic over captured events, so it cannot hallucinate. A line like
 *"abandoned after 4 failed `cargo test -p oxidant-connect` runs"* is often the most useful
@@ -27,17 +27,10 @@ per sealed session, reading `tool.exit_code` regardless of which runtime produce
 
 ## Turning on Tier 2
 
-> **Not wired end-to-end yet.** `ctxlake maint` today runs compaction, Tier 0 digests
-> and the snapshot publish. Extraction and the four gates are implemented and tested as
-> libraries (`ctxlake-maint`'s `extract` and `gate` modules) but nothing calls them from
-> the chain, so configuring a model below currently changes nothing: no candidate claims
-> are produced and none are promoted. Tiers 0 and 1 — everything the briefing's history
-> and handoff blocks are built from — work fully. The rest of this page describes the
-> design the modules implement and the shape the configuration will take; it is here so
-> the gap is visible rather than discovered.
-
-`ctxlake maint --once` compacts, digests and snapshots for free. For Tier 2, point it at
-a model in `ctxlake.toml` ([full reference](reference.md#summarize)):
+`ctxlake maint --once` compacts, digests, and publishes the snapshot for free, with the
+promotion gate always running over it — a fleet with no LLM configured still gates
+whatever `memory_propose` wrote directly. Point it at a model to also run batch
+extraction, in `ctxlake.toml` ([full reference](reference.md#summarize)):
 
 ```toml
 [summarize]
@@ -52,7 +45,7 @@ api_key_env = "ANTHROPIC_API_KEY"   # the NAME of an env var, never the key
 ```sh
 export ANTHROPIC_API_KEY=...
 ctxlake doctor                                # reports whether the name resolves. Never its value.
-ctxlake maint --once                          # will extract and gate, once wired
+ctxlake maint --once                          # extracts, gates, and publishes in one pass
 ctxlake claims --status candidate --explain   # what was extracted, which gate rejected what
 ctxlake claims --status contested             # where claims disagree with each other
 ```

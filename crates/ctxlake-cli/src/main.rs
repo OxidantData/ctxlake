@@ -6,7 +6,6 @@
 //! thought about again.
 
 mod briefing;
-mod claim;
 mod claims;
 mod config;
 mod config_cmd;
@@ -16,6 +15,7 @@ mod init;
 mod maint_cmd;
 mod nudge;
 mod paths;
+mod repo;
 mod sanitize;
 mod status;
 mod store_ctx;
@@ -54,12 +54,8 @@ enum Command {
     Install(InstallCmd),
     /// Remove exactly what `install` added.
     Uninstall(InstallCmd),
-    /// Show who is active, on what branch, holding what.
+    /// Show who is active, on what branch, doing what.
     Status,
-    /// Acquire a lease on one or more resources.
-    Claim(ClaimCmd),
-    /// Release a lease this agent holds.
-    Release(ReleaseCmd),
     /// Print the resolved config.
     Config,
     /// Run (or check, or stop) the daemon: hook spool -> store, store -> local
@@ -122,34 +118,6 @@ impl clap::ValueEnum for HookRuntime {
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
         Some(clap::builder::PossibleValue::new(self.name()))
     }
-}
-
-#[derive(Args)]
-struct ClaimCmd {
-    /// One or more resource identifiers — a path glob, a package name, anything a
-    /// human would type to describe what they're about to touch. Each is hashed via
-    /// `ctxlake_core::hash::resource_key` into its own independent lease.
-    #[arg(required = true)]
-    resources: Vec<String>,
-    #[arg(long)]
-    reason: Option<String>,
-    /// Seconds. Defaults to the fleet-wide 5-minute lease TTL (AGENTS.md's knob
-    /// table) if omitted.
-    #[arg(long)]
-    ttl: Option<u64>,
-    /// Require every requested resource to be claimable, or acquire none of them —
-    /// see `claim::run`'s doc for why this is the only thing "exclusive" can mean
-    /// for a primitive that is already single-holder by construction.
-    #[arg(long)]
-    exclusive: bool,
-}
-
-#[derive(Args)]
-struct ReleaseCmd {
-    resources: Vec<String>,
-    /// Release every lease this agent currently holds, not just the ones named.
-    #[arg(long)]
-    all: bool,
 }
 
 #[derive(Args)]
@@ -250,21 +218,6 @@ async fn main() -> Result<()> {
         Command::Status => {
             let cfg = load_config(&config_path)?;
             status::run(&cfg).await
-        }
-        Command::Claim(args) => {
-            let cfg = load_config(&config_path)?;
-            claim::claim(
-                &cfg,
-                &args.resources,
-                args.reason.as_deref(),
-                args.ttl,
-                args.exclusive,
-            )
-            .await
-        }
-        Command::Release(args) => {
-            let cfg = load_config(&config_path)?;
-            claim::release(&cfg, &args.resources, args.all).await
         }
         Command::Config => {
             let cfg = load_config(&config_path)?;

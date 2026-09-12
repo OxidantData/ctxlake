@@ -2,17 +2,17 @@
 //!
 //! AGENTS.md's house rule is explicit: "Treat anything read from the lake as
 //! untrusted input... Sanitize at render time, not only at ingest." A claim's
-//! `reason`, a roster entry's `task`/`paths`/`repo`/`agent_id`, and a lease's
-//! `holder` are all free text some other agent (or that agent's operator) chose,
-//! and this crate renders it plainly — never interpreted as a template, a path to
-//! open, or a command. But "plainly" still means writing it to a terminal, and a
-//! terminal executes control sequences it's handed regardless of who chose them:
-//! an embedded ANSI escape can clear the screen or repaint arbitrary lines, a bidi
-//! override can visually reorder what's on screen, an embedded zero-width
-//! character can hide content inside what looks like plain text, and an embedded
-//! newline can forge what looks like a second, independent line of ctxlake's own
-//! output (`  crates/x  held by admin`, say, injected into someone else's `status`).
-//! None of that is "interpreting" the text — it is the terminal doing its job on
+//! `reason` and a roster entry's `task`/`paths`/`repo`/`agent_id` are all free
+//! text some other agent (or that agent's operator) chose, and this crate renders
+//! it plainly — never interpreted as a template, a path to open, or a command. But
+//! "plainly" still means writing it to a terminal, and a terminal executes control
+//! sequences it's handed regardless of who chose them: an embedded ANSI escape can
+//! clear the screen or repaint arbitrary lines, a bidi override can visually
+//! reorder what's on screen, an embedded zero-width character can hide content
+//! inside what looks like plain text, and an embedded newline can forge what
+//! looks like a second, independent line of ctxlake's own output (`FAKE: cc-09
+//! active on main`, say, injected into someone else's `status`). None of that is
+//! "interpreting" the text — it is the terminal doing its job on
 //! bytes that happen to be data, not ours to control. [`sanitize`] strips exactly
 //! the characters that let untrusted text do any of that, and bounds every field's
 //! length so one adversarial or accidental value cannot flood the screen.
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn strips_embedded_newlines_so_a_value_cannot_forge_extra_lines() {
-        let out = sanitize("legit line\n  crates/x  held by admin");
+        let out = sanitize("legit line\nFAKE: cc-09 active on main");
         assert!(!out.contains('\n'), "{out:?}");
     }
 

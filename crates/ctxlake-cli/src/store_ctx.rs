@@ -1,8 +1,8 @@
 //! Wires a [`Config`] to a live [`ctxlake_store`] backend and clock.
 //!
-//! Every subcommand that talks to the object store (`init`, `doctor`, `status`,
-//! `claim`, `release`) goes through here so "how do I turn `ctxlake.toml`'s `store`
-//! line into a connection" has exactly one answer.
+//! Every subcommand that talks to the object store (`init`, `doctor`, `maint`,
+//! `sync`) goes through here so "how do I turn `ctxlake.toml`'s `store` line into
+//! a connection" has exactly one answer.
 
 use std::sync::Arc;
 

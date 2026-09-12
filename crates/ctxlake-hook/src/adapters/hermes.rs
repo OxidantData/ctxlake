@@ -42,9 +42,9 @@
 //! `pre_tool_call` is Hermes's one blocking event (`docs/runtimes/hermes.md`'s
 //! capabilities table: `{"action":"block", ...}` or `exit 2`). Like every other
 //! adapter in this crate, [`response_for`] never blocks yet — a real block decision
-//! needs the daemon's view of the lake (a lease, a collision), which does not reach
-//! the hook in this wave (see `claude_code::response_for`'s doc for the same
-//! reasoning applied to Claude Code and Cursor).
+//! needs the daemon's view of the lake (a briefing), which does not reach the hook
+//! in this wave (see `claude_code::response_for`'s doc for the same reasoning
+//! applied to Claude Code and Cursor).
 //!
 //! Content for `pre_llm_call`/`post_llm_call` (the prompt/assistant text) has no
 //! field name given in the shell-hook contract this wave verified — unlike

@@ -139,6 +139,36 @@ fn cursor_gate_events_get_a_permission_response_claude_code_gets_an_empty_object
     );
 }
 
+/// Regression for the removed lease/collision feature: there is no pre-edit
+/// check anywhere in this binary that inspects `tool_input` to warn or block a
+/// call because another agent "holds" the path it touches. `response_for` is
+/// computed from `(runtime, event)` alone, before stdin is even read (see
+/// `main.rs`'s latency trick), so every runtime's PreToolUse-equivalent must
+/// come back exactly the same unconditional non-blocking answer regardless of
+/// what path the tool call names — capture still happens (see the other tests
+/// in this file), only the warning is gone.
+#[test]
+fn pre_tool_use_never_warns_or_blocks_on_the_touched_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let touching_a_path =
+        br#"{"session_id":"s1","tool_name":"Edit","tool_input":{"file_path":"crates/foo/bar.rs"}}"#;
+
+    let mut cmd = hook_cmd(&tmp);
+    cmd.arg("PreToolUse").arg("claude_code");
+    let (_, stdout) = run(cmd, touching_a_path);
+    assert_eq!(stdout, "{}\n");
+
+    let mut cmd = hook_cmd(&tmp);
+    cmd.arg("preToolUse").arg("cursor");
+    let (_, stdout) = run(cmd, touching_a_path);
+    assert_eq!(stdout, "{\"permission\":\"allow\"}\n");
+
+    let mut cmd = hook_cmd(&tmp);
+    cmd.arg("pre_tool_call").arg("hermes");
+    let (_, stdout) = run(cmd, touching_a_path);
+    assert_eq!(stdout, "{}\n");
+}
+
 #[test]
 fn a_leaked_secret_never_reaches_the_spool_file() {
     let tmp = tempfile::tempdir().unwrap();

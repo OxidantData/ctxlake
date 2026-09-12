@@ -36,10 +36,10 @@ use anyhow::{Context, Result};
 use ctxlake_core::Runtime as CoreRuntime;
 use ctxlake_sync::{Daemon, DaemonConfig};
 
-use crate::claim::detect_repo;
 use crate::config::Config;
 use crate::hooks::Runtime as HookRuntime;
 use crate::paths;
+use crate::repo::detect_repo;
 use crate::store_ctx;
 
 fn map_runtime(runtime: Option<HookRuntime>) -> CoreRuntime {
@@ -169,7 +169,7 @@ pub async fn run_foreground(cfg: &Config, runtime: Option<HookRuntime>) -> Resul
 
 fn process_alive(pid: u32) -> bool {
     // `kill -0` sends no signal, just checks existence/permission — the same
-    // shell-out-to-a-real-tool convention `claim.rs::detect_repo` already uses
+    // shell-out-to-a-real-tool convention `repo::detect_repo` already uses
     // for `git`, rather than adding a `libc` dependency for one syscall.
     std::process::Command::new("kill")
         .arg("-0")

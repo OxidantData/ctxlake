@@ -161,8 +161,6 @@ mod tests {
             names,
             [
                 "fleet_status",
-                "fleet_claim",
-                "fleet_release",
                 "fleet_history",
                 "fleet_handoff",
                 "memory_search",
@@ -173,6 +171,10 @@ mod tests {
         assert!(
             !names.contains(&"memory_write"),
             "AGENTS.md invariant 9: there must be no memory_write tool"
+        );
+        assert!(
+            !names.contains(&"fleet_claim") && !names.contains(&"fleet_release"),
+            "the lease/claim tools were removed entirely, not renamed"
         );
         for tool in tools {
             assert_eq!(tool["inputSchema"]["type"], "object");
@@ -260,7 +262,7 @@ mod tests {
     fn missing_required_tool_argument_is_invalid_params() {
         let (_dir, ctx) = test_ctx();
         let resp = handle_line(
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"fleet_claim","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"fleet_handoff","arguments":{}}}"#,
             &ctx,
         )
         .unwrap();
@@ -269,11 +271,11 @@ mod tests {
 
     #[test]
     fn wrong_type_tool_argument_is_invalid_params_not_a_panic() {
-        // `paths` must be an array of strings; feeding a number must not panic,
-        // it must come back as a protocol error.
+        // `limit` must be a non-negative integer; feeding a string must not
+        // panic, it must come back as a protocol error.
         let (_dir, ctx) = test_ctx();
         let resp = handle_line(
-            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"fleet_claim","arguments":{"paths":123,"reason":"x"}}}"#,
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"fleet_history","arguments":{"limit":"not-a-number"}}}"#,
             &ctx,
         )
         .unwrap();

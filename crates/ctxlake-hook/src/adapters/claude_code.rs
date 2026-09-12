@@ -16,9 +16,9 @@ use super::common::{
 };
 
 /// Wave 1 never blocks (`PreToolUse`) or injects (`SessionStart`) — both need the
-/// daemon's view of the lake (a lease, a briefing), which does not exist yet. `{}`
-/// means "no opinion" in every one of Claude Code's hook response shapes, so it is a
-/// safe default across all of them rather than one hand-picked shape per event.
+/// daemon's view of the lake (a briefing), which does not exist yet. `{}` means "no
+/// opinion" in every one of Claude Code's hook response shapes, so it is a safe
+/// default across all of them rather than one hand-picked shape per event.
 ///
 /// `SessionEnd` gets the same `{}`: its budget is shared across *every* hook Claude
 /// Code runs for that event (1.5s total, not per-hook), so nothing beyond the normal

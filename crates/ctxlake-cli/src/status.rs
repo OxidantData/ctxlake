@@ -1,32 +1,28 @@
 //! `ctxlake status` — render the roster.
 //!
-//! Two sections with two different freshness stories, and the output says so
-//! explicitly rather than letting one section's staleness be mistaken for the
-//! other's: the roster comes from the **local cache** (`ctxlake sync`'s
-//! store-to-cache leg, refreshed on a poll interval — docs/architecture.md), so
-//! this prints its age. Leases have no cache format yet (nothing publishes a
-//! merged `leases.json` the way `roster::build` does for the roster), so that
-//! section is fetched **live**, right now, and is labeled as such rather than
-//! silently mixing a live read into what looks like a cache-only view.
+//! Roster only: who is active, on what branch, doing what. This used to have a
+//! second, "leases (live, fetched just now)" section reporting who currently held
+//! a reservation on a path — that concept is gone (see `docs/coordination.md`):
+//! compaction, extraction, and the snapshot publish are each already safe under
+//! concurrent writers by construction (content-addressed generations, a
+//! create-once claim marker, a CAS pointer swap), so there was never a resource
+//! here that needed a holder to protect it. Nothing this command shows depends on
+//! the object store at all any more, only the local roster cache written by
+//! `ctxlake sync`'s store-to-cache leg — see [`render_roster`] for the read path
+//! and its staleness story.
 
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use ctxlake_store::roster::RosterSnapshot;
-use futures::StreamExt;
-use object_store::ObjectStore;
 use time::OffsetDateTime;
 
-use crate::claim::decode_reason;
 use crate::config::Config;
 use crate::paths;
 use crate::sanitize::sanitize;
-use crate::store_ctx::{self, full_path};
 
 pub async fn run(cfg: &Config) -> Result<()> {
-    print_roster(cfg)?;
-    print_live_leases(cfg).await?;
-    Ok(())
+    print_roster(cfg)
 }
 
 fn print_roster(cfg: &Config) -> Result<()> {
@@ -107,73 +103,6 @@ fn render_roster(
     Ok(out)
 }
 
-async fn print_live_leases(cfg: &Config) -> Result<()> {
-    let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
-    let prefix = full_path(&ctx, &ctxlake_store::layout::leases_prefix());
-    let mut stream = ctx.store.list(Some(&prefix));
-    let now: OffsetDateTime = ctx
-        .clock
-        .now()
-        .await
-        .map(OffsetDateTime::from)
-        .unwrap_or_else(|_| OffsetDateTime::now_utc());
-
-    let mut held = Vec::new();
-    while let Some(meta) = stream.next().await {
-        let Ok(meta) = meta else { continue };
-        let Ok(state) = ctxlake_store::lease::read(ctx.store.as_ref(), &meta.location).await else {
-            continue;
-        };
-        // `LeaseState::stealable` (the authoritative "is anyone live-holding this"
-        // check `lease::acquire` itself uses) is crate-private to ctxlake-store;
-        // this mirrors its two public fields directly rather than reaching for a
-        // second, possibly-drifting definition of the same question.
-        let currently_held = matches!(
-            (&state.holder, state.expires_at),
-            (Some(_), Some(expires_at)) if now < expires_at
-        );
-        if currently_held {
-            // `reason` carries the resource string itself, folded in by `claim`
-            // (`LeaseState` has no dedicated field for it — see claim.rs's module
-            // doc) — decode it back so this prints "crates/foo/**", not the lease
-            // key's sha256 hash, which is meaningless to a human reading `status`.
-            let (resource, note) = state
-                .reason
-                .as_deref()
-                .map(decode_reason)
-                .unwrap_or((meta.location.as_ref(), None));
-            held.push((
-                resource.to_string(),
-                state.holder.clone().unwrap_or_default(),
-                note.map(str::to_string),
-            ));
-        }
-    }
-
-    println!("\nleases (live, fetched just now — not cached)");
-    if held.is_empty() {
-        println!("  none held");
-        return Ok(());
-    }
-    for (resource, holder, note) in held {
-        println!("{}", format_lease_line(&resource, &holder, note.as_deref()));
-    }
-    Ok(())
-}
-
-/// `resource` is decoded from another agent's own `LeaseState.reason` and `holder`/
-/// `note` are that agent's own choices too — all untrusted per AGENTS.md's house
-/// rule, sanitized here rather than trusted because a prior `ctxlake claim` chose
-/// them (see `sanitize`'s own doc).
-fn format_lease_line(resource: &str, holder: &str, note: Option<&str>) -> String {
-    let resource = sanitize(resource);
-    let holder = sanitize(holder);
-    match note.map(sanitize) {
-        Some(n) => format!("  {resource}  held by {holder}  \"{n}\""),
-        None => format!("  {resource}  held by {holder}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,36 +181,6 @@ mod tests {
     }
 
     #[test]
-    fn lease_line_decodes_the_resource_out_of_a_folded_reason() {
-        let (resource, note) = decode_reason("crates/foo/**: migrating the shell-out");
-        let line = format_lease_line(resource, "cc-01", note);
-        assert_eq!(
-            line,
-            "  crates/foo/**  held by cc-01  \"migrating the shell-out\""
-        );
-    }
-
-    #[test]
-    fn lease_line_omits_the_note_when_there_is_none() {
-        let line = format_lease_line("crates/foo/**", "cc-01", None);
-        assert_eq!(line, "  crates/foo/**  held by cc-01");
-    }
-
-    #[test]
-    fn lease_line_sanitizes_a_hostile_holder_and_note() {
-        // Regression test: a lease's `holder`/`note` are chosen by whoever holds
-        // it, not by the reader of `status` — AGENTS.md's "sanitize at render
-        // time" rule applies here even though nothing "interprets" the text.
-        let line = format_lease_line(
-            "crates/foo/**",
-            "cc-\x1b[2Jevil",
-            Some("line1\nFAKE: crates/x  held by admin"),
-        );
-        assert!(!line.contains('\x1b'), "{line:?}");
-        assert!(!line.contains('\n'), "{line:?}");
-    }
-
-    #[test]
     fn render_roster_sanitizes_hostile_agent_fields_and_bounds_a_huge_paths_entry() {
         // Reproduces the finding: a `task` carrying an ANSI screen-clear, an
         // embedded newline, a bidi override (U+202E), and a zero-width space
@@ -333,5 +232,56 @@ mod tests {
             "a 200 KB paths entry must be bounded, got {} bytes",
             out.len()
         );
+    }
+
+    /// Regression for the lease removal: `status` used to fetch `live/leases/`
+    /// live from the object store on every run, in addition to the roster cache
+    /// read above. `run` must render cleanly — no "lease" text anywhere in the
+    /// output, no live store round trip at all — against a store that has never
+    /// had a `live/leases/` prefix, or any `live/` prefix, written to it.
+    #[tokio::test]
+    async fn status_run_never_mentions_leases_and_does_not_touch_a_bare_store() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(
+            format!("file://{}", store_dir.path().display()),
+            "status-test-fleet-no-leases",
+            "cc-01",
+        );
+        run(&cfg).await.unwrap();
+        // The store directory itself must still be exactly as bare as it was —
+        // `run` never opened a connection to it, let alone listed `live/leases/`.
+        assert_eq!(
+            std::fs::read_dir(store_dir.path()).unwrap().count(),
+            0,
+            "status must not touch the object store at all any more"
+        );
+    }
+
+    #[test]
+    fn render_roster_output_never_mentions_leases() {
+        let snapshot = ctxlake_store::roster::RosterSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            source: RosterSource::RosterBuild,
+            agents: vec![Intent {
+                agent_id: "cc-01".into(),
+                fleet_id: "myteam".into(),
+                runtime: Runtime::ClaudeCode,
+                session_id: None,
+                repo: Some("github.com/OxidantData/ctxlake".into()),
+                branch: Some("wave2/cli".into()),
+                cwd: None,
+                task: Some("implementing ctxlake-cli".into()),
+                paths: vec!["crates/ctxlake-cli/src/main.rs".into()],
+                updated_at: OffsetDateTime::now_utc(),
+            }],
+        };
+        let text = serde_json::to_string(&snapshot).unwrap();
+        let out = render_roster(
+            "myteam",
+            std::path::Path::new("/x/roster.json"),
+            Some(&text),
+        )
+        .unwrap();
+        assert!(!out.to_lowercase().contains("lease"), "{out}");
     }
 }

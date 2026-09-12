@@ -156,6 +156,45 @@ from track record instead:
 This only works because provenance and independence were kept from the start. It is the
 payoff that justifies the discipline on the rest of this page.
 
+## Where this lives, and what's still a placeholder
+
+`ctxlake-maint` (wave 3) implements the pipeline this page describes:
+
+- **The event log** — `crates/ctxlake-maint/src/claims.rs`. `Proposed` / `Promoted` /
+  `Contested` / `Retired` / `Superseded` are separate append objects under
+  `claims/events/` (see [layout.md](layout.md)); `fold()` replays them into current
+  state, and nothing anywhere overwrites one of these events in place. The one exception
+  is `claims/fleet/<claim_id>.json`, which the gate *does* overwrite as a claim's status
+  changes — safe specifically because the gate runs single-writer under
+  `lease_maintenance` (docs/architecture.md), so there is never a second writer to race.
+- **Extraction** — `crates/ctxlake-maint/src/extract.rs`. Context fencing, the
+  provider trait over `reqwest` (`anthropic` / `openai-compatible` / `ollama`), and
+  "no evidence, no claim" all live here. Citation verification is real: an
+  `excerpt_hash` is always computed from the session's own captured content, never
+  taken from what a model claims it is.
+- **The four gates** — `crates/ctxlake-maint/src/gate.rs`. Independence
+  (`compute_independent_count`) joins evidence sessions against
+  `injected_context` and is the authoritative threshold check; the earlier evidence
+  check is a cheap pre-filter on raw evidence, not the real gate — see that module's
+  doc comment for why the order in this page's list and the order of enforcement
+  aren't quite the same thing. Shadow mode is enforced in `claims::claims_visible_to_agents`
+  and `claims::read_promoted_for_agents` — the only two functions in the crate that
+  return fleet-scope claims — not merely by how `ctxlake.toml` is parsed.
+
+Two things this wave deliberately does not claim to have solved:
+
+- **Contradiction detection is a proxy, not semantics.** There is no NLI model here to
+  tell "confirms" from "contradicts" apart. The gate treats "same subject, high cosine
+  similarity or lexical overlap, different claim text" as a conflict worth a human's
+  attention. That is a coarse recall-favoring heuristic, not a classifier — it will
+  send some genuine corroboration to `contested` for a human to wave through, and that
+  false-positive rate is the intentional trade against the alternative (silently
+  trusting two similar-but-different claims to agree).
+- **Confidence is a placeholder formula**, not the resolver described above. It climbs
+  with `independent_count` and is bounded, which is all today's gate logic depends on
+  it for. The hypothesis-to-outcome resolver that would make confidence mean "this
+  agent's track record" is future work.
+
 ## Anti-goals
 
 - Do not auto-promote hypotheses beyond agent scope. Ever.

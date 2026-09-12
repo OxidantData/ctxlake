@@ -99,13 +99,18 @@ pub fn session_sealed(
     session_dir(date, fleet, runtime, agent, session_id).join("_SEALED")
 }
 
+/// The `claims/events/` prefix, for listing every event ever appended (the gate's
+/// fold needs to read all of them, across every date and agent partition).
+pub fn claims_events_prefix() -> Path {
+    Path::from("claims").join("events")
+}
+
 /// One claim proposal (`memory_propose`, never `memory_write` — AGENTS.md invariant
 /// 9). `ulid` is expected to already be a ULID string, which is why it is not itself
 /// escaped further here beyond the standard segment encoding every dynamic value
 /// gets.
 pub fn claim_event(date: &str, agent: &str, ulid: &str) -> Path {
-    Path::from("claims")
-        .join("events")
+    claims_events_prefix()
         .join(format!("dt={date}"))
         .join(format!("agent={agent}"))
         .join(format!("{ulid}.json"))
@@ -115,6 +120,28 @@ pub fn claim_event(date: &str, agent: &str, ulid: &str) -> Path {
 /// idempotent instead of re-proposing the same claim twice.
 pub fn claims_extracted(session_id: &str) -> Path {
     Path::from("claims").join("extracted").join(session_id)
+}
+
+/// The `claims/fleet/` prefix — promoted (and later contested/retired) claims,
+/// one object per `claim_id`. Listed by the gate on every run to find the current
+/// set of already-decided claims to check new candidates against.
+pub fn claims_fleet_prefix() -> Path {
+    Path::from("claims").join("fleet")
+}
+
+/// One claim's current folded state, once it has reached fleet scope. Written
+/// **only** by the promotion gate inside `ctxlake maint` (AGENTS.md invariant 9) —
+/// nothing else in this codebase constructs this path for a `put`.
+///
+/// Unlike `live/` this is a plain overwrite, not a CAS write: the gate is a
+/// single-writer batch job that runs under `lease_maintenance`, so by the time
+/// anything touches this key there is, by construction, no second writer to race —
+/// two promotions cannot happen at once. Adding a version-checked CAS here would be
+/// locking a resource the design has already made single-writer; see
+/// `docs/architecture.md`'s maintenance chain for why the lease is what does that
+/// work instead.
+pub fn claim_fleet(claim_id: &str) -> Path {
+    claims_fleet_prefix().join(format!("{claim_id}.json"))
 }
 
 /// A published, content-addressed snapshot. Immutable once written: the hash in the
@@ -188,6 +215,7 @@ mod tests {
                 .as_ref(),
             "sessions/dt=2026-09-11/fleet=oxidant/runtime=claude_code/agent=cc-01/session=sess-1/_SEALED"
         );
+        assert_eq!(claims_events_prefix().as_ref(), "claims/events");
         assert_eq!(
             claim_event("2026-09-11", "cc-01", "01J000000000000000000000").as_ref(),
             "claims/events/dt=2026-09-11/agent=cc-01/01J000000000000000000000.json"
@@ -195,6 +223,11 @@ mod tests {
         assert_eq!(
             claims_extracted("sess-1").as_ref(),
             "claims/extracted/sess-1"
+        );
+        assert_eq!(claims_fleet_prefix().as_ref(), "claims/fleet");
+        assert_eq!(
+            claim_fleet("01J000000000000000000000").as_ref(),
+            "claims/fleet/01J000000000000000000000.json"
         );
         assert_eq!(
             snapshot("deadbeef1234").as_ref(),

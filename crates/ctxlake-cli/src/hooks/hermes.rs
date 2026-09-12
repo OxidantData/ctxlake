@@ -1,6 +1,6 @@
 //! Hermes — `~/.hermes/config.yaml`, top-level `hooks:` block.
 //!
-//! Per AGENTS.md and docs/runtimes/hermes.md: shell hooks, never the Python plugin
+//! Per AGENTS.md and docs/runtimes.md § Hermes: shell hooks, never the Python plugin
 //! in `adapters/hermes/` (that mechanism is being retired precisely because a second
 //! redaction implementation is a liability — see that doc's module note). Shape is
 //! flat, like Cursor's: `hooks.<event>` is a list of `{command, matcher?, timeout?,
@@ -8,7 +8,7 @@
 //!
 //! `fail_closed` is meaningful on exactly one event — `pre_tool_call`, the sole
 //! blocking hook — and Hermes logs a warning if it is set anywhere else (per
-//! docs/runtimes/hermes.md), so this installer only ever writes it there, left at
+//! docs/runtimes.md § Hermes), so this installer only ever writes it there, left at
 //! `false`: a hook crash must never wedge a session (AGENTS.md invariant 1's
 //! reasoning, applied to the hook itself — it fails open, always).
 
@@ -17,7 +17,7 @@ use serde_yaml::{Mapping, Value};
 
 use super::{hook_command, is_ours, Runtime};
 
-/// Hermes' own hook names (`docs/runtimes/hermes.md`'s event-mapping table) — both
+/// Hermes' own hook names (`docs/runtimes.md § Hermes`'s event-mapping table) — both
 /// the YAML key under `hooks:` and, per `ctxlake-hook`'s argv[1] contract, the event
 /// name passed to the binary. `compact` has no Hermes equivalent and is omitted, the
 /// same gap that page documents.
@@ -183,7 +183,7 @@ fn hooks_value(doc: &Value) -> Option<&Value> {
 /// parsed, and that loss covers content ctxlake never touches. Splicing confines
 /// the loss to the one block ctxlake actually owns, matching the same "entries
 /// survive, formatting inside our own block does not" guarantee already disclosed
-/// for the two JSON runtimes (docs/cli.md) — now honestly true for YAML too,
+/// for the two JSON runtimes (docs/reference.md) — now honestly true for YAML too,
 /// rather than the whole-file loss the docs previously excluded.
 fn splice_hooks_block(original: &str, hooks_value: Option<&Value>) -> Result<String> {
     let block = match hooks_value {

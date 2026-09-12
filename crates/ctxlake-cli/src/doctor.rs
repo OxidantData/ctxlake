@@ -40,12 +40,12 @@ pub struct Report {
     pub spool_backlog: SpoolReport,
     pub daemon: DaemonReport,
     pub maint: MaintReport,
-    /// docs/summarization.md's three-tier spelling (`ctxlake.toml`'s own
+    /// docs/memory.md's three-tier spelling (`ctxlake.toml`'s own
     /// `[summarize].mode`) — see `config.rs`'s `SummarizeMode::Display` impl.
     pub summarize_mode: String,
     /// How many sessions currently show a fired Tier 1 nudge marker (`nudge.rs`)
     /// under this fleet's cache dir. Not a health signal by itself — just
-    /// visibility into whether Tier 1 (docs/summarization.md's default) is
+    /// visibility into whether Tier 1 (docs/memory.md's default) is
     /// actually firing for this operator's agents.
     pub nudged_sessions: usize,
 }
@@ -191,19 +191,21 @@ impl Report {
         );
         match self.daemon.pid {
             Some(pid) => println!("  process: running (pid {pid})"),
-            None => println!("  process: not running — `ctxlake sync` (see docs/cli.md) starts it"),
+            None => println!(
+                "  process: not running — `ctxlake sync` (see docs/reference.md) starts it"
+            ),
         }
 
         println!("\nmaintenance");
         match self.maint.last_snapshot_age {
             Some(age) => println!(
                 "  last snapshot published {}s ago (proxy for last completion — see \
-                 docs/summarization.md)",
+                 docs/memory.md)",
                 age.as_secs()
             ),
             None => println!(
                 "  never — ctxlake-maint has not published a snapshot yet (optional: \
-                 `ctxlake maint` from cron/systemd, or run it by hand; see docs/cli.md)"
+                 `ctxlake maint` from cron/systemd, or run it by hand; see docs/reference.md)"
             ),
         }
 
@@ -213,7 +215,7 @@ impl Report {
             println!("  {note}");
         }
         println!(
-            "  tier 1 nudges fired: {} session(s) (see docs/summarization.md)",
+            "  tier 1 nudges fired: {} session(s) (see docs/memory.md)",
             self.nudged_sessions
         );
     }
@@ -225,7 +227,7 @@ impl Report {
 /// a test can pin the honesty of its wording without capturing stdout.
 ///
 /// **Why this note exists, and why it is `shadow`-only.** Of the five modes
-/// (`docs/summarization.md`), only `shadow` makes a claim about what happens on
+/// (`docs/memory.md`), only `shadow` makes a claim about what happens on
 /// a *read* path: "runs the whole chain ... with agent reads disabled ...
 /// nothing reaches a context window." `none`/`agent` never produce a claim to
 /// read in the first place, and `batch`/`both` promise extraction, not
@@ -243,7 +245,7 @@ fn summarize_mode_enforcement_note(mode: &str) -> Option<&'static str> {
     if mode == "shadow" {
         Some(
             "NOTE: shadow's \"reads disabled\" is not enforced yet — memory_search \
-             does not consult [summarize].mode (see docs/summarization.md)",
+             does not consult [summarize].mode (see docs/memory.md)",
         )
     } else {
         None
@@ -277,7 +279,7 @@ fn meaning(probe: &str) -> &'static str {
         }
         "conditional-get-304" => {
             "roster polling will cost a full GET every cycle instead of a cheap 304 \
-             — works, but scales worse (see docs/scaling.md)"
+             — works, but scales worse (see docs/storage.md)"
         }
         "list" => "the roster fan-in and maintenance both require LIST — capture (writing sessions) does not",
         "delete" => "scratch-object cleanup won't fully work; harmless on its own",

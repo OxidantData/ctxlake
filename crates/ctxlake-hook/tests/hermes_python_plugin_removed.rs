@@ -1,7 +1,7 @@
 //! Guards the removal named in the wave-2 task brief: the in-process Python Hermes
 //! plugin (`adapters/hermes/`) is deleted, not merely undocumented. Hermes reaches
 //! ctxlake exclusively through `ctxlake-hook` now — see
-//! `src/adapters/hermes.rs` and `docs/runtimes/hermes.md`.
+//! `src/adapters/hermes.rs` and `docs/runtimes.md § Hermes`.
 //!
 //! Why this is worth a real filesystem assertion rather than trusting `git rm`: a
 //! rebase, a bad merge, or someone restoring the directory "to compare against"

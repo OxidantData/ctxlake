@@ -2,7 +2,7 @@
 //!
 //! Flatter than Claude Code's: `hooks.<event>` is directly an array of
 //! `{"command": "...", "timeout"?: N}` entries, no matcher-group nesting
-//! (docs/runtimes/cursor.md).
+//! (docs/runtimes.md § Cursor).
 
 use anyhow::Result;
 use json::JsonValue;
@@ -10,7 +10,7 @@ use json::JsonValue;
 use super::json_util::{ensure_array, ensure_object, parse_or_empty, remove_if_empty};
 use super::{hook_command, is_ours, Runtime};
 
-/// The six events docs/runtimes/cursor.md documents ctxlake against. Cursor's hook
+/// The six events docs/runtimes.md § Cursor documents ctxlake against. Cursor's hook
 /// surface has several more (the pre-check-only and subagent events cursor.rs's
 /// adapter also recognizes), left uninstalled here because the doc page — the
 /// contract this installer has to match — only commits to these six.

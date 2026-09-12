@@ -70,13 +70,13 @@ pub fn cursor_hooks_path() -> PathBuf {
     home_dir().join(".cursor").join("hooks.json")
 }
 
-/// Hermes shell-hook config — see docs/runtimes/hermes.md.
+/// Hermes shell-hook config — see docs/runtimes.md § Hermes.
 pub fn hermes_config_path() -> PathBuf {
     home_dir().join(".hermes").join("config.yaml")
 }
 
 /// Hermes's own SQLite state database — the source `ctxlake import --runtime hermes`
-/// reads (see `import/hermes.rs` and docs/import.md).
+/// reads (see `import/hermes.rs` and docs/adding-it.md).
 ///
 /// This is a *live* database belonging to another process, which is why the importer
 /// opens it read-only and immutable rather than ever writing anywhere near it.

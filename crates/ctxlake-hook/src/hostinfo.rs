@@ -33,7 +33,7 @@ fn resolve(value: Option<&str>, default: &str) -> String {
 }
 
 /// Best-effort hostname, without adding a dependency. `HOSTNAME` is rarely exported
-/// by interactive shells on macOS, so this is a known gap — see `docs/runtimes/` —
+/// by interactive shells on macOS, so this is a known gap — see `docs/runtimes.md` —
 /// until a later wave either links a tiny libc shim or has the installer stamp a
 /// stable machine id itself instead of relying on the hostname at all.
 pub fn hostname() -> String {

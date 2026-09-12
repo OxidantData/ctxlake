@@ -1,4 +1,4 @@
-//! Tier 1's once-per-session nudge marker (docs/summarization.md: "at turn end a
+//! Tier 1's once-per-session nudge marker (docs/memory.md: "at turn end a
 //! hook returns a ONE-TIME nudge and the agent calls the `fleet_handoff` MCP
 //! tool").
 //!

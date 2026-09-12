@@ -2,7 +2,7 @@
 //!
 //! Hermes reaches this binary through shell hooks it declares in
 //! `~/.hermes/config.yaml`, a wire contract deliberately Claude Code-compatible
-//! (`docs/runtimes/hermes.md`) — it spawns this same binary per event exactly like
+//! (`docs/runtimes.md § Hermes`) — it spawns this same binary per event exactly like
 //! the other two runtimes, and no longer runs an in-process Python plugin
 //! (`adapters/hermes/`, deleted: see `adapters::hermes`'s module doc for why a
 //! second, hand-ported redactor was a liability rather than an optimization).
@@ -30,7 +30,7 @@ use std::io::{self, Read, Write};
 /// Which event each runtime calls "the session is starting, here is your chance to
 /// inject". Hermes's is `pre_llm_call` rather than `on_session_start`: only the former
 /// has an injection channel, so injecting on the latter would be silently dropped
-/// (docs/runtimes/hermes.md).
+/// (docs/runtimes.md § Hermes).
 fn is_session_start(runtime: &str, event: &str) -> bool {
     matches!(
         (runtime, event),

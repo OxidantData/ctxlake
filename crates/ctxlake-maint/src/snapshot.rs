@@ -37,7 +37,7 @@
 //! before there is content, so that whatever writes real claims next needs no
 //! migration to start landing in it.
 //!
-//! **Content-addressed, `docs/concepts.md`-style: write the blob, then swap the
+//! **Content-addressed, `docs/how-it-works.md`-style: write the blob, then swap the
 //! pointer.** [`publish`] writes `snapshot/<sha256>.sqlite` (skipping the `PUT`
 //! entirely if that exact hash is already there — the fold is deterministic, so a
 //! maintenance run that finds no new claim events reproduces the same bytes and the
@@ -48,7 +48,7 @@
 //! snapshot).
 //!
 //! **The gate is a property of the artifact, not of one crate's function.**
-//! `docs/summarization.md`'s shadow mode runs "the whole chain — extraction, gates,
+//! `docs/memory.md`'s shadow mode runs "the whole chain — extraction, gates,
 //! snapshot — with agent reads disabled," so `publish` always folds and writes the
 //! *full* claim log regardless of mode (`agent_reads_enabled` never skips a row in
 //! [`SCHEMA_SQL`]'s `claims` table — that table is this module's arithmetic, and it
@@ -946,7 +946,7 @@ mod tests {
 
     /// The regression for the review finding: publishing with agent reads
     /// disabled must still run the full fold (arithmetic doesn't skip in shadow
-    /// mode, per `docs/summarization.md`), but the artifact it produces must be
+    /// mode, per `docs/memory.md`), but the artifact it produces must be
     /// structurally incapable of serving that promoted claim to an agent — no
     /// FTS5 hit, no `visible_to_agents` row — rather than merely trusting every
     /// future reader to remember to check the mode themselves.

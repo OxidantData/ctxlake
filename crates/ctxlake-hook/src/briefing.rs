@@ -92,13 +92,13 @@ pub fn session_start_response_at(
             .to_string(),
         ),
         // Hermes injects from `pre_llm_call` — a `{"context": ...}` return is appended
-        // to the turn's user message (docs/runtimes/hermes.md, read from its source).
+        // to the turn's user message (docs/runtimes.md § Hermes, read from its source).
         // Deliberately NOT on_session_start: that hook has no injection channel, and
         // returning a context shape there would be silently discarded.
         "hermes" => Some(serde_json::json!({ "context": text }).to_string()),
         // Cursor's sessionStart has no documented injection field, and no live capture
         // has shown one. Rather than guess a shape, Cursor agents reach the same data
-        // through the `fleet_status` MCP tool — see docs/runtimes/cursor.md.
+        // through the `fleet_status` MCP tool — see docs/runtimes.md § Cursor.
         _ => None,
     }
 }

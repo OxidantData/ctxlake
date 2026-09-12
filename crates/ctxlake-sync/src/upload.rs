@@ -435,7 +435,7 @@ async fn maybe_seal_and_cleanup(
     decrement_tracked_size(&dir, freed);
     let _ = std::fs::remove_file(&done_marker);
     // The watermark itself is deliberately NOT deleted here (a past version of this
-    // function did, and it was a bronze-corrupting bug): `docs/runtimes/claude-code.md`
+    // function did, and it was a bronze-corrupting bug): `docs/runtimes.md § Claude Code`
     // documents that `--resume`/`--continue` reuses `session_id`, so a `.ndjson` can
     // reappear at this same path days later. Deleting the watermark would reset
     // `next_seg` to 0 and `sealed_in_store` to `false`, and the very first segment the
@@ -980,7 +980,7 @@ mod tests {
     async fn a_resumed_session_after_sealing_appends_new_segments_rather_than_overwriting_seg0() {
         // Regression: cleanup used to delete the watermark file once a session
         // sealed. Claude Code's `--resume`/`--continue` reuses `session_id`
-        // (docs/runtimes/claude-code.md), so a session's `.ndjson` can reappear at
+        // (docs/runtimes.md § Claude Code), so a session's `.ndjson` can reappear at
         // the same spool path later. With the watermark gone, that reappearance
         // read back as `next_seg: 0, sealed_in_store: false` and its first upload
         // PUT straight over the already-sealed `seg-000000`, destroying it.

@@ -16,8 +16,8 @@ happened in this repo.
 |---|---|
 | [`docs/README.md`](docs/README.md) | Docs index |
 | [`docs/architecture.md`](docs/architecture.md) | Operator's map: every component, data flow, failure modes |
-| [`docs/concepts.md`](docs/concepts.md) | The three planes and the one-write-pattern rule |
-| [`docs/scaling.md`](docs/scaling.md) | Where this does not scale, with the cost arithmetic |
+| [`docs/how-it-works.md`](docs/how-it-works.md) | The three planes and the one-write-pattern rule |
+| [`docs/storage.md`](docs/storage.md) | Backends, the CAS matrix, and where this does not scale |
 
 ## The invariants
 
@@ -106,7 +106,7 @@ every payload carries `user_email`, which must never reach the envelope. See
 `{hook_event_name, tool_name, tool_input, session_id, cwd, extra}` and `exit 2` blocks, so
 one binary serves all three runtimes. But `result` and `duration_ms` are nested under
 `extra`, not top-level. Verified against Hermes's own source; see
-[`docs/runtimes/hermes.md`](docs/runtimes/hermes.md).
+[`docs/runtimes.md`](docs/runtimes.md)'s Hermes section.
 
 **Claude Code sends `prompt`, not the documented `user_input`.** The published hooks
 reference says `user_input`; the binary sends `prompt`. Reading only the documented name

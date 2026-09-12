@@ -1,6 +1,6 @@
 //! Compaction — rewrite a `(date, fleet)` partition's many small sealed-session
 //! Parquet segments into a handful of larger files. See `docs/architecture.md`'s
-//! maintenance chain and `docs/scaling.md`'s "small-object explosion" section for
+//! maintenance chain and `docs/storage.md`'s "small-object explosion" section for
 //! why this exists: one Parquet file per session is cheap to write but expensive to
 //! `LIST` and read back at scale.
 //!
@@ -71,7 +71,7 @@ use crate::partition::read_session_segments;
 
 /// Target size for one compacted output file. Not a hard cap — the last part of a
 /// partition is whatever's left over, however small — just the point at which a
-/// growing batch is flushed as its own file. See `docs/summarization.md`'s sibling
+/// growing batch is flushed as its own file. See `docs/memory.md`'s sibling
 /// docs for the "~256MB" figure this implements.
 pub const DEFAULT_MAX_PART_BYTES: usize = 256 * 1024 * 1024;
 

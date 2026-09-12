@@ -1,7 +1,7 @@
 //! Runtime adapters: normalize a hook's native event into a [`ctxlake_core::Envelope`].
 //!
 //! Hermes reaches this binary through shell hooks, a wire contract deliberately
-//! Claude Code-compatible (`docs/runtimes/hermes.md`) — it no longer runs an
+//! Claude Code-compatible (`docs/runtimes.md § Hermes`) — it no longer runs an
 //! in-process Python plugin (`adapters/hermes/`, deleted: a hand-ported second
 //! redactor with no shared source was the exact silent-divergence risk AGENTS.md
 //! invariant 7 exists to rule out). See [`hermes`] for the payload shape.

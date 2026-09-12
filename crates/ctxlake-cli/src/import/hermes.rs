@@ -4,7 +4,7 @@
 //! assistant and tool), the structured `tool_calls` an assistant asked for, per-model
 //! token and cost accounting, and the session titles Hermes generates for its own UI.
 //! That makes it a **high**-fidelity import source, comparable to Claude Code's JSONL
-//! transcript — not the "live capture only" runtime `docs/import.md` used to claim it
+//! transcript — not the "live capture only" runtime `docs/adding-it.md` used to claim it
 //! was. See that page for the corrected fidelity table.
 //!
 //! ## Opening someone else's live database
@@ -78,7 +78,7 @@ use time::OffsetDateTime;
 use super::EnvelopeSink;
 
 /// Columns of `messages` this importer maps. Every one is required: each carries a
-/// piece of the fidelity `docs/import.md` now promises for Hermes, and losing any of
+/// piece of the fidelity `docs/adding-it.md` now promises for Hermes, and losing any of
 /// them silently is worse than refusing to run.
 const REQUIRED_MESSAGE_COLUMNS: &[&str] = &[
     "id",
@@ -204,7 +204,7 @@ pub fn verify_schema(conn: &Connection) -> Result<Schema> {
         bail!(
             "Hermes's `messages` table is missing {}{version_note}; this importer was \
              verified against a schema that has them, and importing without them would \
-             silently drop history rather than fail. See docs/import.md.",
+             silently drop history rather than fail. See docs/adding-it.md.",
             missing.join(", ")
         );
     }
@@ -693,7 +693,7 @@ fn build_session(
 
         let run_ends = row.compacted && rows.get(i + 1).map(|n| !n.compacted).unwrap_or(true);
         if run_ends {
-            // Hermes has no compaction *hook* — `docs/runtimes/hermes.md`'s
+            // Hermes has no compaction *hook* — `docs/runtimes.md § Hermes`'s
             // compaction gap is real for live capture — but the database records the
             // fact after the event. `compacted = 1` means the message was compacted
             // AWAY (Hermes sets `active = 0, compacted = 1` together — its own tests
@@ -1392,7 +1392,7 @@ mod tests {
     fn a_compacted_row_yields_a_compact_event() {
         // Hermes has no compaction *hook* — live capture cannot see this at all —
         // but the database records it, so import can. This is the asymmetry
-        // docs/import.md now states.
+        // docs/adding-it.md now states.
         let fx = Fixture::build();
         let (_, c) = fx.import();
         let compacts: Vec<&Envelope> = c

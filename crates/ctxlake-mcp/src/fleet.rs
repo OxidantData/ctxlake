@@ -7,7 +7,7 @@
 //! Compaction, extraction, and the snapshot publish are each safe under
 //! concurrent writers by construction — content-addressed generation
 //! directories, a create-once claim marker, a CAS pointer swap
-//! (`docs/coordination.md`) — so nothing in this system was ever waiting on a
+//! (`docs/how-it-works.md`) — so nothing in this system was ever waiting on a
 //! holder to protect it. What these tools offer instead is visibility: who is
 //! active, what happened recently, and a place to leave a note for whoever picks
 //! a repo up next.

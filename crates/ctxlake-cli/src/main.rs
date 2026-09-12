@@ -1,4 +1,4 @@
-//! `ctxlake` — the entire user-facing surface of the project. See docs/cli.md.
+//! `ctxlake` — the entire user-facing surface of the project. See docs/reference.md.
 //!
 //! Adoption is the product: a coordination tool nobody can install without reading
 //! source code coordinates nothing. Every subcommand here is built to be run by a
@@ -64,7 +64,7 @@ enum Command {
     Doctor,
     /// Merge ctxlake's hooks into a runtime's config.
     Install(InstallCmd),
-    /// Backfill the history a runtime already has on disk. See docs/import.md.
+    /// Backfill the history a runtime already has on disk. See docs/adding-it.md.
     Import(ImportCmd),
     /// Remove exactly what `install` added.
     Uninstall(InstallCmd),
@@ -72,8 +72,8 @@ enum Command {
     Status,
     /// Print the resolved config.
     Config,
-    /// Run (or check, or stop) the daemon: hook spool -> store, store -> local
-    /// cache, and this agent's own presence.
+    /// Run the daemon — hook spool -> store, store -> local cache, and this
+    /// agent's own presence — or install it as a service so it survives a reboot.
     Sync(SyncCmd),
     /// Compact, digest, and publish the snapshot. Safe to run on every host at once.
     Maint(MaintCmd),
@@ -201,7 +201,7 @@ enum SyncAction {
     /// the daemon is actually running.
     Status,
     /// Install a systemd user unit (Linux) or LaunchAgent (macOS) so the daemon
-    /// comes back after a reboot. See docs/cli.md.
+    /// comes back after a reboot. See docs/reference.md.
     Install {
         /// Install the unit without starting it.
         #[arg(long)]
@@ -215,7 +215,7 @@ enum SyncAction {
 #[derive(Args)]
 struct MaintCmd {
     /// Run the chain once and exit, instead of looping on an interval. What a
-    /// cron entry or systemd timer should pass — see docs/cli.md on why that
+    /// cron entry or systemd timer should pass — see docs/reference.md on why that
     /// timer is optional.
     #[arg(long)]
     once: bool,

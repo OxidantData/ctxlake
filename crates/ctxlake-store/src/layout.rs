@@ -1,4 +1,4 @@
-//! Typed paths for the bucket layout — see `docs/layout.md`.
+//! Typed paths for the bucket layout — see `docs/storage.md`.
 //!
 //! Every key any part of ctxlake writes or reads is constructed here and nowhere
 //! else. That is not a style preference: a hand-rolled `format!("live/agents/{id}")`
@@ -87,7 +87,7 @@ pub fn claims_events_prefix() -> Path {
     Path::from("claims").join("events")
 }
 
-/// The Tier 0 structural digest for one sealed session — see `docs/summarization.md`.
+/// The Tier 0 structural digest for one sealed session — see `docs/memory.md`.
 /// Colocated under the same session directory as its segments and `_SEALED` marker
 /// (rather than a separate top-level prefix) because it is derived from, and only
 /// ever meaningful alongside, that one session's own data; a reader who has found
@@ -134,7 +134,7 @@ pub fn session_digest(
 /// `snapshot/`. Old generations are never deleted (deleting one a lagging reader
 /// might still be mid-read of would reintroduce the exact race this exists to
 /// avoid), so a partition recompacted often accumulates old generations' storage —
-/// a known, documented cost (`docs/layout.md`), not a silent one.
+/// a known, documented cost (`docs/storage.md`), not a silent one.
 pub fn sessions_compacted_part(date: &str, fleet: &str, generation: &str, part: u32) -> Path {
     Path::from("sessions")
         .join("compacted")

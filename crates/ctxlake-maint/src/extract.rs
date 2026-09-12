@@ -1,4 +1,4 @@
-//! Tier 2 — batch extraction over sealed sessions. See `docs/summarization.md`.
+//! Tier 2 — batch extraction over sealed sessions. See `docs/memory.md`.
 //!
 //! This is the only tier that needs an LLM, and it is optional: [`tier2_enabled`]
 //! is the single gate everything else in this module respects, and when it says
@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::claims::{self, ClaimState, ClaimType, Evidence, ProposedClaim, Scope};
 
-/// `docs/summarization.md`'s `[summarize] mode` values. `Shadow` is not listed
+/// `docs/memory.md`'s `[summarize] mode` values. `Shadow` is not listed
 /// alongside the other four in the `mode` doc comment there because it gets its
 /// own section, but it is the same field — see `docs/memory.md`'s note that
 /// shadow mode runs "the whole chain... with agent reads disabled."
@@ -57,7 +57,7 @@ pub enum ProviderKind {
     Ollama,
 }
 
-/// `[summarize.batch]`, mirroring `docs/summarization.md`'s table field-for-field,
+/// `[summarize.batch]`, mirroring `docs/memory.md`'s table field-for-field,
 /// defaults included, so a bare `[summarize.batch]` with nothing set behaves
 /// exactly like the doc's sample.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +98,7 @@ pub struct SummarizeConfig {
 }
 
 /// The one gate every entry point in this module checks first. "If no LLM is
-/// configured, extraction is a clean no-op" (docs/summarization.md) — this
+/// configured, extraction is a clean no-op" (docs/memory.md) — this
 /// function is that sentence made checkable.
 pub fn tier2_enabled(cfg: &SummarizeConfig) -> bool {
     matches!(
@@ -197,7 +197,7 @@ pub enum ExtractError {
 }
 
 /// One batch's results, keyed by the request id each was submitted under — never
-/// by position, since batch results come back out of order (docs/summarization.md).
+/// by position, since batch results come back out of order (docs/memory.md).
 pub type BatchResults = HashMap<String, Result<String, ExtractError>>;
 
 /// One HTTP-backed extraction backend. Kept as a plain trait with hand-rolled
@@ -214,7 +214,7 @@ pub trait Provider: Send + Sync {
     /// implementation is correct but pays full (live) price per request; a
     /// batch-capable provider overrides this to use its half-price batch
     /// endpoint instead — see [`AnthropicProvider`]. The result is keyed by
-    /// request id, **never** by position: docs/summarization.md is explicit that
+    /// request id, **never** by position: docs/memory.md is explicit that
     /// batch results come back out of order.
     fn complete_batch<'a>(
         &'a self,
@@ -371,7 +371,7 @@ impl Provider for AnthropicProvider {
                 .to_string();
 
             // Batch extraction is definitionally not latency-sensitive
-            // (docs/summarization.md) — a plain poll loop is the right shape
+            // (docs/memory.md) — a plain poll loop is the right shape
             // here, not a webhook or a background task this crate would then
             // have to keep alive across process restarts.
             let results_url = loop {
@@ -497,7 +497,7 @@ pub fn parse_ollama_response(raw: &str) -> Result<String, ExtractError> {
 }
 
 /// `ollama` — a local (or self-hosted) endpoint. No transcript leaves the host;
-/// see docs/summarization.md's "running it entirely locally."
+/// see docs/memory.md's "running it entirely locally."
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
@@ -571,7 +571,7 @@ struct RawExtraction {
 
 /// Parse the model's structured-output JSON (`{"claims": [...]}`) into raw
 /// candidates. A malformed response is an [`ExtractError`], not a bad memory
-/// silently stored — docs/summarization.md's "structured output" rule.
+/// silently stored — docs/memory.md's "structured output" rule.
 pub fn parse_claims_response(raw: &str) -> Result<Vec<RawClaim>, ExtractError> {
     let parsed: RawExtraction = serde_json::from_str(raw.trim())
         .map_err(|e| ExtractError::MalformedResponse(e.to_string()))?;
@@ -851,7 +851,7 @@ pub async fn load_transcript(
     })
 }
 
-/// The extraction system prompt: the stable prefix docs/summarization.md's
+/// The extraction system prompt: the stable prefix docs/memory.md's
 /// "prompt caching" paragraph describes — byte-identical across every session,
 /// so a caching-aware provider only pays for it once.
 pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You extract atomic, evidence-backed claims from a coding-agent session transcript.
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     /// Deliberately out of order: `req-2`'s line comes before `req-1`'s, the
-    /// exact scenario docs/summarization.md warns about ("results come back out
+    /// exact scenario docs/memory.md warns about ("results come back out
     /// of order, so they are keyed by request id, never by position").
     const BATCH_RESULTS_JSONL_OUT_OF_ORDER: &str = "\
 {\"custom_id\":\"req-2\",\"result\":{\"type\":\"succeeded\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"claims\\\":[]}\"}]}}}

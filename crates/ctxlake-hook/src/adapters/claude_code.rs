@@ -83,7 +83,7 @@ pub fn normalize(event: &str, v: &Value) -> Result<Envelope, String> {
         // Claude Code's `Stop` payload carries `transcript_path`, not the message
         // text itself; opening and scanning that file here would risk the 5ms budget
         // on a long session, so `content` is intentionally left empty — see
-        // docs/runtimes/claude-code.md for the gap.
+        // docs/runtimes.md § Claude Code for the gap.
     }
 
     if matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure") {

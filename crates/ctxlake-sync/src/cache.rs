@@ -10,7 +10,7 @@
 //!   call and persist. Written to `<cache_root>/<fleet_id>/roster.json`.
 //! - **snapshot** (`snapshot/latest.json` -> `snapshot/<content_hash>.sqlite`, per
 //!   `ctxlake_store::layout`), the content-addressed publish/pointer pair
-//!   `docs/concepts.md`'s "Serving" plane describes. What the *blob* actually
+//!   `docs/how-it-works.md`'s "Serving" plane describes. What the *blob* actually
 //!   contains (a briefing, a recent-session digest, ...) is `ctxlake-maint`'s
 //!   schema to define and publish, in a wave this crate does not own — nothing
 //!   writes `snapshot/latest.json` yet. This module treats the blob as opaque bytes
@@ -134,7 +134,7 @@ pub async fn refresh_snapshot(
         Err(OsError::NotFound { .. }) => {
             // The pointer named a blob that isn't there (yet, or a torn publish
             // that never finished writing the blob before the pointer swap this
-            // module observed) — `docs/concepts.md`'s no-cross-key-atomicity story
+            // module observed) — `docs/how-it-works.md`'s no-cross-key-atomicity story
             // says a crash between blob and pointer writes is the *publisher's*
             // orphan/no-op to have, but a reader landing exactly in that window
             // must not treat it as fatal either. Leave `snapshot_content_hash`

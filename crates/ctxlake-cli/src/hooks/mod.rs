@@ -303,7 +303,7 @@ pub fn plan_install(
 /// testable.
 ///
 /// Hermes is the one entry here: `ctxlake install hermes` writes real, correct
-/// shell-hook commands into `~/.hermes/config.yaml` (per docs/runtimes/hermes.md),
+/// shell-hook commands into `~/.hermes/config.yaml` (per docs/runtimes.md § Hermes),
 /// but `ctxlake-hook` itself does not yet normalize a live Hermes payload —
 /// `crates/ctxlake-hook/src/adapters/mod.rs::normalize` rejects `Runtime::Hermes`
 /// outright, and `main.rs`'s own module doc still describes Hermes as the in-process
@@ -315,7 +315,7 @@ pub fn plan_install(
 pub fn install_caveat(runtime: Runtime) -> Option<&'static str> {
     match runtime {
         Runtime::Hermes => Some(
-            "ctxlake-hook does not yet capture live Hermes events (see docs/cli.md) — \
+            "ctxlake-hook does not yet capture live Hermes events (see docs/reference.md) — \
              this wires the hook commands into ~/.hermes/config.yaml correctly for when \
              it does, but until then every wired event logs to ~/.ctxlake/hook-errors.log \
              and captures nothing",

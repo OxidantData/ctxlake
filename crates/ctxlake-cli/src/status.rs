@@ -2,7 +2,7 @@
 //!
 //! Roster only: who is active, on what branch, doing what. This used to have a
 //! second, "leases (live, fetched just now)" section reporting who currently held
-//! a reservation on a path — that concept is gone (see `docs/coordination.md`):
+//! a reservation on a path — that concept is gone (see `docs/how-it-works.md`):
 //! compaction, extraction, and the snapshot publish are each already safe under
 //! concurrent writers by construction (content-addressed generations, a
 //! create-once claim marker, a CAS pointer swap), so there was never a resource

@@ -127,7 +127,7 @@ fn cursor_fixtures_cover_every_documented_event_and_match_expected_fields() {
 fn hermes_fixtures_cover_every_documented_event_and_match_expected_fields() {
     // on_session_start, pre_llm_call, post_llm_call, pre_tool_call, post_tool_call,
     // on_session_end, on_session_finalize, on_session_reset — see adapters/hermes.rs's
-    // `normalize` match and docs/runtimes/hermes.md's event table.
+    // `normalize` match and docs/runtimes.md § Hermes's event table.
     const EXPECTED_EVENT_COUNT: usize = 8;
     let checked = run_fixtures("hermes", Runtime::Hermes);
     assert_eq!(

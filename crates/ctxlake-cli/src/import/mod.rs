@@ -1,5 +1,5 @@
 //! `ctxlake import` — backfilling the history a runtime already has on disk. See
-//! [`docs/import.md`](../../../../docs/import.md).
+//! [`docs/adding-it.md`](../../../../docs/adding-it.md).
 //!
 //! Import is not a second capture pipeline. It builds exactly the same
 //! [`ctxlake_core::Envelope`] the live hook builds, runs it through exactly the same
@@ -20,7 +20,7 @@
 //! the report. A new source implements [`EnvelopeSink`]-shaped streaming and nothing
 //! else.
 //!
-//! **Only Hermes is implemented today.** `docs/import.md` describes the per-runtime
+//! **Only Hermes is implemented today.** `docs/adding-it.md` describes the per-runtime
 //! *fidelity of the data on disk*, which is a property of those runtimes and true
 //! regardless; the Claude Code and Cursor readers are not written yet, and this
 //! module says so out loud rather than accepting the flag and quietly importing
@@ -109,7 +109,7 @@ impl ImportReport {
         if self.rows_skipped_unknown_role > 0 {
             println!(
                 "  warning: {} message row(s) had a role this importer does not map — \
-                 see docs/import.md",
+                 see docs/adding-it.md",
                 self.rows_skipped_unknown_role
             );
         }
@@ -416,14 +416,14 @@ pub fn run(cfg: &Config, req: ImportRequest) -> Result<()> {
                     .unwrap_or_else(paths::hermes_state_db_path);
                 import_hermes(&db, &identity, since, req.dry_run)
             }
-            // Refused, not silently skipped. `docs/import.md` describes what these
+            // Refused, not silently skipped. `docs/adding-it.md` describes what these
             // runtimes' on-disk history *contains*; no reader for it is written yet,
             // and an importer that accepts the flag and reports zero events is
             // exactly the silent failure AGENTS.md's "how these were found" section
             // is about.
             other => Err(anyhow!(
                 "no import source is implemented for {other} yet — only `--runtime hermes` \
-                 reads history today (see docs/import.md)"
+                 reads history today (see docs/adding-it.md)"
             )),
         };
         match outcome {
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn re_running_the_same_import_writes_nothing_the_second_time() {
-        // The idempotency contract docs/import.md promises, at this layer: the
+        // The idempotency contract docs/adding-it.md promises, at this layer: the
         // source produces the same envelopes again and every one of them is already
         // in the ledger.
         let dir = tempfile::tempdir().unwrap();

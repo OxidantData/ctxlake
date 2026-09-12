@@ -67,7 +67,7 @@ impl Runtime {
 }
 
 /// The normalized event kind. Runtime-specific event names map onto these; see
-/// `docs/runtimes/` for the per-runtime mapping tables.
+/// `docs/runtimes.md` for the per-runtime mapping tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {

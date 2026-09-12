@@ -1,6 +1,6 @@
 //! Claude Code — `~/.claude/settings.json`, `hooks` object.
 //!
-//! Shape (docs/runtimes/claude-code.md, AGENTS.md): each event name maps to an array
+//! Shape (docs/runtimes.md § Claude Code, AGENTS.md): each event name maps to an array
 //! of *matcher groups* — `{"matcher"?: "...", "hooks": [{"type": "command",
 //! "command": "..."}]}` — so more than one tool can register on the same event
 //! without one clobbering another's group. ctxlake always appends its own
@@ -14,7 +14,7 @@ use super::json_util::{ensure_array, ensure_object, parse_or_empty, remove_if_em
 use super::{hook_command, is_ours, Runtime};
 
 /// Every Claude Code hook event ctxlake wires up — the full mapping table in
-/// docs/runtimes/claude-code.md, `Notification` excluded (documented there as
+/// docs/runtimes.md § Claude Code, `Notification` excluded (documented there as
 /// carrying nothing the envelope schema holds).
 pub const EVENTS: &[&str] = &[
     "SessionStart",

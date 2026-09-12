@@ -1,6 +1,6 @@
 //! Detect which repo the current directory belongs to, for the daemon's own
 //! roster entry (`live/agents/<agent_id>.json`'s `repo` field — see
-//! `docs/coordination.md`).
+//! `docs/how-it-works.md`).
 
 /// Prefers `git remote origin`'s URL (stable across clones on different
 /// machines); falls back to the git toplevel path, then the raw cwd, so a

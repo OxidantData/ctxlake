@@ -1,5 +1,5 @@
 //! Hermes adapter — shell hooks, a deliberately Claude Code-compatible wire
-//! contract (`docs/runtimes/hermes.md`, verified against Hermes's own source).
+//! contract (`docs/runtimes.md § Hermes`, verified against Hermes's own source).
 //!
 //! This replaces the wave-1 in-process Python plugin (`adapters/hermes/`, now
 //! deleted): a hand-ported second redactor with no shared source was exactly the
@@ -13,7 +13,7 @@
 //!
 //! `{"hook_event_name": <event>, tool_name, tool_input, session_id, cwd, extra:
 //! {...}}`. The first five are top-level and named identically to Claude Code's
-//! (`docs/runtimes/hermes.md`). **`result` and `duration_ms` are nested under
+//! (`docs/runtimes.md § Hermes`). **`result` and `duration_ms` are nested under
 //! `extra`, never top-level** — this is the field the task brief calls out
 //! explicitly, and for good reason: it is the exact silent-failure shape the
 //! Cursor adapter's own double-encoded `tool_output` bug had (see `cursor.rs`'s
@@ -25,21 +25,21 @@
 //! reading the top level fails loudly instead of merely under-testing.
 //!
 //! `session_id` falls back to `parent_session_id`, then is refused if still empty
-//! (`docs/runtimes/hermes.md`) — an event that can't be attributed to a session
+//! (`docs/runtimes.md § Hermes`) — an event that can't be attributed to a session
 //! pollutes every aggregate it lands in, so this adapter drops it rather than
 //! spooling it under a placeholder.
 //!
-//! Hermes has no compaction event (`docs/runtimes/hermes.md`'s "compaction gap").
+//! Hermes has no compaction event (`docs/runtimes.md § Hermes`'s "compaction gap").
 //! `EventType::Compact` is simply never produced here — a documented gap, never a
 //! synthesized event.
 //!
 //! `on_session_end`, `on_session_finalize`, and `on_session_reset` all collapse
-//! onto `EventType::SessionEnd` (`docs/runtimes/hermes.md`'s event-mapping table):
+//! onto `EventType::SessionEnd` (`docs/runtimes.md § Hermes`'s event-mapping table):
 //! the schema has one session-boundary-at-the-end variant, not three, and Hermes's
 //! own docs list all three as synonyms for it rather than distinct lifecycle
 //! events.
 //!
-//! `pre_tool_call` is Hermes's one blocking event (`docs/runtimes/hermes.md`'s
+//! `pre_tool_call` is Hermes's one blocking event (`docs/runtimes.md § Hermes`'s
 //! capabilities table: `{"action":"block", ...}` or `exit 2`). Like every other
 //! adapter in this crate, [`response_for`] never blocks yet — a real block decision
 //! needs the daemon's view of the lake (a briefing), which does not reach the hook
@@ -67,7 +67,7 @@ const TOOL_EVENTS: &[&str] = &["pre_tool_call", "post_tool_call"];
 
 /// See the module doc: `pre_tool_call` is Hermes's only blocking event, but this
 /// wave never exercises that — every Hermes hook gets `{}`, the documented no-op
-/// shape `docs/runtimes/hermes.md`'s config section describes for a hook that
+/// shape `docs/runtimes.md § Hermes`'s config section describes for a hook that
 /// declares no opinion.
 pub fn response_for(_event: &str) -> String {
     "{}".to_string()
@@ -364,7 +364,7 @@ mod tests {
         // `EventType::Compact` for any Hermes event name, it does so by editing the
         // match in `normalize`, which every other test above already exercises.
         // This test instead pins the specific documented gap: none of the event
-        // names Hermes actually sends (`docs/runtimes/hermes.md`'s event table)
+        // names Hermes actually sends (`docs/runtimes.md § Hermes`'s event table)
         // produce one.
         for event in [
             "on_session_start",

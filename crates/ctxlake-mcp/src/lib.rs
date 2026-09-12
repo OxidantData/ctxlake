@@ -1,6 +1,6 @@
 //! `ctxlake-mcp` — the MCP tool server, run as `ctxlake mcp`.
 //!
-//! See `docs/architecture.md`'s component table and `docs/mcp.md` for what this
+//! See `docs/architecture.md`'s component table and `docs/reference.md` for what this
 //! process is and is not allowed to do. In one sentence: it is a stdio JSON-RPC
 //! 2.0 server speaking MCP protocol 2024-11-05, exposing fleet coordination and
 //! (eventually) shared-memory tools to whichever runtime spawned it — Claude Code,

@@ -1,4 +1,4 @@
-//! Tier 0 — the structural session digest. See `docs/summarization.md`.
+//! Tier 0 — the structural session digest. See `docs/memory.md`.
 //!
 //! Everything in this module is arithmetic over envelopes that were already
 //! captured, redacted, and sealed. There is no LLM call anywhere in this file, on
@@ -64,7 +64,7 @@ pub enum Friction {
     /// session — not necessarily consecutively.
     RepeatedFailure { command: String, count: u32 },
     /// A path appeared in `tool.paths` more than `edit_count` times. Named `HotFile`
-    /// to match `docs/summarization.md`'s wording, but honestly: this counts every
+    /// to match `docs/memory.md`'s wording, but honestly: this counts every
     /// tool call that *named* the path, not only calls known to be a write —
     /// `ToolCall` carries no is-write flag, and guessing per-runtime tool names here
     /// would reintroduce exactly the runtime-specific coupling this module's
@@ -73,14 +73,14 @@ pub enum Friction {
     /// flagging thrash.
     HotFile { path: String, edit_count: u32 },
     /// The session's last `count` commands were all the same failing command, and no
-    /// `SessionEnd` ever arrived — the signal `docs/summarization.md` singles out by
+    /// `SessionEnd` ever arrived — the signal `docs/memory.md` singles out by
     /// name: "abandoned after 4 failed `cargo test -p oxidant-connect` runs".
     AbandonedAfterFailures { command: String, count: u32 },
 }
 
 impl Friction {
     /// A human-readable line for a briefing — the exact phrasing
-    /// `docs/summarization.md` uses for its own example, so that example is also
+    /// `docs/memory.md` uses for its own example, so that example is also
     /// this function's regression test.
     pub fn headline(&self) -> String {
         match self {
@@ -99,7 +99,7 @@ impl Friction {
 
 /// Token and cost accounting, summed across every envelope in the session that
 /// carried a [`ctxlake_core::envelope::Usage`] — "read straight from the runtime's
-/// own accounting" per `docs/summarization.md`, never estimated.
+/// own accounting" per `docs/memory.md`, never estimated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
@@ -326,7 +326,7 @@ pub fn compute(
 
     let mut friction = Vec::new();
 
-    // Abandonment: the single highest-value signal (docs/summarization.md names it
+    // Abandonment: the single highest-value signal (docs/memory.md names it
     // explicitly). Computed before repeated-failure so the latter can avoid
     // reporting the same fact twice — see below.
     let abandonment = trailing_same_command_failure_streak(&commands).and_then(|(cmd, count)| {
@@ -426,7 +426,7 @@ pub enum DigestOutcome {
 /// tracking a watermark of "sessions already digested": simpler, and correct (a
 /// digest write is itself the record of "already done," checked in
 /// [`run_for_session`]), at the cost of a LIST over the full history every
-/// maintenance run — an honest tradeoff to revisit if `docs/scaling.md`'s
+/// maintenance run — an honest tradeoff to revisit if `docs/storage.md`'s
 /// small-object-explosion arithmetic ever makes that LIST itself the bottleneck.
 pub async fn discover_sealed_sessions(
     store: &dyn ObjectStore,
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn four_failing_runs_of_the_same_command_with_no_session_end_is_abandoned() {
-        // The exact example from docs/summarization.md: "abandoned after 4 failed
+        // The exact example from docs/memory.md: "abandoned after 4 failed
         // `cargo test -p oxidant-connect` runs" is pure arithmetic over exit codes.
         let envelopes: Vec<Envelope> = (0..4)
             .map(|n| {

@@ -1,4 +1,4 @@
-//! `ctxlake.toml` — see `docs/config.md` for the authoritative reference this struct
+//! `ctxlake.toml` — see `docs/reference.md` for the authoritative reference this struct
 //! must keep matching.
 //!
 //! AGENTS.md invariant 10 shapes every field here: nothing in this type can hold a
@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// docs/summarization.md's three tiers, selected by name. `None` still runs Tier 0
+/// docs/memory.md's three tiers, selected by name. `None` still runs Tier 0
 /// (structural digests) — there is no way to turn *that* off, since it costs no LLM
 /// call and derives entirely from captured events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -45,7 +45,7 @@ impl SummarizeMode {
 
 impl std::fmt::Display for SummarizeMode {
     /// `ctxlake doctor`'s "what summarize mode is configured" line reads this — see
-    /// `doctor.rs`. Matches `docs/summarization.md`'s own spelling of each mode
+    /// `doctor.rs`. Matches `docs/memory.md`'s own spelling of each mode
     /// (`toml`'s `#[serde(rename_all = "snake_case")]` on this enum uses the same
     /// strings, so a doctor report and a `ctxlake.toml` line never disagree on what
     /// to call a mode).
@@ -103,7 +103,7 @@ fn summarize_is_default(s: &SummarizeConfig) -> bool {
     s.mode == SummarizeMode::Agent && s.batch.is_none()
 }
 
-/// The full contents of `ctxlake.toml`. See `docs/config.md`.
+/// The full contents of `ctxlake.toml`. See `docs/reference.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// `s3://`, `gs://`, `az://`/`abfs(s)://`, or `file://` — parsed by
@@ -152,7 +152,7 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let body = toml::to_string_pretty(cfg).context("serializing config")?;
-    let banner = "# Written by `ctxlake init`. See docs/config.md for the full reference.\n\n";
+    let banner = "# Written by `ctxlake init`. See docs/reference.md for the full reference.\n\n";
     std::fs::write(path, format!("{banner}{body}"))
         .with_context(|| format!("writing config to {}", path.display()))
 }

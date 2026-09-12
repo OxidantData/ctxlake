@@ -12,7 +12,7 @@
 //! `crates/ctxlake-hook/src/spool.rs`. This module points at that same root rather
 //! than a second, separately-resolved root: a daemon that eventually drains both the hook's
 //! and this crate's spool output needs one tree, not two, and the hook's tree is
-//! the one that already exists on disk. `docs/mcp.md` says so plainly, since
+//! the one that already exists on disk. `docs/reference.md` says so plainly, since
 //! papering over a gap between docs and the actual on-disk layout is exactly the
 //! kind of overclaim `docs/checks/regression_checks.py` exists to catch elsewhere
 //! in this repo.

@@ -53,7 +53,7 @@ pub struct MaintenanceReport {
 
 /// Run the full maintenance chain for `fleet_id`: compact -> digest -> publish.
 ///
-/// `agent_reads_enabled` is the boolean form of `docs/summarization.md`'s
+/// `agent_reads_enabled` is the boolean form of `docs/memory.md`'s
 /// `[summarize] mode` (`shadow`/`none` -> `false`, everything else -> `true`) —
 /// see `snapshot`'s module doc for exactly what it does and does not gate. It is
 /// a plain `bool`, not that config enum, because no wave has wired

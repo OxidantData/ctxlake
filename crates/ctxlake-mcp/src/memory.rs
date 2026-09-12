@@ -175,7 +175,7 @@ pub fn search(
             "results": [],
             "note": "no promoted-claim snapshot has synced locally yet for this \
                       fleet — either ctxlake sync hasn't completed a first refresh, \
-                      or the fleet is running in shadow mode (docs/summarization.md), \
+                      or the fleet is running in shadow mode (docs/memory.md), \
                       which is the default and reads nothing on purpose. Propose \
                       observations with memory_propose regardless — they queue for \
                       whenever the gate promotes them.",
@@ -628,7 +628,7 @@ mod tests {
 
     /// The gate-preserving property, at the tool-result level: a **default**
     /// install — no snapshot has ever synced, which is also exactly what a fleet
-    /// sitting in shadow mode (the documented default — docs/summarization.md)
+    /// sitting in shadow mode (the documented default — docs/memory.md)
     /// looks like from this process's point of view — reads zero claims. See
     /// `shadow_mode_reads_none_and_live_mode_reads_promoted_claims_from_the_same_store`
     /// for the second half: even a *populated* snapshot reads zero when every row

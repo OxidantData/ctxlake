@@ -9,7 +9,7 @@
 //! **The arithmetic half cannot be wrong.** Compaction repacks Parquet, the digest
 //! counts exit codes and elapsed time, and the snapshot folds an event log into
 //! SQLite. All three are derived so directly from captured events that there is
-//! nothing for them to be mistaken about — see `docs/summarization.md`'s Tier 0.
+//! nothing for them to be mistaken about — see `docs/memory.md`'s Tier 0.
 //!
 //! **The belief half can be.** Tier 2 extraction asks a model what a session meant,
 //! and the promotion gate decides what the fleet gets to believe. That is why the

@@ -1,5 +1,5 @@
 //! `ctxlake claims` / `ctxlake quarantine` — the human review surface docs/
-//! memory.md and docs/summarization.md promise:
+//! memory.md and docs/memory.md promise:
 //!
 //! ```text
 //! ctxlake claims --status candidate --explain   which gate rejected what, and why
@@ -419,7 +419,7 @@ pub fn explain(group: &CandidateGroup, quarantined: &HashSet<String>) -> Explana
         blocked_by_quarantine: false,
         gate: None,
         reason: "passes every gate this evaluator can check locally; contradiction \
-                  needs data only ctxlake-maint's real gate has (see docs/cli.md)"
+                  needs data only ctxlake-maint's real gate has (see docs/reference.md)"
             .to_string(),
     }
 }
@@ -484,7 +484,7 @@ fn print_cached(cache_dir: &std::path::Path, status: &str) -> Result<()> {
         Err(_) => {
             println!(
                 "no {status} claims yet — the promotion gate (ctxlake maint) has not \
-                 produced any (see docs/summarization.md); nothing at {}",
+                 produced any (see docs/memory.md); nothing at {}",
                 path.display()
             );
             return Ok(());

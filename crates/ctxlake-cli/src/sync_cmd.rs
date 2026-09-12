@@ -15,7 +15,7 @@
 //! why" cuts against pulling one in just for this), so the child can still receive
 //! a `SIGHUP` if its controlling terminal's session ends. A `systemd`/`launchd`
 //! unit running `ctxlake sync --foreground` directly is the robust option for a
-//! production host; docs/cli.md says so.
+//! production host; docs/reference.md says so.
 //!
 //! Resolves spool and cache roots through `paths.rs` (a thin wrapper over
 //! `ctxlake_core::paths`) — never independently, per AGENTS.md's hard-won-facts

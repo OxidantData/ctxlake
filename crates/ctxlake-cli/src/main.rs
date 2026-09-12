@@ -6,15 +6,19 @@
 //! thought about again.
 
 mod claim;
+mod claims;
 mod config;
 mod config_cmd;
 mod doctor;
 mod hooks;
 mod init;
+mod maint_cmd;
+mod nudge;
 mod paths;
 mod sanitize;
 mod status;
 mod store_ctx;
+mod sync_cmd;
 
 use std::path::PathBuf;
 
@@ -57,6 +61,16 @@ enum Command {
     Release(ReleaseCmd),
     /// Print the resolved config.
     Config,
+    /// Run (or check, or stop) the daemon: hook spool -> store, store -> local
+    /// cache, and this agent's own presence.
+    Sync(SyncCmd),
+    /// Run the maintenance chain under the fleet-wide maintenance lease.
+    Maint(MaintCmd),
+    /// Review candidate, contested, and promoted claims.
+    Claims(ClaimsCmd),
+    /// Stop one agent's claims from promoting; its already-promoted claims move
+    /// to contested. Capture continues.
+    Quarantine(QuarantineCmd),
 }
 
 #[derive(Args)]
@@ -126,6 +140,50 @@ struct ReleaseCmd {
     all: bool,
 }
 
+#[derive(Args)]
+struct SyncCmd {
+    /// Run attached to this process instead of daemonizing. What tests exercise
+    /// directly, and what a systemd/launchd unit should invoke.
+    #[arg(long)]
+    foreground: bool,
+    /// Report whether the daemon is running, then exit. Mutually exclusive with
+    /// every other flag here.
+    #[arg(long)]
+    status: bool,
+    /// Stop a running daemon (SIGTERM, then wait briefly), then exit.
+    #[arg(long)]
+    stop: bool,
+    /// Which runtime this daemon's own presence heartbeat declares itself as. A
+    /// sync daemon uploads every runtime's spool regardless of this value — it
+    /// only labels this daemon's own live intent.
+    #[arg(long)]
+    runtime: Option<HookRuntime>,
+}
+
+#[derive(Args)]
+struct MaintCmd {
+    /// Run the chain once and exit, instead of looping on an interval. What a
+    /// cron entry or systemd timer should pass — see docs/cli.md on why that
+    /// timer is optional.
+    #[arg(long)]
+    once: bool,
+}
+
+#[derive(Args)]
+struct ClaimsCmd {
+    #[arg(long, value_parser = ["candidate", "contested", "promoted"])]
+    status: String,
+    /// For `--status candidate`: name which of the four gates rejected each
+    /// claim, and why.
+    #[arg(long)]
+    explain: bool,
+}
+
+#[derive(Args)]
+struct QuarantineCmd {
+    agent_id: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -189,6 +247,33 @@ async fn main() -> Result<()> {
         Command::Config => {
             let cfg = load_config(&config_path)?;
             config_cmd::run(&cfg)
+        }
+        Command::Sync(args) => {
+            if args.status as u8 + args.stop as u8 > 1 {
+                anyhow::bail!("pass at most one of --status / --stop");
+            }
+            let cfg = load_config(&config_path)?;
+            if args.status {
+                sync_cmd::status(&cfg)
+            } else if args.stop {
+                sync_cmd::stop(&cfg)
+            } else if args.foreground {
+                sync_cmd::run_foreground(&cfg, args.runtime).await
+            } else {
+                sync_cmd::run_background(&cfg, &config_path, args.runtime)
+            }
+        }
+        Command::Maint(args) => {
+            let cfg = load_config(&config_path)?;
+            maint_cmd::run(&cfg, args.once).await
+        }
+        Command::Claims(args) => {
+            let cfg = load_config(&config_path)?;
+            claims::run_claims(&cfg, &args.status, args.explain).await
+        }
+        Command::Quarantine(args) => {
+            let cfg = load_config(&config_path)?;
+            claims::quarantine(&cfg, &args.agent_id).await
         }
     }
 }

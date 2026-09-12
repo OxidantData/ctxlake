@@ -55,6 +55,24 @@ pub fn full_path(ctx: &StoreCtx, key: &StorePath) -> StorePath {
     ctx.prefix.parts().chain(key.parts()).collect()
 }
 
+/// A store that addresses every key relative to `ctx.prefix` by itself, for the
+/// one caller in this crate that cannot call [`full_path`] at every site: `ctxlake
+/// sync` hands `ctx.store` straight to `ctxlake_sync::Daemon`, whose upload/cache/
+/// presence loops call `ctxlake_store::layout` functions directly and have no
+/// notion of a bucket prefix to fold in (see `sync_cmd.rs`). Wrapping once here,
+/// at the boundary, keeps that "who joins the prefix" question answered in one
+/// place instead of asking the daemon to import a CLI-only helper.
+///
+/// A no-op for `file://` stores (an empty prefix — see
+/// `connects_to_a_file_store_and_prefixes_keys` above), so this is safe to call
+/// unconditionally rather than branching on whether a prefix is actually set.
+pub fn prefixed_store(ctx: &StoreCtx) -> Arc<dyn ObjectStore> {
+    Arc::new(object_store::prefix::PrefixStore::new(
+        ctx.store.clone(),
+        ctx.prefix.clone(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +102,30 @@ mod tests {
         };
         let full = full_path(&ctx, &key);
         assert_eq!(full.as_ref(), "ctxlake/_meta/fleet.json");
+    }
+
+    #[tokio::test]
+    async fn prefixed_store_addresses_layout_keys_without_an_explicit_join() {
+        use object_store::ObjectStoreExt;
+
+        let prefix = StorePath::from("ctxlake");
+        let ctx = StoreCtx {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            prefix: prefix.clone(),
+            clock: Arc::new(SystemClock),
+        };
+        let wrapped = prefixed_store(&ctx);
+        let key = ctxlake_store::layout::fleet_meta();
+        wrapped
+            .put(&key, object_store::PutPayload::from_static(b"{}"))
+            .await
+            .unwrap();
+
+        // Written through the raw (unwrapped) store, the same bytes must land at
+        // the *fully* prefixed key — proving the wrapper, not the caller, is what
+        // folded the prefix in.
+        let full = full_path(&ctx, &key);
+        assert!(ctx.store.get(&full).await.is_ok());
     }
 
     #[test]

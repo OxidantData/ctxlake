@@ -15,6 +15,10 @@ ctxlake status      who's active, on what, holding what
 ctxlake claim       acquire a lease on a resource
 ctxlake release     give one back
 ctxlake config      print the resolved config
+ctxlake sync        run (or check, or stop) the daemon
+ctxlake maint       run the maintenance chain under the fleet-wide lease
+ctxlake claims      review candidate / contested / promoted claims
+ctxlake quarantine  stop one agent's claims from promoting
 ```
 
 Every subcommand accepts `--config <path>` to point at a `ctxlake.toml` somewhere other
@@ -101,6 +105,15 @@ runtimes
 daemon
   no cache at /Users/you/.ctxlake/cache/myteam/roster.json yet — daemon not running, or hasn't completed a first refresh
   spool backlog: 0 file(s), 0 bytes — /Users/you/.ctxlake/spool
+  process: not running — `ctxlake sync` (see docs/cli.md) starts it
+
+maintenance
+  never — ctxlake-maint has not published a snapshot yet (optional: `ctxlake maint`
+  from cron/systemd, or run it by hand; see docs/cli.md)
+
+summarization
+  mode: agent
+  tier 1 nudges fired: 0 session(s) (see docs/summarization.md)
 ```
 
 ### Backend: every primitive is *executed*, never assumed
@@ -140,10 +153,9 @@ named environment variable resolves — `yes` or `no`, **never the value**. Ther
 code path in this crate that reads that variable and prints it; AGENTS.md invariant 10
 is enforced by there being nothing to print.
 
-### The daemon and the spool
+### The daemon, the spool, maintenance, and summarization
 
-Neither of these can be checked by asking a running process (there isn't one yet to
-ask, in this wave) — `doctor` instead reports what the filesystem shows: the local
+The cache and spool checks are filesystem-only, not a live process check: the local
 cache's freshness (`~/.ctxlake/cache/<fleet_id>/roster.json`'s mtime, if it
 exists at all) and the spool's backlog (file count and total bytes under
 `$CTXLAKE_SPOOL_DIR`, or `~/.ctxlake/spool` if that's unset — the exact root
@@ -152,6 +164,26 @@ exists at all) and the spool's backlog (file count and total bytes under
 the same root or it reports an empty spool regardless of what the hook actually
 wrote). A missing cache or a growing spool are reported plainly, in the same language
 [architecture.md](architecture.md)'s failure-mode table uses, rather than guessed at.
+
+Three more lines report on the pieces [`ctxlake sync`](#ctxlake-sync) and
+[`ctxlake maint`](#ctxlake-maint) (below) add:
+
+- **`process:`** — whether `ctxlake sync` is running, the same way `ctxlake sync
+  --status` checks it: a pidfile under `~/.ctxlake/run/<fleet_id>.pid` whose pid is
+  still alive. A stale pidfile left behind by a crashed process reads as **not
+  running**, never as a phantom daemon nothing can stop.
+- **`maintenance`** — how long ago `snapshot/latest.json` was last published, read from
+  the object store's own `last_modified` for that key (AGENTS.md invariant 6: never
+  this host's clock). This is a **proxy** for "when did maintenance last complete," not
+  a dedicated completion marker — see [`ctxlake maint`](#ctxlake-maint) below for why.
+- **`summarization`** — the configured `[summarize].mode` (see
+  [summarization.md](summarization.md)'s three tiers) and how many sessions on this
+  host currently show a fired Tier 1 nudge marker. Not a health signal by itself, just
+  visibility into whether Tier 1 — the default, no-LLM-required tier — is actually
+  firing. `mode: shadow` carries one more line: nothing in this workspace enforces
+  shadow's "reads disabled" promise on a read path yet (`memory_search` never
+  consults `[summarize].mode`), so `doctor` says that plainly rather than let the
+  config value alone imply the guarantee is in effect.
 
 ### Exit code
 
@@ -372,6 +404,168 @@ Prints the resolved `ctxlake.toml`. There is nothing to mask by replacing a valu
 place, only the *name* of an environment variable (`api_key_env`) — so "with secrets
 elided" is true by construction, and the command says so in its own footer rather than
 asking you to take it on faith.
+
+## `ctxlake sync`
+
+```sh
+ctxlake sync                          # daemonize (the default)
+ctxlake sync --foreground             # run attached, e.g. under systemd/launchd
+ctxlake sync --status
+ctxlake sync --stop
+ctxlake sync --runtime <claude-code|cursor|hermes>   # label this daemon's own presence
+```
+
+This runs `ctxlake-sync`'s three loops — hook spool → store (`sessions/`), store → local
+cache (`roster.json`, `snapshot.bin`), and this agent's own `live/agents/<id>.json`
+presence heartbeat — under one process. Nothing in this crate starts it for you: no
+subcommand above spawns a daemon as a side effect, so a fleet with `ctxlake sync` never
+run still captures nothing past the local spool and coordinates nothing past a live
+lease read. Run it once per host, or point a `systemd`/`launchd` unit at
+`ctxlake sync --foreground`.
+
+Spool and cache roots are resolved through the exact same functions every other
+subcommand uses (`$CTXLAKE_SPOOL_DIR`/`~/.ctxlake/spool`,
+`$CTXLAKE_CACHE_DIR`/`~/.ctxlake/cache`) — never re-derived here, which is the class of
+bug AGENTS.md's hard-won-facts section calls out by name.
+
+**The bare form daemonizes; `--foreground` does not.** Without a flag, `ctxlake sync`
+re-execs itself with `--foreground` as a detached child — its own process group (so a
+`Ctrl-C` on the launching shell doesn't also kill it), stdio redirected to
+`~/.ctxlake/run/<fleet_id>.log`, and returns immediately once the child reports its pid.
+The child writes its own pidfile at `~/.ctxlake/run/<fleet_id>.pid` the moment it starts.
+
+> **Honest about what this daemonization is not.** There is no `setsid` — the
+> workspace carries no `libc` dependency to call it with, and one is not worth adding
+> for this alone (AGENTS.md: don't add a dependency without saying why). The daemon can
+> still receive a `SIGHUP` if its controlling terminal's session ends. For a host you
+> care about staying up, run `ctxlake sync --foreground` under a real service manager
+> instead of the bare, self-daemonizing form.
+
+`--status` and `--stop` both work off the same pidfile, checking liveness with `kill
+-0` rather than trusting a stale file: a pidfile left behind by a process that crashed
+reads as *not running*, and `ctxlake sync` (with no flags) against that state starts a
+fresh daemon rather than reporting "already running." `--stop` sends `SIGTERM`, waits up
+to 5 seconds for the process to exit, and reports whichever happened.
+
+**Shutdown is graceful.** `SIGTERM` (or `Ctrl-C`, under `--foreground`) stops all three
+loops after their current iteration and releases the fleet-wide maintenance lease if
+this daemon's presence loop happened to be holding it — see
+[`ctxlake_sync::Daemon::shutdown`](../crates/ctxlake-sync/src/daemon.rs)'s own doc.
+There is nothing else to flush: every loop's writes (a spool line uploaded, a cache file
+refreshed) are already durable the instant they happen.
+
+## `ctxlake maint`
+
+```sh
+ctxlake maint             # loop forever, one cycle every 5 minutes
+ctxlake maint --once      # run one cycle and exit — what cron/systemd should call
+```
+
+Runs under the fleet-wide maintenance lease (`live/leases/_maintenance`, provisioned
+once by `ctxlake init`): acquire it, run the maintenance chain, release it. **Exits 0
+quietly when another host already holds the lease** — this is what makes a cron entry
+or systemd timer *optional*, not required:
+
+```text
+$ ctxlake maint --once
+maintenance lease held by cc-01 — nothing to do
+```
+
+Point a timer at every host in the fleet, or none at all, and nothing breaks either
+way. If nothing has `ctxlake sync` or `ctxlake maint` running anywhere, the fleet simply
+runs with an empty belief layer and no compaction — coordination (leases, roster,
+status) is entirely unaffected, since it never depended on maintenance in the first
+place.
+
+> **Honest about today's chain.** The compaction/extraction/promotion-gate/snapshot
+> chain this command is meant to run (`ctxlake-maint`, [`docs/summarization.md`](summarization.md))
+> ships in its own wave. Until it does, `ctxlake maint` still does the part that
+> matters most to get right first — the lease coordination, so at most one host is ever
+> "doing maintenance" at a time — and says so plainly rather than pretending to run a
+> chain that doesn't exist yet:
+>
+> ```text
+> $ ctxlake maint --once
+> maintenance lease acquired, but ctxlake-maint has no chain to run yet
+> (compaction/extraction/gates/snapshot — see docs/summarization.md); releasing the lease
+> ```
+
+## `ctxlake claims`
+
+```sh
+ctxlake claims --status candidate --explain   # which gate rejected what, and why
+ctxlake claims --status contested             # the human review queue
+ctxlake claims --status promoted
+```
+
+`--status candidate` lists every proposed claim currently sitting in the object store
+under `claims/events/` — what `memory_propose` (the MCP tool) queued and `ctxlake sync`
+shipped out of the local spool — grouped by claim type and text, with every observing
+agent listed.
+
+`--explain` is the load-bearing flag: for each candidate, it names **which** of
+[docs/memory.md](memory.md)'s four gates would reject it today, and why:
+
+```text
+$ ctxlake claims --status candidate --explain
+[hypothesis] the flake is a colima scheduling artifact
+    observed by: cc-01
+    -> rejected by the evidence gate: hypotheses never auto-promote beyond agent scope
+
+[convention] this repo uses just, not make
+    observed by: cc-01
+    -> rejected by the evidence gate: convention claims need 2 independent observations; only 1 non-quarantined observer(s) so far
+```
+
+Be clear about what this is: a **read-only, best-effort evaluator**, not a second
+implementation of the gate. Two of the four gates — contradiction (checking against
+promoted claims on the same subject) and independence (discounting corroboration from
+agents that read each other's context) — need data this wave's candidate schema does
+not carry (a promoted-claim index to check against, `injected_context` lineage to
+compute true independence), and `--explain` says so rather than guessing:
+
+```text
+[environment] staging listens on 2222
+    observed by: cc-01, cc-02
+    -> would promote: passes every gate this evaluator can check locally; contradiction
+       and independence need data only ctxlake-maint's real gate has
+```
+
+`--status promoted` and `--status contested` read the local fleet cache mirror
+(`<cache_root>/<fleet_id>/claims.json`) — the same file `memory_search` reads, so this
+command and a peer's MCP search can never disagree about what a promoted claim looks
+like. Nothing writes that file yet in this release (`ctxlake-maint`'s gate is what
+would), so both report the honest, empty case until it does.
+
+## `ctxlake quarantine`
+
+```sh
+ctxlake quarantine <agent_id>
+```
+
+The kill switch. Two effects, both real, and a third deliberate non-effect:
+
+1. **Its claims stop promoting.** A marker is written to
+   `claims/quarantine/<agent_id>.json`; `ctxlake claims --explain` checks it before
+   checking any of the four gates, and reports a quarantined agent's claims as blocked
+   regardless of what the gates would otherwise say.
+2. **Its already-promoted claims move to `contested`.** Any entry in the local
+   `claims.json` cache mirror observed by this agent and currently `promoted` is
+   rewritten to `contested` — the human review queue `ctxlake claims --status contested`
+   shows.
+3. **Capture continues.** Quarantine never touches `claims/events/`, a session's spool,
+   or anything upstream of it — [docs/memory.md](memory.md) is explicit about why: "you
+   want the record of the failure, not a gap where it used to be."
+
+```text
+$ ctxlake quarantine cc-99
+quarantined cc-99: its candidates stop promoting; 1 previously promoted claim(s) moved to contested in the local cache
+capture is unaffected — cc-99's sessions and claim proposals keep landing in the lake
+```
+
+Reversible and auditable: there is no `ctxlake unquarantine` in this release, but the
+marker is a plain object at a known key, and removing it is a one-line fix for whoever
+operates the bucket directly.
 
 ## Next steps
 

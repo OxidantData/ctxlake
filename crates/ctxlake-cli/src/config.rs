@@ -77,6 +77,23 @@ impl SummarizeMode {
     }
 }
 
+impl std::fmt::Display for SummarizeMode {
+    /// `ctxlake doctor`'s "what summarize mode is configured" line reads this — see
+    /// `doctor.rs`. Matches `docs/summarization.md`'s own spelling of each mode
+    /// (`toml`'s `#[serde(rename_all = "snake_case")]` on this enum uses the same
+    /// strings, so a doctor report and a `ctxlake.toml` line never disagree on what
+    /// to call a mode).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SummarizeMode::None => "none",
+            SummarizeMode::Agent => "agent",
+            SummarizeMode::Batch => "batch",
+            SummarizeMode::Both => "both",
+            SummarizeMode::Shadow => "shadow",
+        })
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -184,6 +201,29 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_mode_display_matches_its_toml_spelling() {
+        // `ctxlake doctor` prints this Display impl; `ctxlake.toml` accepts the
+        // serde `rename_all = "snake_case"` spelling — a doctor report naming a
+        // mode differently from what an operator would type in the config file
+        // would be confusing, not just cosmetic.
+        for (mode, word) in [
+            (SummarizeMode::None, "none"),
+            (SummarizeMode::Agent, "agent"),
+            (SummarizeMode::Batch, "batch"),
+            (SummarizeMode::Both, "both"),
+            (SummarizeMode::Shadow, "shadow"),
+        ] {
+            assert_eq!(mode.to_string(), word);
+            let cfg = SummarizeConfig { mode, batch: None };
+            let toml = toml::to_string(&cfg).unwrap();
+            assert!(
+                toml.contains(word),
+                "Display and serde spelling diverged for {mode:?}: {toml}"
+            );
+        }
+    }
 
     #[test]
     fn round_trips_through_toml() {

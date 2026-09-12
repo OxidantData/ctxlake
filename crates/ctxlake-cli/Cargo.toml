@@ -17,8 +17,18 @@ ctxlake-core = { path = "../ctxlake-core" }
 ctxlake-store = { path = "../ctxlake-store" }
 ctxlake-maint = { path = "../ctxlake-maint" }
 ctxlake-mcp = { path = "../ctxlake-mcp" }
+# The daemon library behind `ctxlake sync` (upload/cache/presence loops) — see
+# `sync_cmd.rs`'s module doc. Not a dependency before this wave: nothing here
+# called `ctxlake sync` until now.
+ctxlake-sync = { path = "../ctxlake-sync" }
 clap.workspace = true
-tokio.workspace = true
+# Adds the "signal" feature on top of the workspace default so `ctxlake sync
+# --foreground` can catch SIGTERM/SIGINT for graceful shutdown
+# (`tokio::signal::unix`, `tokio::signal::ctrl_c`). This is an additive feature on
+# an existing workspace dependency, merged via Cargo's normal feature unification —
+# not a new crate (AGENTS.md: "don't add a dependency without saying why" is about
+# new crates; this changes no dependency tree).
+tokio = { workspace = true, features = ["signal"] }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -30,6 +40,15 @@ time.workspace = true
 object_store.workspace = true
 url.workspace = true
 futures.workspace = true
+# `object_store::path::Path` percent-encodes a dynamic segment on write
+# (`PathPart`'s `join`/`child`) but exposes no public way to decode one back —
+# `Path::filename()`/`Path::parts()` both return the raw, still-encoded segment.
+# `claims.rs`'s quarantine list needs the real, decoded `agent_id` back out of
+# `claims/quarantine/<agent_id>.json` to compare against `observed_by`, so this
+# crate does the decode itself with the same crate `object_store` uses
+# internally (already resolved in Cargo.lock at 2.3.2 via that dependency —
+# this pins the same version rather than letting it drift independently).
+percent-encoding = "2.3.2"
 # Scoped to this crate only (never linked into ctxlake-hook, AGENTS.md invariant 2
 # governs that crate's tree, not this one's): the installer must merge into a real
 # `~/.hermes/config.yaml` without clobbering key order or an operator's other entries.

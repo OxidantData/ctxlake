@@ -99,7 +99,21 @@ Installs **merge** into your existing configuration. Existing hooks are preserve
 `.bak` is written first, and re-running changes nothing. Preview the change with
 `--dry-run`, and reverse it exactly with `ctxlake uninstall`.
 
-## 6. See the fleet
+## 6. Start the daemon
+
+```sh
+ctxlake sync
+```
+
+This is the piece that actually moves bytes: hook spool → the store (`sessions/`),
+store → the local cache your hooks and `ctxlake status` read, and this agent's own
+presence heartbeat. Nothing above starts it for you — without a running `ctxlake sync`
+somewhere, sessions sit in the local spool and never reach the lake. Run it once per
+host, or point a `systemd`/`launchd` unit at `ctxlake sync --foreground` for a host you
+want to stay up reliably. Check on it any time with `ctxlake sync --status`, and stop
+it with `ctxlake sync --stop`.
+
+## 7. See the fleet
 
 ```sh
 ctxlake status
@@ -120,7 +134,7 @@ fleet myteam · 2 agents active · roster 4s old
 Start a new agent session in that repo and it opens with the same information already in
 context — who is working, what they hold, and what happened here recently.
 
-## 7. Claim something before you work on it
+## 8. Claim something before you work on it
 
 ```sh
 ctxlake claim 'crates/oxidant-loom/**' --reason "splitting the S3 cache out"
@@ -142,16 +156,36 @@ ctxlake release --all
 
 ## What happens next
 
-Nothing you have to run. A background daemon ships your spooled sessions to the lake and
-refreshes the local cache your hooks read. Compaction and digests run opportunistically
-on whichever machine picks up the maintenance lease; if no agent is running, nothing
-happens and nothing breaks.
+The `ctxlake sync` you started in step 6 ships your spooled sessions to the lake and
+refreshes the local cache your hooks read — that part needs to actually be running
+somewhere, on at least one host, or nothing above step 6 reaches the lake.
 
-The belief layer — durable claims extracted across sessions — is off until you configure
-it. See [summarization.md](summarization.md).
+Maintenance is different: `ctxlake maint` (compaction, digests, and — once configured —
+claim extraction) is **optional**, and — as of this release — the compaction/
+extraction/promotion-gate/snapshot chain it is meant to run doesn't exist yet
+(`ctxlake-maint` ships its own chain in a later wave; see
+[cli.md](cli.md#ctxlake-maint)'s own "Honest about today's chain" note). Point a cron
+entry or systemd timer at it on every host, on one host, or on none — whichever host's
+`ctxlake maint` acquires the fleet-wide maintenance lease finds there is no chain to
+run yet and releases it, every other one exits immediately without contending, and
+either way coordination (leases, roster, `ctxlake status`) keeps working exactly the
+same. Right now you get no compaction and no belief layer regardless of whether
+anything runs `ctxlake maint` — that changes only once the chain lands.
+
+**Tier 1** is docs/summarization.md's designed default — the agent that just did the
+work writes its own one-line "here's what I did and what's next" note, no LLM key
+required — but as of this release nothing yet calls it: the hook adapter that would
+prompt an agent for its handoff at turn-end hasn't been wired to do so. `ctxlake
+doctor`'s `tier 1 nudges fired: 0 session(s)` line reflects that honestly today, not a
+bug in your install. The belief layer — durable claims extracted *across* sessions — is
+a separate, optional Tier 2 that needs an LLM configured; once `ctxlake-maint`'s chain
+exists, review what it produces with `ctxlake claims --status candidate --explain`, and
+reach for `ctxlake quarantine <agent_id>` if one agent's claims start looking wrong.
+See [summarization.md](summarization.md).
 
 ## Next steps
 
+- [cli.md](cli.md) — every command and flag, including `ctxlake sync`/`maint`/`claims`
 - [adopting.md](adopting.md) — how this fits alongside what you already run
 - [concepts.md](concepts.md) — the three planes, and why each exists
 - [architecture.md](architecture.md) — every component, for when you need to debug one

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.6
 
 The daemon did not run on either machine it was installed on. All four causes were
 the same mistake, made in four places: **a supervised service does not inherit your

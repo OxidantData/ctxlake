@@ -80,7 +80,13 @@ pub fn top_k_cosine(query: &[f32], corpus: &[(String, Vec<f32>)], k: usize) -> V
 /// present in `b`'s. Not real FTS ranking (no term frequency, no stopwords) — a
 /// deliberately minimal stand-in the task brief calls for alongside cosine, not a
 /// search engine.
-fn lexical_overlap(a: &str, b: &str) -> f32 {
+///
+/// `pub(crate)`, not private: `crate::calibrate::resolve` reuses this exact
+/// function (via [`cosine`] first, falling back to this) to decide whether an
+/// outcome claim agrees with a hypothesis — the same "same subject, similar
+/// text" proxy this gate uses for contradiction, not a second, possibly
+/// drifting implementation of "do these two claims agree."
+pub(crate) fn lexical_overlap(a: &str, b: &str) -> f32 {
     let words_a: std::collections::HashSet<String> = a
         .to_lowercase()
         .split_whitespace()
@@ -120,6 +126,18 @@ pub struct GateContext<'a> {
     /// Has a human approved this specific candidate? `preference` claims can
     /// never promote without one, regardless of evidence.
     pub human_approved: bool,
+    /// Agents currently under quarantine — see `crate::calibrate`'s module
+    /// doc and [`GateDecision::Quarantined`]. Checked before any of the four
+    /// gates, because it isn't one of them: it is docs/memory.md's separate
+    /// kill switch, and a quarantined agent's candidate must never even reach
+    /// gate 1's evidence check, let alone pass it.
+    pub quarantined_agents: &'a std::collections::HashSet<String>,
+    /// Per-agent calibration, feeding [`derive_confidence`] — see
+    /// `crate::calibrate::AgentScore`. An agent with no entry here (a `None`
+    /// from `.get`) has no resolved track record yet, which
+    /// `AgentScore::trust_multiplier`'s doc explains must read as neutral,
+    /// never as a penalty for being new.
+    pub agent_scores: &'a HashMap<String, crate::calibrate::AgentScore>,
 }
 
 /// The outcome of running a candidate through all four gates.
@@ -137,6 +155,14 @@ pub enum GateDecision {
         failed_gate: &'static str,
         reason: String,
     },
+    /// The observing agent is quarantined (`crate::calibrate`) — held back
+    /// regardless of what the four gates above would otherwise say, and
+    /// deliberately not reported as `Review { failed_gate: ... }`: an
+    /// operator seeing "rejected by the evidence gate" would go looking for
+    /// more evidence, which fixes nothing here. Produces no event (like
+    /// `Review`): the `AgentQuarantined` event already on the log is the
+    /// audit trail for "why," this is just the gate obeying it.
+    Quarantined { agent_id: String },
 }
 
 /// Gate 1 (coarse): can this claim type structurally ever promote right now,
@@ -297,14 +323,34 @@ fn independent_threshold(claim_type: ClaimType) -> u32 {
     }
 }
 
-/// A simple, documented-as-a-placeholder confidence score: it climbs with
-/// independent corroboration and never claims certainty. `docs/memory.md`
-/// describes the real calibration path (hypothesis -> outcome -> a resolver that
-/// scores an agent's track record); that resolver is future work this wave does
-/// not implement. This formula only has to be monotonic in `independent_count`
-/// and bounded, which is all the gate's own logic depends on.
-fn derive_confidence(independent_count: u32) -> f64 {
-    (0.5 + 0.15 * independent_count as f64).min(0.95)
+/// Confidence for a newly-promoted claim: a structural component from
+/// independent corroboration (unchanged from before calibration existed —
+/// still monotonic in `independent_count` and bounded, which is all the rest
+/// of this module depends on it for), scaled by how much to trust *this
+/// observing agent's* assertions in general — see
+/// `crate::calibrate::AgentScore::trust_multiplier`.
+///
+/// **This is the whole point of docs/memory.md's "Confidence is derived, not
+/// claimed."** `calibration` is `None` for an agent with no resolved
+/// hypotheses yet, which must multiply by `1.0` (neutral, see
+/// `trust_multiplier`'s own doc) — a brand-new agent is not penalized for
+/// lacking a track record, but a *proven-unreliable* one (a real, non-empty
+/// history of resolving wrong) does get discounted here, and a
+/// proven-reliable one gets a boost. Note there is no self-reported
+/// confidence anywhere on [`ProposedClaim`](crate::claims::ProposedClaim) for
+/// this to "fall back to" in the first place — the schema simply does not
+/// carry one, which is itself the design: an agent has no channel to assert
+/// "trust me" directly, only a channel to *earn* trust via
+/// `crate::calibrate::resolve`.
+fn derive_confidence(
+    independent_count: u32,
+    calibration: Option<&crate::calibrate::AgentScore>,
+) -> f64 {
+    let structural = (0.5 + 0.15 * independent_count as f64).min(0.95);
+    let trust = calibration
+        .map(crate::calibrate::AgentScore::trust_multiplier)
+        .unwrap_or(1.0);
+    (structural * trust).clamp(0.05, 0.95)
 }
 
 /// Run all four gates over one candidate. `excerpt_resolves` is a closure rather
@@ -315,6 +361,14 @@ pub fn run_gate(
     ctx: &GateContext,
     excerpt_resolves: impl Fn(&Evidence) -> bool,
 ) -> GateDecision {
+    // The kill switch, checked first because it is not one of the four gates
+    // below (docs/memory.md) — a quarantined agent's candidate is held
+    // regardless of how well it would otherwise score.
+    if ctx.quarantined_agents.contains(&candidate.observed_by) {
+        return GateDecision::Quarantined {
+            agent_id: candidate.observed_by.clone(),
+        };
+    }
     if let Err(reason) = evidence_precheck(candidate, ctx.human_approved) {
         return GateDecision::Review {
             failed_gate: "evidence",
@@ -347,7 +401,10 @@ pub fn run_gate(
     }
     GateDecision::Promote {
         independent_count,
-        confidence: derive_confidence(independent_count),
+        confidence: derive_confidence(
+            independent_count,
+            ctx.agent_scores.get(&candidate.observed_by),
+        ),
     }
 }
 
@@ -391,6 +448,11 @@ pub fn events_for_decision(
             },
         ],
         GateDecision::Review { .. } => Vec::new(),
+        // Same reasoning as `Review`: the `AgentQuarantined` event already
+        // says why, and this candidate stays `candidate` until either it is
+        // un-quarantined and re-evaluated, or a human intervenes — no fifth
+        // status to invent here either.
+        GateDecision::Quarantined { .. } => Vec::new(),
     }
 }
 
@@ -400,6 +462,47 @@ pub struct GateRunSummary {
     pub promoted: usize,
     pub contested_pairs: usize,
     pub sent_to_review: usize,
+    /// Candidates held by the quarantine kill switch this run — see
+    /// `crate::calibrate`. Counted separately from `sent_to_review` so an
+    /// operator reading this summary can tell "needs more evidence" apart
+    /// from "this agent is quarantined, more evidence won't help."
+    pub blocked_by_quarantine: usize,
+    /// Already-`Promoted` claims demoted to `contested` this run because
+    /// their observing agent is quarantined — the other real effect of the
+    /// kill switch docs/memory.md promises ("its already-promoted claims
+    /// move to contested"), applied every run (not only the run in which
+    /// `AgentQuarantined` was written) so it is a standing invariant, not a
+    /// one-time side effect that a differently-ordered maintenance run could
+    /// miss.
+    pub demoted_by_quarantine: usize,
+}
+
+/// Proof that the caller holds `lease_maintenance` before it may touch
+/// single-writer state — `claims/fleet/` here, and `crate::calibrate`'s own
+/// quarantine/calibration events for the identical reason. Pulled out to one
+/// place so [`run`] and every entry point in `crate::calibrate` check the
+/// *same* thing the *same* way, rather than each reimplementing (and risking
+/// drifting from) this exact comparison — see AGENTS.md on why a duplicated
+/// resolver is a standing risk in this codebase, not a style nit.
+/// `caller` names the failing function in the error so a mismatched-lease bug
+/// report doesn't require guessing which of several call sites tripped it.
+pub(crate) fn require_maintenance_lease(
+    lease: &ctxlake_store::lease::LeaseHandle,
+    caller: &str,
+) -> Result<(), StoreError> {
+    let expected_key = ctxlake_store::layout::lease_maintenance();
+    if lease.key != expected_key {
+        // A `LeaseHandle` for some other key proves nothing about who else may be
+        // touching `claims/fleet/` right now — accepting it would make the type
+        // requirement above theater. This is a caller bug (wrong lease threaded
+        // through), not a race, so it fails loudly rather than silently trusting
+        // the wrong proof.
+        return Err(StoreError::Config(format!(
+            "{caller} requires a LeaseHandle for {expected_key} (lease_maintenance), got one for {}",
+            lease.key
+        )));
+    }
+    Ok(())
 }
 
 /// Fold every event, run the gate over every still-`candidate` claim, append the
@@ -421,19 +524,14 @@ pub async fn run(
     injected_context_by_session: &HashMap<String, std::collections::HashSet<String>>,
     excerpt_resolves: impl Fn(&Evidence) -> bool,
 ) -> Result<GateRunSummary, StoreError> {
-    let expected_key = ctxlake_store::layout::lease_maintenance();
-    if lease.key != expected_key {
-        // A `LeaseHandle` for some other key proves nothing about who else may be
-        // touching `claims/fleet/` right now — accepting it would make the type
-        // requirement above theater. This is a caller bug (wrong lease threaded
-        // through), not a race, so it fails loudly rather than silently trusting
-        // the wrong proof.
-        return Err(StoreError::Config(format!(
-            "gate::run requires a LeaseHandle for {expected_key} (lease_maintenance), got one for {}",
-            lease.key
-        )));
-    }
+    require_maintenance_lease(lease, "gate::run")?;
     let events = claims::list_events(store).await?;
+    // Both folds read the exact same already-fetched `events` — no second
+    // `list_events` round-trip just to learn who is quarantined or how an
+    // agent has calibrated, and no risk of the two views disagreeing about
+    // which events exist.
+    let quarantined_agents = crate::calibrate::fold_quarantine(events.iter());
+    let agent_scores = crate::calibrate::fold_scores(events.iter());
     let folded = claims::fold(events.iter());
     let mut promoted: Vec<ClaimState> = folded
         .values()
@@ -442,6 +540,49 @@ pub async fn run(
         .collect();
 
     let mut summary = GateRunSummary::default();
+
+    // The kill switch's other real effect: an already-`Promoted` claim whose
+    // observing agent is quarantined moves to `contested` — every run, not
+    // only the run right after `AgentQuarantined` was written, so this stays
+    // a standing invariant of "no promoted claim from a quarantined agent"
+    // rather than a one-time reaction. Contested here (never silently
+    // retired or deleted): the demotion is the record of the failure, and a
+    // human can still find and review it, same as any other contested claim.
+    let to_demote: Vec<ClaimState> = promoted
+        .iter()
+        .filter(|s| quarantined_agents.contains(&s.observed_by))
+        .cloned()
+        .collect();
+    for mut state in to_demote {
+        let ulid = ctxlake_core::envelope::next_event_id();
+        let ev = ClaimEvent::Contested {
+            claim_id: state.claim_id.clone(),
+            at: ctx_at.to_string(),
+            conflicts_with: None,
+            reason: format!(
+                "observing agent {} is quarantined — promoted claims from a \
+                 quarantined agent move to contested",
+                state.observed_by
+            ),
+        };
+        let path = ctxlake_store::layout::claim_event(
+            &ctx_at[..10.min(ctx_at.len())],
+            &state.observed_by,
+            &ulid,
+        );
+        store
+            .put_opts(
+                &path,
+                object_store::PutPayload::from(serde_json::to_vec(&ev)?),
+                object_store::PutMode::Create.into(),
+            )
+            .await?;
+        state.status = ClaimStatus::Contested;
+        claims::publish_fleet_state(store, &state).await?;
+        summary.demoted_by_quarantine += 1;
+    }
+    promoted.retain(|s| !quarantined_agents.contains(&s.observed_by));
+
     // Candidates only — already-decided claims (promoted/contested/retired) have
     // nothing left for this gate to do to them directly, though a *new*
     // candidate can still contest an already-promoted one (handled inside
@@ -459,6 +600,8 @@ pub async fn run(
             session_windows,
             injected_context_by_session,
             human_approved: false,
+            quarantined_agents: &quarantined_agents,
+            agent_scores: &agent_scores,
         };
         let decision = run_gate(candidate, &gctx, &excerpt_resolves);
         let new_events = events_for_decision(&candidate.claim_id, ctx_at, &decision);
@@ -530,6 +673,9 @@ pub async fn run(
             }
             GateDecision::Review { .. } => {
                 summary.sent_to_review += 1;
+            }
+            GateDecision::Quarantined { .. } => {
+                summary.blocked_by_quarantine += 1;
             }
         }
     }
@@ -605,8 +751,22 @@ mod tests {
             independent_count: 0,
             confidence: 0.0,
             embedding: Some(vec![1.0; EMBEDDING_DIM]),
+            resolves_at: None,
         }
     }
+
+    /// `'static`, so `&EMPTY_QUARANTINE`/`&EMPTY_AGENT_SCORES` satisfy
+    /// `GateContext<'a>` for any `'a` — every pre-calibration test in this
+    /// module can keep calling `default_ctx` with its original four
+    /// arguments unchanged, rather than every call site needing to also
+    /// thread through two more temporaries it does not care about. Tests
+    /// that DO care (quarantine, calibration) build their own real
+    /// `HashSet`/`HashMap` and construct `GateContext` directly instead of
+    /// going through this helper.
+    static EMPTY_QUARANTINE: std::sync::LazyLock<StdHashSet<String>> =
+        std::sync::LazyLock::new(StdHashSet::new);
+    static EMPTY_AGENT_SCORES: std::sync::LazyLock<HashMap<String, crate::calibrate::AgentScore>> =
+        std::sync::LazyLock::new(HashMap::new);
 
     fn default_ctx<'a>(
         promoted: &'a [ClaimState],
@@ -620,6 +780,8 @@ mod tests {
             session_windows: windows,
             injected_context_by_session: injected,
             human_approved: false,
+            quarantined_agents: &EMPTY_QUARANTINE,
+            agent_scores: &EMPTY_AGENT_SCORES,
         }
     }
 
@@ -790,6 +952,97 @@ mod tests {
         ));
     }
 
+    // ---- calibration: derived confidence, exercised through the REAL
+    //      derive_confidence (via run_gate), not a reimplementation of its
+    //      formula. This is the test `crate::calibrate`'s own
+    //      `derived_confidence_differs_for_a_well_calibrated_vs_poorly_calibrated_agent`
+    //      doc points to as the one that would catch a regression in the
+    //      actual function — see that test's own doc for why it cannot, by
+    //      itself, prove `derive_confidence` isn't silently ignoring
+    //      calibration. ----
+
+    #[test]
+    fn structurally_identical_candidates_get_different_confidence_from_different_agent_calibration()
+    {
+        // Two candidates, same claim type, same independent_count (1 evidence
+        // session each, `environment`'s threshold) — the ONLY thing that
+        // differs between them is which agent observed it and that agent's
+        // calibration record. A gate that silently fell back to a fixed
+        // formula (or to a self-reported number, if one existed) would
+        // produce identical confidence for both; this test fails if it does.
+        let good_score = crate::calibrate::AgentScore {
+            agent_id: "cc-good".into(),
+            resolved_count: 40,
+            correct_count: 38,
+            incorrect_count: 2,
+            expired_count: 0,
+            brier_score: 2.0 / 40.0,
+            low_sample: false,
+        };
+        let bad_score = crate::calibrate::AgentScore {
+            agent_id: "cc-bad".into(),
+            resolved_count: 40,
+            correct_count: 4,
+            incorrect_count: 36,
+            expired_count: 0,
+            brier_score: 36.0 / 40.0,
+            low_sample: false,
+        };
+        let mut agent_scores: HashMap<String, crate::calibrate::AgentScore> = HashMap::new();
+        agent_scores.insert("cc-good".to_string(), good_score);
+        agent_scores.insert("cc-bad".to_string(), bad_score);
+
+        let known_agents = StdHashSet::from([
+            "cc-good".to_string(),
+            "cc-bad".to_string(),
+            "cc-neutral".to_string(),
+        ]);
+        let windows = windows_for(&["s1"]);
+        let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
+        let promoted = Vec::new();
+
+        let run_for =
+            |agent: &str, scores: &HashMap<String, crate::calibrate::AgentScore>| -> f64 {
+                let mut c = candidate(ClaimType::Environment, "staging", "SSH on 2222", &["s1"]);
+                c.observed_by = agent.to_string();
+                c.embedding = None;
+                let ctx = GateContext {
+                    promoted: &promoted,
+                    known_agents: &known_agents,
+                    session_windows: &windows,
+                    injected_context_by_session: &injected,
+                    human_approved: false,
+                    quarantined_agents: &EMPTY_QUARANTINE,
+                    agent_scores: scores,
+                };
+                match run_gate(&c, &ctx, always_resolves) {
+                    GateDecision::Promote { confidence, .. } => confidence,
+                    other => panic!("expected a promotion, got {other:?}"),
+                }
+            };
+
+        let neutral_confidence = run_for("cc-neutral", &agent_scores); // no entry -> None -> neutral
+        let good_confidence = run_for("cc-good", &agent_scores);
+        let bad_confidence = run_for("cc-bad", &agent_scores);
+
+        assert!(
+            good_confidence > neutral_confidence,
+            "a well-calibrated agent's REAL derived confidence must exceed the \
+             no-track-record baseline: {good_confidence} vs {neutral_confidence}"
+        );
+        assert!(
+            bad_confidence < neutral_confidence,
+            "a poorly-calibrated agent's REAL derived confidence must fall below \
+             the no-track-record baseline: {bad_confidence} vs {neutral_confidence}"
+        );
+        assert!(
+            good_confidence > bad_confidence,
+            "the gate must not silently fall back to a fixed or self-reported \
+             confidence regardless of the observing agent's calibration: \
+             good={good_confidence} bad={bad_confidence}"
+        );
+    }
+
     // ---- hypothesis never promotes ----
 
     #[test]
@@ -860,6 +1113,7 @@ mod tests {
             independent_count: 2,
             confidence: 0.8,
             embedding: Some(vec![1.0; EMBEDDING_DIM]),
+            resolves_at: None,
         };
         let mut new_candidate = candidate(
             ClaimType::Convention,
@@ -885,7 +1139,8 @@ mod tests {
         let events =
             events_for_decision(&new_candidate.claim_id, "2026-09-10T00:00:00Z", &decision);
         assert_eq!(events.len(), 2, "both sides get a Contested event");
-        let ids: std::collections::HashSet<&str> = events.iter().map(|e| e.claim_id()).collect();
+        let ids: std::collections::HashSet<&str> =
+            events.iter().filter_map(|e| e.claim_id()).collect();
         assert!(ids.contains(new_candidate.claim_id.as_str()));
         assert!(ids.contains("old-1"));
         for ev in &events {
@@ -911,6 +1166,7 @@ mod tests {
             independent_count: 2,
             confidence: 0.8,
             embedding: Some(vec![1.0; EMBEDDING_DIM]),
+            resolves_at: None,
         };
         let mut new_candidate = candidate(
             ClaimType::Convention,
@@ -1005,6 +1261,7 @@ mod tests {
             observed_at: "2026-09-09T12:00:00Z".into(),
             evidence: vec![evidence("s1", "m1")],
             embedding: None,
+            resolves_at: None,
         };
         claims::append_proposed(&store, "2026-09-09", &p1)
             .await
@@ -1046,6 +1303,7 @@ mod tests {
             observed_at: "2026-09-09T12:00:00Z".into(),
             evidence: vec![evidence("s1", "m1")],
             embedding: None,
+            resolves_at: None,
         };
         claims::append_proposed(&store, "2026-09-09", &p1)
             .await

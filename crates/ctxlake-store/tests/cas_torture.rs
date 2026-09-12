@@ -197,85 +197,37 @@ async fn cas_torture_minio() {
     run_torture(store, object_store_clock, 6, 5).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dies_mid_hold_only_one_contender_steals() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = local_store(dir.path());
-    let clock = SystemClock;
-    let key = Path::from("live/leases/dies-mid-hold.json");
-    lease::provision(store.as_ref(), &key).await.unwrap();
+/// A clock the test advances by hand.
+///
+/// `dies_mid_hold_only_one_contender_steals` used a real clock with a 50ms TTL and a
+/// 10ms sleep, then asserted no contender had stolen yet. That asserts something about
+/// the scheduler, not about the lease: under load — CI, a parallel cargo build — 10ms of
+/// sleep routinely takes longer than 50ms of wall time, the lease legitimately expires,
+/// and a correct steal gets reported as a failure. It failed about 1 run in 20 locally,
+/// then failed in CI.
+///
+/// Driving the clock makes both halves exact. The lease's expiry logic is what is under
+/// test; how promptly a thread wakes up is not.
+#[derive(Debug)]
+struct ManualClock(std::sync::Mutex<std::time::SystemTime>);
 
-    let AcquireOutcome::Acquired(handle) = lease::acquire(
-        store.as_ref(),
-        &clock,
-        &key,
-        "the-doomed-holder",
-        None,
-        Duration::from_millis(50),
-    )
-    .await
-    .unwrap() else {
-        panic!("expected the first acquire to succeed");
-    };
-    drop(handle); // no release() call — simulates a process that dies mid-hold.
-
-    // Contenders race the moment the TTL is up; none should win before it, exactly
-    // one should win after.
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let too_early: Vec<_> = futures::future::join_all((0..4).map(|i| {
-        let store = store.clone();
-        let key = key.clone();
-        async move {
-            lease::acquire(
-                store.as_ref(),
-                &SystemClock,
-                &key,
-                &format!("early-{i}"),
-                None,
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap()
-        }
-    }))
-    .await;
-    assert!(
-        too_early
-            .iter()
-            .all(|o| matches!(o, AcquireOutcome::NotAcquired { .. })),
-        "no contender may steal before the TTL elapses"
-    );
-
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let results: Vec<_> = futures::future::join_all((0..8).map(|i| {
-        let store = store.clone();
-        let key = key.clone();
-        async move {
-            lease::acquire(
-                store.as_ref(),
-                &SystemClock,
-                &key,
-                &format!("late-{i}"),
-                None,
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap()
-        }
-    }))
-    .await;
-    let winners = results
-        .iter()
-        .filter(|o| matches!(o, AcquireOutcome::Acquired(_)))
-        .count();
-    assert_eq!(
-        winners, 1,
-        "exactly one contender must steal an expired, unreleased lease"
-    );
+impl ManualClock {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(std::time::SystemTime::now()))
+    }
+    fn advance(&self, d: Duration) {
+        *self.0.lock().unwrap() += d;
+    }
 }
 
-/// A [`Clock`] whose reading is a fixed offset from a shared, real system clock —
-/// used to simulate a process whose wall clock disagrees with everyone else's.
+impl Clock for ManualClock {
+    fn now(&self) -> BoxFuture<'_, Result<std::time::SystemTime, ctxlake_store::StoreError>> {
+        Box::pin(async move { Ok(*self.0.lock().unwrap()) })
+    }
+}
+
+/// A clock offset by a fixed number of seconds from this process's real one, used to
+/// simulate a host whose wall clock disagrees with everyone else's.
 #[derive(Debug)]
 struct SkewedClock(i64);
 
@@ -290,6 +242,81 @@ impl Clock for SkewedClock {
             })
         })
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dies_mid_hold_only_one_contender_steals() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = local_store(dir.path());
+    let clock = ManualClock::new();
+    let key = Path::from("live/leases/dies-mid-hold.json");
+    lease::provision(store.as_ref(), &key).await.unwrap();
+
+    let ttl = Duration::from_secs(60);
+    let AcquireOutcome::Acquired(handle) =
+        lease::acquire(store.as_ref(), &clock, &key, "the-doomed-holder", None, ttl)
+            .await
+            .unwrap()
+    else {
+        panic!("expected the first acquire to succeed");
+    };
+    drop(handle); // no release() — a process that died still holding the lease.
+
+    // Strictly inside the TTL: nobody may steal, however many contend.
+    clock.advance(Duration::from_secs(30));
+    let too_early: Vec<_> = futures::future::join_all((0..4).map(|i| {
+        let store = store.clone();
+        let key = key.clone();
+        let clock = &clock;
+        async move {
+            lease::acquire(
+                store.as_ref(),
+                clock,
+                &key,
+                &format!("early-{i}"),
+                None,
+                ttl,
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    assert!(
+        too_early
+            .iter()
+            .all(|o| matches!(o, AcquireOutcome::NotAcquired { .. })),
+        "no contender may steal while the dead holder's TTL is still running"
+    );
+
+    // Past it: exactly one steals, and the rest are refused by that one's new lease.
+    clock.advance(ttl + Duration::from_secs(1));
+    let results: Vec<_> = futures::future::join_all((0..8).map(|i| {
+        let store = store.clone();
+        let key = key.clone();
+        let clock = &clock;
+        async move {
+            lease::acquire(
+                store.as_ref(),
+                clock,
+                &key,
+                &format!("contender-{i}"),
+                None,
+                ttl,
+            )
+            .await
+            .unwrap()
+        }
+    }))
+    .await;
+    let winners = results
+        .iter()
+        .filter(|o| matches!(o, AcquireOutcome::Acquired(_)))
+        .count();
+    assert_eq!(
+        winners, 1,
+        "an expired lease must be stolen by exactly one contender, not {winners}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

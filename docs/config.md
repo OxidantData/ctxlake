@@ -70,7 +70,7 @@ different physical hosts merges their roster identity, which is a human-facing
 confusion, not a correctness bug — CAS still prevents lost writes underneath it).
 
 `ctxlake init --agent-id <id>` sets it explicitly. Omitted, `init` derives a default
-from the hostname (`Vamsis-MacBook-Pro.local` becomes `vamsis-macbook-pro-local`) —
+from the hostname (`Alices-MacBook-Pro.local` becomes `alices-macbook-pro-local`) —
 stable across re-running `init` on the same host, though nothing stops two different
 hosts from sharing a hostname and thus this default; name it explicitly in that case.
 

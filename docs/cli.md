@@ -47,7 +47,7 @@ Three things happen, in order, and any failure in the middle leaves nothing behi
 3. **Writing `ctxlake.toml`** — see [config.md](config.md) for the full shape.
 
 `--agent-id` is optional. Omitted, it falls back to a sanitized hostname
-(`Vamsis-MacBook-Pro.local` becomes `vamsis-macbook-pro-local`), which is at least
+(`Alices-MacBook-Pro.local` becomes `alices-macbook-pro-local`), which is at least
 *stable across re-running `init` on the same host* — AGENTS.md's own knob table calls
 agent-id stability "operator-assigned," and a fresh random id every run would defeat
 that on the one axis a default can actually help with.

@@ -39,7 +39,7 @@ fn default_agent_id() -> String {
 }
 
 /// Lowercased, with anything that is not alphanumeric/`-`/`_` collapsed to `-` — a
-/// raw hostname (`Vamsis-MacBook-Pro.local`) is a fine agent id, but the `.` and
+/// raw hostname (`Alices-MacBook-Pro.local`) is a fine agent id, but the `.` and
 /// mixed case are worth normalizing rather than carrying into every roster entry.
 fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -273,8 +273,8 @@ mod tests {
     #[test]
     fn default_agent_id_sanitizes_a_raw_hostname() {
         assert_eq!(
-            sanitize("Vamsis-MacBook-Pro.local"),
-            "vamsis-macbook-pro-local"
+            sanitize("Alices-MacBook-Pro.local"),
+            "alices-macbook-pro-local"
         );
         assert_eq!(sanitize("  weird   spacing  "), "weird-spacing");
     }

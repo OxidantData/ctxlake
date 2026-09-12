@@ -9,9 +9,9 @@
   "model": "default",
   "reason": "completed",
   "session_id": "8655aefa-2dc2-4e6b-9eb7-2972bd921932",
-  "transcript_path": "/home/alice/.cursor/projects/private-tmp-claude-501-Users-vamsi-projects-oxidandata-31ace0a6-1ce6-4039-8ec4-9d18d645c4d8-scratchpad-cursor-probe/agent-transcripts/8655aefa-2dc2-4e6b-9eb7-2972bd921932/8655aefa-2dc2-4e6b-9eb7-2972bd921932.jsonl",
+  "transcript_path": "/home/alice/.cursor/projects/home-alice-project-sessionscratchpad-cursor-probe/agent-transcripts/8655aefa-2dc2-4e6b-9eb7-2972bd921932/8655aefa-2dc2-4e6b-9eb7-2972bd921932.jsonl",
   "user_email": "operator@example.com",
   "workspace_roots": [
-    "/tmp/-Users-vamsi-projects-oxidandata/31ace0a6-1ce6-4039-8ec4-9d18d645c4d8/scratchpad/cursor-probe"
+    "/tmp/cursor-probe"
   ]
 }

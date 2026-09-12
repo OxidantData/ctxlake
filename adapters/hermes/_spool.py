@@ -19,6 +19,26 @@ MAX_SPOOL_FILE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_DIR_BYTES = 512 * 1024 * 1024
 
 
+def _validate_session_id(session_id: str) -> None:
+    """Reject a `session_id` that is not a single safe path segment — mirrors
+    `validate_session_id` in spool.rs.
+
+    `session_id` comes straight from an untrusted Hermes hook payload and is joined
+    into a filesystem path unchecked otherwise, so `"../../pwned"` (or a bare `".."`)
+    escapes the spool root: `<root>/hermes/../../pwned.ndjson` lands two directories
+    above `<root>`, and with the real default root (`~/.ctxlake/spool`) that reaches
+    anywhere the user can write.
+    """
+    if (
+        not session_id
+        or session_id in (".", "..")
+        or "/" in session_id
+        or "\\" in session_id
+        or "\0" in session_id
+    ):
+        raise ValueError(f"unsafe session_id: {session_id!r}")
+
+
 def spool_root() -> Path:
     override = os.environ.get("CTXLAKE_SPOOL_DIR")
     if override:
@@ -37,14 +57,20 @@ def append_event(root: Path, session_id: str, line: str) -> None:
     """Append one line to `hermes/<session_id>.ndjson` under `root`. Best-effort: any
     I/O failure is swallowed here (the caller is a Hermes lifecycle hook, and this
     plugin's contract — see __init__.py — is to never raise into the host process).
+
+    Raises `ValueError` for an unsafe `session_id` rather than swallowing it like an
+    I/O error: `_make_hook`'s wrapper catches and logs it, same as any other capture
+    failure, and a bad id is worth that visibility (see `_validate_session_id`).
     """
+    _validate_session_id(session_id)
     run_dir = root / "hermes"
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return
 
-    if _dir_size(run_dir) >= MAX_RUNTIME_DIR_BYTES:
+    tracked = _read_or_seed_tracked_size(run_dir)
+    if tracked >= MAX_RUNTIME_DIR_BYTES:
         print(
             f"ctxlake (hermes plugin): WARNING spool dir {run_dir} is at or over "
             f"{MAX_RUNTIME_DIR_BYTES} bytes; dropping event rather than filling the disk",
@@ -66,9 +92,11 @@ def append_event(root: Path, session_id: str, line: str) -> None:
             os.close(fd)
     except OSError:
         return
+    _write_tracked_size(run_dir, tracked + len(data))
 
 
 def mark_session_done(root: Path, session_id: str) -> None:
+    _validate_session_id(session_id)
     run_dir = root / "hermes"
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -115,3 +143,35 @@ def _dir_size(dir_path: Path) -> int:
     except OSError:
         return 0
     return total
+
+
+_SIZE_SIDECAR_NAME = ".spool_size"
+
+
+def _read_or_seed_tracked_size(dir_path: Path) -> int:
+    """The runtime directory's tracked size, read from a small sidecar file instead
+    of `_dir_size`'s `scandir` + `stat` of every entry — mirrors
+    `read_or_seed_tracked_size` in spool.rs.
+
+    This plugin runs in-process (no daemon to drain the spool in wave 1 — see
+    `MAX_RUNTIME_DIR_BYTES`), so each session leaves an `.ndjson` and a `.done`
+    behind forever; scanning the whole directory on every single `pre_tool_call`/
+    `post_tool_call` pair scales with a number that only grows. The sidecar is
+    missing on a fresh directory (or one from a build that predates this), so this
+    falls back to a real scan exactly once and persists the result.
+    """
+    sidecar = dir_path / _SIZE_SIDECAR_NAME
+    try:
+        return int(sidecar.read_text().strip())
+    except (OSError, ValueError):
+        pass
+    scanned = _dir_size(dir_path)
+    _write_tracked_size(dir_path, scanned)
+    return scanned
+
+
+def _write_tracked_size(dir_path: Path, size: int) -> None:
+    try:
+        (dir_path / _SIZE_SIDECAR_NAME).write_text(str(size))
+    except OSError:
+        pass

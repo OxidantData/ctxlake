@@ -169,6 +169,98 @@ def test_reading_a_denied_path_withholds_result_but_keeps_the_call(ctx: FakeCtx,
     assert env["tool"]["paths"] == ["/Users/x/.aws/credentials"]
 
 
+def test_writing_a_secret_to_a_denied_path_does_not_leak_via_input(ctx: FakeCtx, tmp_path: Path) -> None:
+    # Regression: the path denylist was applied only to the tool *result*, never to
+    # *args* — so a write to a denylisted path stored the secret verbatim in
+    # `tool.input` while `redaction.status` said "quarantined" (fired only by the
+    # unrelated, secret-free result).
+    secret = "qV3kRt8zLmNp0XyW7bHfJ2sD4gUe6AcZ1oIl5TnB"
+    ctx.handlers["post_tool_call"](
+        session_id="s1",
+        task_id="task-1",
+        tool_call_id="tc-1",
+        tool_name="write_file",
+        args={
+            "file_path": "/Users/dev/.aws/credentials",
+            "content": f"[default]\naws_access_key={secret}",
+        },
+        result="wrote 2 lines",
+        duration_ms=1,
+    )
+    raw = (tmp_path / "spool" / "hermes" / "s1.ndjson").read_text()
+    assert secret not in raw, f"the secret written to a denylisted path leaked into the spool: {raw}"
+    env = spool_lines(tmp_path, "s1")[0]
+    assert env["redaction"]["status"] == "quarantined"
+
+
+def test_session_id_with_path_traversal_is_rejected_and_writes_nothing_outside_root(
+    ctx: FakeCtx, tmp_path: Path
+) -> None:
+    # Regression: `append_event` used to join `session_id` into a path with no
+    # validation, so `<spool_root>/hermes/../../pwned.ndjson` — one level above
+    # `spool_root` — was a real file `on_session_start(session_id="../../pwned")`
+    # could produce.
+    escape_target = tmp_path / "pwned.ndjson"
+    ctx.handlers["on_session_start"](session_id="../../pwned", model="m", platform="cli")
+    assert not escape_target.exists(), f"wrote outside the spool root: {escape_target}"
+    # The plugin must never raise into the host process even so; the failure lands in
+    # the error log instead (same contract as `test_handler_exception_never_propagates`).
+    error_log = (tmp_path / "hook-errors.log").read_text()
+    assert "unsafe session_id" in error_log
+
+
+def test_spool_append_event_rejects_unsafe_session_ids_directly(tmp_path: Path) -> None:
+    from hermes import _spool
+
+    for bad in ("../../pwned", "..", "a/b", "a\\b", ""):
+        with pytest.raises(ValueError):
+            _spool.append_event(tmp_path, bad, "line")
+    assert not any(tmp_path.rglob("*.ndjson")), "no file should have been created"
+
+
+def test_spool_size_check_uses_the_tracked_sidecar_not_a_live_directory_scan(tmp_path: Path) -> None:
+    # Regression: the cap check used to call `_dir_size`, which stats every file in
+    # the runtime directory on every event — an O(files) syscall storm on a path this
+    # plugin runs once per LLM/tool call, with a file count that only grows (wave 1
+    # ships no daemon to drain it). Seed a small tracked size and plant a decoy file
+    # that would blow the cap if anything actually scanned the directory for real
+    # bytes on disk; the append must succeed because it trusts the sidecar.
+    from hermes import _spool
+
+    run_dir = tmp_path / "hermes"
+    run_dir.mkdir(parents=True)
+    (run_dir / "._spool_size_placeholder").write_bytes(b"")  # keep dir non-empty
+    (run_dir / ".spool_size").write_text("10")
+    (run_dir / "decoy.ndjson").write_bytes(b"x" * (_spool.MAX_RUNTIME_DIR_BYTES + 1))
+
+    _spool.append_event(tmp_path, "sess-1", "line")
+
+    assert (run_dir / "sess-1.ndjson").exists(), (
+        "the tracked sidecar size (10 bytes), not a scan of the decoy file, must "
+        "decide whether the cap is exceeded"
+    )
+
+
+def test_spool_size_tracking_self_heals_from_a_missing_sidecar(tmp_path: Path) -> None:
+    from hermes import _spool
+
+    run_dir = tmp_path / "hermes"
+    run_dir.mkdir(parents=True)
+    (run_dir / "huge.ndjson").write_bytes(b"x" * (_spool.MAX_RUNTIME_DIR_BYTES + 1))
+
+    _spool.append_event(tmp_path, "new-session", "dropped")
+
+    assert not (run_dir / "new-session.ndjson").exists()
+    assert (run_dir / ".spool_size").exists(), "the scan's result should be persisted"
+
+
+def test_spool_ordinary_session_ids_still_work(tmp_path: Path) -> None:
+    from hermes import _spool
+
+    _spool.append_event(tmp_path, "8f3e-a1.2", "line")
+    assert (tmp_path / "hermes" / "8f3e-a1.2.ndjson").read_text() == "line\n"
+
+
 def test_handler_exception_never_propagates(ctx: FakeCtx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A Hermes plugin runs inside the host agent's process; a bug in capture must
     degrade to "this event wasn't captured", never to a broken turn."""
@@ -227,6 +319,20 @@ def test_ulid_is_26_crockford_base32_characters() -> None:
     assert len(u) == 26
     assert all(c in "0123456789ABCDEFGHJKMNPQRSTVWXYZ" for c in u)
     assert _ulid.new_ulid() != u, "two calls must not collide in practice"
+
+
+def test_ulid_is_monotonic_within_a_process() -> None:
+    # Regression: `new_ulid()` drew fresh random bits on every call, so two ids
+    # minted in the same millisecond sorted arbitrarily instead of in call order.
+    # Hermes runs in-process and mints ids back-to-back (a `pre_tool_call` immediately
+    # followed by its `post_tool_call`), which lands in the same millisecond often
+    # enough that this was not a hypothetical: 1000 successive calls produced hundreds
+    # of out-of-order adjacent pairs before this fix.
+    from hermes import _ulid
+
+    ids = [_ulid.new_ulid() for _ in range(1000)]
+    out_of_order = [(a, b) for a, b in zip(ids, ids[1:]) if not a < b]
+    assert not out_of_order, f"{len(out_of_order)} adjacent pair(s) out of order: {out_of_order[:3]}"
 
 
 def test_content_hash_matches_the_rust_side_format() -> None:

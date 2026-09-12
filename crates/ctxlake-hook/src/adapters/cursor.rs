@@ -203,7 +203,12 @@ fn build_tool_call(
 
     let input = input.map(|s| truncate(&s));
     let input_hash = hash::content_hash(input.as_deref().unwrap_or(""));
-    let input = scrub_field(redactor, acc, input, false);
+    // See claude_code.rs's `build_tool_call` for why the denylist and entropy pass
+    // both have to cover `input`, not only `result`: `afterFileEdit`'s `edits` (and
+    // any other write-shaped payload) is where a secret written to a denied path
+    // actually lands, and it is arbitrary file content rather than prose.
+    let input = withhold_if_denied_path(redactor, acc, path.as_deref(), input);
+    let input = scrub_field(redactor, acc, input, true);
 
     let result =
         withhold_if_denied_path(redactor, acc, path.as_deref(), result.map(|s| truncate(&s)));
@@ -344,6 +349,31 @@ mod tests {
         .unwrap();
         assert_eq!(env.event_type, EventType::Assistant);
         assert_eq!(env.content.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn editing_a_denied_path_does_not_leak_via_input() {
+        // Regression, mirrors claude_code.rs's equivalent test: `afterFileEdit`'s
+        // `edits` field carries the written content directly, and the path denylist
+        // was applied only to `result` (always `None` for this event), so a secret
+        // written into e.g. `.env` sailed through untouched.
+        let secret = "qV3kRt8zLmNp0XyW7bHfJ2sD4gUe6AcZ1oIl5TnB";
+        let env = normalize(
+            "afterFileEdit",
+            &v(serde_json::json!({
+                "session_id": "s1",
+                "file_path": "/Users/dev/.aws/credentials",
+                "edits": format!("[default]\naws_access_key={secret}")
+            })),
+        )
+        .unwrap();
+        let tool = env.tool.unwrap();
+        assert_eq!(env.redaction.status, "quarantined");
+        assert!(
+            !tool.input.as_deref().unwrap().contains(secret),
+            "the secret written to a denylisted path leaked through tool.input: {:?}",
+            tool.input
+        );
     }
 
     #[test]

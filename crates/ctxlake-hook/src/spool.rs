@@ -25,6 +25,18 @@
 //! write, which practically does not happen for local-disk writes at the sizes one
 //! event produces; [`crate::adapters::common::MAX_FIELD_BYTES`] keeps those sizes
 //! small on purpose, as defense in depth rather than a proof.
+//!
+//! ## Ordering is append order, not `event_id`
+//!
+//! `ctxlake-hook` is spawned fresh per event (see `main.rs`): whatever monotonicity
+//! `Envelope::new`'s ULID generation offers is scoped to a single call in a single
+//! process, so it buys nothing across two events from the same session — each is a
+//! different process with its own generator state. For Claude Code and Cursor, the
+//! only ordering this design actually gets is *append order*: the order in which
+//! processes reach [`append_event_at`] for a given session's file, not `event_id`'s
+//! sort order. Hermes is the exception — it runs in-process and mints consecutive ids
+//! from one generator (`adapters/hermes/_ulid.py`), so its ids are meaningfully
+//! ordered on their own.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -45,6 +57,31 @@ fn session_file(root: &Path, runtime: &str, session_id: &str) -> PathBuf {
     root.join(runtime).join(format!("{session_id}.ndjson"))
 }
 
+/// Reject a `session_id` that is not a single safe path segment.
+///
+/// `session_id` comes straight from untrusted hook stdin (and, via `ctxlake import`
+/// in a later wave, from historical transcripts — an even less trustworthy source).
+/// It is joined into a filesystem path unchecked otherwise, so `"../../pwned"` or a
+/// bare `".."` escapes the spool root entirely: `<root>/<runtime>/../../pwned.ndjson`
+/// lands two directories above `<root>`, and with the real default root
+/// (`~/.ctxlake/spool`) that reaches anywhere the user can write. A single `/`, `\`,
+/// or NUL is enough to break out too, so all three are rejected outright rather than
+/// only the two dot-segments.
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty() {
+        return Err("session_id must not be empty".to_string());
+    }
+    if session_id == "." || session_id == ".." {
+        return Err(format!("session_id must not be {session_id:?}"));
+    }
+    if session_id.contains(['/', '\\', '\0']) {
+        return Err(format!(
+            "session_id must be a single path segment, got {session_id:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Append one line (without a trailing newline) to the session's spool file, creating
 /// the runtime directory and file as needed. Returns `Err` only for a genuine I/O
 /// failure the caller should log — callers must still exit 0 either way (AGENTS.md
@@ -56,10 +93,12 @@ pub fn append_event_at(
     session_id: &str,
     line: &str,
 ) -> Result<(), String> {
+    validate_session_id(session_id)?;
     let dir = root.join(runtime);
     fs::create_dir_all(&dir).map_err(|e| format!("create spool dir {}: {e}", dir.display()))?;
 
-    if dir_size(&dir) >= MAX_RUNTIME_DIR_BYTES {
+    let tracked = read_or_seed_tracked_size(&dir);
+    if tracked >= MAX_RUNTIME_DIR_BYTES {
         eprintln!(
             "ctxlake-hook: WARNING spool dir {} is at or over {} bytes; dropping event rather than filling the disk",
             dir.display(),
@@ -71,13 +110,16 @@ pub fn append_event_at(
     let path = session_file(root, runtime, session_id);
     rotate_if_full(&path);
 
+    let bytes = format!("{line}\n");
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|e| format!("open spool file {}: {e}", path.display()))?;
-    f.write_all(format!("{line}\n").as_bytes())
-        .map_err(|e| format!("append to {}: {e}", path.display()))
+    f.write_all(bytes.as_bytes())
+        .map_err(|e| format!("append to {}: {e}", path.display()))?;
+    write_tracked_size(&dir, tracked + bytes.len() as u64);
+    Ok(())
 }
 
 /// Rename a full spool file out of the way so the next append starts a fresh one.
@@ -104,10 +146,10 @@ fn rotate_if_full(path: &Path) {
     let _ = fs::rename(path, rotated);
 }
 
-/// Sum of file sizes directly inside `dir` (not recursive). Checking only the one
-/// runtime directory — not the whole spool tree — keeps this O(sessions currently
-/// active for that runtime) rather than O(every runtime's entire history), which
-/// matters because it runs on every single event.
+/// Sum of file sizes directly inside `dir` (not recursive). This is the expensive,
+/// O(files in dir) fallback used only to seed [`read_or_seed_tracked_size`]'s
+/// sidecar once — see that function's docs for why the steady-state cap check must
+/// not call this on every event.
 fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0; // directory doesn't exist yet — nothing counted, nothing to drop.
@@ -120,10 +162,51 @@ fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Name of the sidecar file that tracks a runtime directory's approximate total size.
+const SIZE_SIDECAR_NAME: &str = ".spool_size";
+
+/// The runtime directory's tracked size, read from a small sidecar file instead of
+/// stat-ing every entry in the directory.
+///
+/// `ctxlake-hook` is a fresh process per event (`main.rs`'s docs) — there is no
+/// long-lived process to cache a directory scan in, so without this sidecar,
+/// [`append_event_at`] paid for a full `read_dir` + `stat` of every file in the
+/// runtime directory on *every single tool call*. That is fine at a handful of
+/// files and a real cost once a laptop has run this for a few weeks: each session
+/// leaves an `.ndjson` and a `.done` behind forever (wave 1 ships no daemon to drain
+/// them — see `MAX_RUNTIME_DIR_BYTES`'s docs), so the file count only grows, and the
+/// scan's cost grows with it on a path budgeted at 5ms p99.
+///
+/// The sidecar is missing on a fresh directory (or one written by a build that
+/// predates this file), so this falls back to a real scan exactly once and persists
+/// the result — every call after that is a few bytes' read. Concurrent writers can
+/// race on the read-here / write-in-`write_tracked_size` round trip and under- or
+/// over-count by a line or two; that is acceptable for a cap that is already
+/// documented as "arbitrary and generous" advisory disk-fill protection, not for
+/// anything that needs to be exact.
+fn read_or_seed_tracked_size(dir: &Path) -> u64 {
+    if let Some(cached) = fs::read_to_string(dir.join(SIZE_SIDECAR_NAME))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return cached;
+    }
+    let scanned = dir_size(dir);
+    write_tracked_size(dir, scanned);
+    scanned
+}
+
+/// Persist the runtime directory's tracked size. Best-effort: a failed write just
+/// means the next call falls back to a real scan again, which is correct, if slow.
+fn write_tracked_size(dir: &Path, size: u64) {
+    let _ = fs::write(dir.join(SIZE_SIDECAR_NAME), size.to_string());
+}
+
 /// Write the `.done` sentinel marking a session's spool file as finished. The daemon
 /// (a later wave) uses this to know a session's ndjson file is safe to ship without
 /// racing a writer that might still append to it.
 pub fn mark_session_done_at(root: &Path, runtime: &str, session_id: &str) -> Result<(), String> {
+    validate_session_id(session_id)?;
     let dir = root.join(runtime);
     fs::create_dir_all(&dir).map_err(|e| format!("create spool dir {}: {e}", dir.display()))?;
     let path = dir.join(format!("{session_id}.done"));
@@ -327,6 +410,120 @@ mod tests {
                 "line does not match any writer's output — interleaved write: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn session_id_with_path_traversal_is_rejected_and_writes_nothing_outside_root() {
+        // Regression: `session_file` used to join `session_id` into a path with no
+        // validation at all, so a crafted id walked out of the spool root.
+        let dir = tempfile::tempdir().unwrap();
+        // `<root>/claude_code/../../pwned.ndjson` lands here — one level above `root`.
+        let escape_target = dir.path().parent().unwrap().join("pwned.ndjson");
+        let _ = fs::remove_file(&escape_target);
+
+        let result = append_event_at(dir.path(), "claude_code", "../../pwned", "line");
+
+        assert!(
+            result.is_err(),
+            "a path-traversal session_id must be rejected, not written"
+        );
+        assert!(
+            !escape_target.exists(),
+            "must never write outside the spool root: {}",
+            escape_target.display()
+        );
+        let _ = fs::remove_file(&escape_target); // leave no trace either way
+    }
+
+    #[test]
+    fn session_id_containing_a_slash_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(append_event_at(dir.path(), "claude_code", "a/b", "line").is_err());
+        assert!(!dir.path().join("claude_code").join("a").exists());
+    }
+
+    #[test]
+    fn session_id_of_bare_dot_dot_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(append_event_at(dir.path(), "claude_code", "..", "line").is_err());
+    }
+
+    #[test]
+    fn session_id_containing_nul_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(append_event_at(dir.path(), "claude_code", "a\0b", "line").is_err());
+    }
+
+    #[test]
+    fn mark_session_done_rejects_an_unsafe_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let escape_target = dir.path().parent().unwrap().join("pwned.done");
+        let _ = fs::remove_file(&escape_target);
+
+        let result = mark_session_done_at(dir.path(), "claude_code", "../../pwned");
+
+        assert!(result.is_err());
+        assert!(!escape_target.exists());
+        let _ = fs::remove_file(&escape_target);
+    }
+
+    #[test]
+    fn ordinary_session_ids_with_dots_or_dashes_still_work() {
+        // The validator must reject traversal, not merely "any non-alphanumeric" —
+        // real session ids look like UUIDs or `sess.1234`.
+        let dir = tempfile::tempdir().unwrap();
+        append_event_at(dir.path(), "claude_code", "8f3e-a1.2", "line").unwrap();
+        assert!(session_file(dir.path(), "claude_code", "8f3e-a1.2").exists());
+    }
+
+    #[test]
+    fn size_check_uses_the_tracked_sidecar_not_a_live_directory_scan() {
+        // Regression: the cap check used to call `dir_size`, which stats every file
+        // in the runtime directory on every event — an O(files) syscall storm on a
+        // path budgeted at 5ms p99, and the file count only grows (wave 1 ships no
+        // daemon to drain it). Seed a small tracked size and plant a decoy file that
+        // would blow the cap if anything actually scanned the directory for real
+        // bytes on disk; the append must succeed because it trusts the sidecar.
+        let dir = tempfile::tempdir().unwrap();
+        let rt_dir = dir.path().join("claude_code");
+        fs::create_dir_all(&rt_dir).unwrap();
+        fs::write(rt_dir.join(".spool_size"), "10").unwrap();
+        fs::write(
+            rt_dir.join("decoy.ndjson"),
+            vec![b'x'; MAX_RUNTIME_DIR_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        append_event_at(dir.path(), "claude_code", "sess-1", "line").unwrap();
+
+        assert!(
+            session_file(dir.path(), "claude_code", "sess-1").exists(),
+            "the tracked sidecar size (10 bytes), not a scan of the decoy file, must \
+             decide whether the cap is exceeded"
+        );
+    }
+
+    #[test]
+    fn size_tracking_self_heals_from_a_missing_sidecar() {
+        // No sidecar yet (fresh directory, or an upgrade from a build that predates
+        // it): the real over-cap file must still be caught by falling back to a scan
+        // once, exactly like `over_cap_runtime_dir_drops_events_instead_of_growing_further`.
+        let dir = tempfile::tempdir().unwrap();
+        let rt_dir = dir.path().join("claude_code");
+        fs::create_dir_all(&rt_dir).unwrap();
+        fs::write(
+            rt_dir.join("huge.ndjson"),
+            vec![b'x'; MAX_RUNTIME_DIR_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        append_event_at(dir.path(), "claude_code", "new-session", "dropped").unwrap();
+
+        assert!(!session_file(dir.path(), "claude_code", "new-session").exists());
+        assert!(
+            rt_dir.join(".spool_size").exists(),
+            "the scan's result should be persisted so the next call is O(1)"
+        );
     }
 
     #[test]

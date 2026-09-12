@@ -109,7 +109,16 @@ fn build_tool_call(
 
     let input = get_stringified(v, "tool_input").map(|s| truncate(&s));
     let input_hash = hash::content_hash(input.as_deref().unwrap_or(""));
-    let input = scrub_field(redactor, acc, input, false);
+    // A `Write`/`Edit` to a denylisted path carries the secret in *input*, not
+    // result — `.aws/credentials` and `.env` are two of the most common places an
+    // agent puts a key. The denylist must cover both directions of a call, or
+    // writing a secret is a silent bypass of AGENTS.md invariant 7 (the status field
+    // would say "quarantined" from the result-side check below while the input still
+    // held the plaintext). Entropy is enabled here too — a write's payload is
+    // arbitrary file content, not prose, so the same heuristic that catches a leaked
+    // key in tool *output* applies to it.
+    let input = withhold_if_denied_path(redactor, acc, file_path.as_deref(), input);
+    let input = scrub_field(redactor, acc, input, true);
 
     let mut tool = ToolCall {
         name,
@@ -275,6 +284,41 @@ mod tests {
             .redaction
             .rules_fired
             .contains(&"aws_access_key_id".to_string()));
+    }
+
+    #[test]
+    fn writing_a_secret_to_a_denied_path_does_not_leak_via_input() {
+        // Regression for the finding: the path denylist was applied only to *results*
+        // (a read of `.aws/credentials`), never to *input* — so a `Write` to that same
+        // path stored the secret verbatim in `tool.input` while `redaction.status` said
+        // "quarantined" (fired only by the unrelated, secret-free `tool_result`). A
+        // reader trusting that status to mean "the value was withheld" would render the
+        // key straight out of bronze.
+        let secret = "qV3kRt8zLmNp0XyW7bHfJ2sD4gUe6AcZ1oIl5TnB";
+        let env = normalize(
+            "PostToolUse",
+            &v(serde_json::json!({
+                "session_id": "w1",
+                "tool_use_id": "tu-1",
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": "/Users/dev/.aws/credentials",
+                    "content": format!("[default]\naws_access_key={secret}")
+                },
+                "tool_result": "File written successfully."
+            })),
+        )
+        .unwrap();
+        let tool = env.tool.unwrap();
+        assert_eq!(
+            env.redaction.status, "quarantined",
+            "the path denylist should still fire"
+        );
+        assert!(
+            !tool.input.as_deref().unwrap().contains(secret),
+            "the secret written to a denylisted path leaked through tool.input: {:?}",
+            tool.input
+        );
     }
 
     #[test]

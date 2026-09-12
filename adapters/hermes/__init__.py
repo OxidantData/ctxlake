@@ -235,12 +235,21 @@ def _build_envelope(event_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
 def _build_tool(acc: _RedactionAcc, name: str, args: Any, result: Any, duration_ms: Any) -> dict[str, Any]:
     input_text = _to_json_text(args)
     input_hash = _redact.content_hash(input_text or "")
-    input_text = _scrub(acc, input_text, False)
+    path = _extract_path(args)
+    # A write to a denylisted path (`.aws/credentials`, `.env`) carries the secret in
+    # *args*, not the result — mirrors the fix in adapters::claude_code::build_tool_call
+    # on the Rust side. Applying the denylist and the entropy pass to result only left
+    # a write as a silent bypass of AGENTS.md invariant 7: `redaction.status` could say
+    # "quarantined" (from the result-side check below) while the actual secret sat in
+    # `tool.input` untouched.
+    input_text, input_denied = _spool_withhold(path, input_text)
+    if input_denied:
+        acc.record_denied_path()
+    input_text = _scrub(acc, input_text, True)
 
     result_text = _to_json_text(result)
-    path = _extract_path(args)
-    result_text, denied = _spool_withhold(path, result_text)
-    if denied:
+    result_text, result_denied = _spool_withhold(path, result_text)
+    if result_denied:
         acc.record_denied_path()
     result_text = _scrub(acc, result_text, True)
 

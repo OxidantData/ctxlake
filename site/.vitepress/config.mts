@@ -13,7 +13,10 @@ export default defineConfig({
     'Zero-compute context lake for agent fleets. Keeps Claude Code, Cursor and Hermes agents in sync through object storage alone.',
   srcDir: '../docs',
   outDir: './.vitepress/dist',
-  cleanUrls: true,
+  // Extension-ful URLs (/getting-started.html). cleanUrls would emit /getting-started,
+  // which a plain S3 origin cannot resolve without a CloudFront Function to append
+  // .html — prettier links are not worth an edge function in the serving path.
+  cleanUrls: false,
   lastUpdated: true,
 
   // Dark-first, matching oxidantdata.com. Readers can still switch.

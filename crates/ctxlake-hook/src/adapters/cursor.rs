@@ -90,7 +90,9 @@ pub fn normalize(event: &str, v: &Value) -> Result<Envelope, String> {
         crate::clock::now_rfc3339(),
     );
     env.host_id = crate::hostinfo::host_id();
-    env.cwd = get_str(v, "cwd").map(truncate);
+    env.cwd = cursor_cwd(v).map(|s| truncate(&s));
+    // Free in every payload, and the thing you want first when a wire contract moves.
+    env.runtime_version = get_str(v, "cursor_version").map(str::to_string);
 
     match event {
         "beforeSubmitPrompt" => {
@@ -133,6 +135,74 @@ pub fn normalize(event: &str, v: &Value) -> Result<Envelope, String> {
 
 /// Per-event (name, raw input field, raw result field, path-if-any) before
 /// truncation/redaction/hashing, which is identical across events and lives here once.
+/// Cursor's working directory.
+///
+/// The payload has a `cwd` key, but a live capture showed it arriving empty while the
+/// real path sat in `workspace_roots[0]`. Reading only `cwd` therefore produced events
+/// with no working directory at all, and so no repo attribution.
+fn cursor_cwd(v: &Value) -> Option<String> {
+    if let Some(cwd) = get_str(v, "cwd").filter(|s| !s.trim().is_empty()) {
+        return Some(cwd.to_string());
+    }
+    v.get("workspace_roots")?
+        .as_array()?
+        .iter()
+        .find_map(Value::as_str)
+        .map(str::to_string)
+}
+
+/// `tool_output`, decoded.
+///
+/// Cursor DOUBLE-ENCODES this: the value is a JSON *string* whose contents are an
+/// object — `"{\"output\": \"...\", \"exitCode\": 0}"`. A live capture is the only
+/// way this surfaces; reading it as a plain string yields the wrapper, and matching it
+/// as an object never matches. Both shapes are accepted here because only one of them
+/// is documented and neither is guaranteed to stay.
+fn tool_output_obj(v: &Value) -> Option<Value> {
+    match v.get("tool_output")? {
+        Value::Object(o) => Some(Value::Object(o.clone())),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(Value::is_object),
+        _ => None,
+    }
+}
+
+/// The human-readable text of a tool's output, unwrapped from the envelope above.
+fn tool_output_text(v: &Value) -> Option<String> {
+    if let Some(obj) = tool_output_obj(v) {
+        return match obj.get("output") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(other) => Some(other.to_string()),
+            // Shape changed on us: keep the payload rather than silently dropping it.
+            None => Some(obj.to_string()),
+        };
+    }
+    get_stringified(v, "tool_output")
+}
+
+/// The tool's exit code, which Cursor nests inside the `tool_output` envelope.
+///
+/// Nothing read this before, so every Cursor tool call recorded `exit_code: None`.
+/// Friction detection ("abandoned after 4 failed `cargo test` runs") is built entirely
+/// on exit codes, so it worked on Claude Code and was silently blind here.
+fn tool_exit_code(v: &Value) -> Option<i32> {
+    tool_output_obj(v)?
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+}
+
+/// Cursor reports durations as a float in milliseconds (`1089.021`).
+///
+/// `Value::as_u64()` returns `None` for any non-integer number, so reading it that way
+/// dropped every real duration. The fixture that covered this used an integer literal,
+/// which is how an invented fixture hides a bug a captured one would have caught.
+fn duration_to_ms(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_f64().filter(|f| *f >= 0.0).map(|f| f.round() as u64))
+}
+
 fn build_tool_call(
     event: &str,
     v: &Value,
@@ -143,8 +213,7 @@ fn build_tool_call(
         "preToolUse" | "postToolUse" | "postToolUseFailure" => (
             get_str(v, "tool_name").unwrap_or("unknown").to_string(),
             get_stringified(v, "tool_input"),
-            get_stringified(v, "tool_output")
-                .or_else(|| get_str(v, "error_message").map(str::to_string)),
+            tool_output_text(v).or_else(|| get_str(v, "error_message").map(str::to_string)),
             v.get("tool_input")
                 .and_then(|ti| ti.get("file_path"))
                 .and_then(Value::as_str)
@@ -224,7 +293,8 @@ fn build_tool_call(
     tool.duration_ms = v
         .get("duration")
         .or_else(|| v.get("duration_ms"))
-        .and_then(Value::as_u64);
+        .and_then(duration_to_ms);
+    tool.exit_code = tool_exit_code(v);
     if let Some(p) = path {
         tool.paths = vec![p];
     }

@@ -1,10 +1,12 @@
 # Cursor — hooks.json v1, event mapping, import fidelity
 
-> **Verification basis:** the adapter is implemented, and payloads were **captured from a
-> real `cursor-agent` run** (see `crates/ctxlake-hook/tests/fixtures/cursor-verified/`).
-> That capture proved four of the originally inferred fields wrong, and **the adapter has
-> not yet been corrected** — so Cursor capture is currently incomplete in specific, known
-> ways. They are listed under "Known gaps" below rather than left for you to discover.
+> **Verification basis:** the adapter is implemented and asserted against payloads
+> **captured from a real `cursor-agent` run**
+> (`crates/ctxlake-hook/tests/fixtures/cursor-verified/`). That capture corrected five
+> fields the original implementation had inferred wrongly — all five failing silently —
+> and the corrections are pinned by tests that were each verified to fail against the old
+> behaviour. Of the three runtimes, Cursor's field mapping is the one grounded in observed
+> traffic rather than documentation.
 
 Cursor Agent CLI is near-parity with Claude Code: capture, injection, blocking, and MCP
 are all supported through the same shape of mechanism. "Near," not "full," because two
@@ -103,28 +105,34 @@ real timing, but no reconstructed tool-call detail. Live capture going forward, 
 the hook mapping above, has no such gap — this limitation is specific to backfilling
 history that already existed before `ctxlake install` ran.
 
-## Known gaps
+## What the live capture corrected
 
-A live `cursor-agent` capture (fixtures in
-`crates/ctxlake-hook/tests/fixtures/cursor-verified/`) showed the adapter reading four
-fields that Cursor does not send in the shape assumed. Until it is corrected, Cursor
-capture is lossy in these specific ways:
+The adapter was first written from Cursor's documentation. Five fields were wrong, and
+every one of them failed *silently* — no error, just a field quietly missing from every
+Cursor envelope. They are recorded here because the same class of mistake is easy to
+reintroduce:
 
-| What the adapter reads | What Cursor actually sends | Consequence today |
+| Field | First assumption | What Cursor actually sends |
 |---|---|---|
-| `cwd` | present but often **empty**; the real path is `workspace_roots[0]` | Cursor events land with no working directory, so no repo attribution |
-| `tool_output` as a string | an object: `{"output": "...", "exitCode": N}` | the whole object is stringified into the result field |
-| `duration_ms` | `duration`, a float in milliseconds | duration is always absent |
-| — (no exit-code source) | nested at `tool_output.exitCode` | **every Cursor tool call records no exit code** |
+| working directory | `cwd` | `cwd` exists but arrives **empty**; the path is `workspace_roots[0]` |
+| tool result | `tool_output` is a string | a **JSON-encoded string** containing `{"output": ..., "exitCode": N}` |
+| exit code | not read at all | nested inside that decoded object |
+| duration | `duration_ms`, integer | `duration`, a **float** in milliseconds |
+| client version | not read at all | `cursor_version` |
 
-The last row is the one that matters. Friction detection — "abandoned after 4 failed
-`cargo test` runs" — is built entirely on exit codes, so it currently works on Claude Code
-and is silently blind on Cursor. That asymmetry is exactly the kind of thing a capability
-table would otherwise hide behind a row of ticks.
+The exit code is the one that mattered. Friction detection — "abandoned after 4 failed
+`cargo test` runs" — is built entirely on exit codes, so while this was wrong that signal
+worked on Claude Code and was blind on Cursor, with nothing anywhere to say so.
 
-One further field is deliberately dropped rather than mapped: **every Cursor payload
-carries `user_email`**. Stored verbatim it would publish each operator's address to
-everyone else in the fleet. The envelope has no field for it and should not gain one.
+The duration bug is the instructive one. The field name was read correctly, but the value
+was parsed with an integer accessor, which yields nothing for `1089.021`. The hand-written
+fixture covering it used the integer `42` — so the test passed, and agreed with the bug.
+That is the failure mode captured fixtures exist to prevent.
+
+> **`user_email` is dropped, deliberately.** Every Cursor payload carries the operator's
+> email address. Stored verbatim it would publish that address to everyone else who can
+> read the fleet's lake. The envelope has no field for it and should not gain one; a test
+> asserts it never appears in a serialized envelope.
 
 ## Next steps
 

@@ -268,10 +268,129 @@ def check_runtime_verification_honesty() -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Finding 5: docs/import.md claimed Hermes had no importable history ("Hermes —
+# live capture only", "Plugin captures from install onward"). That was false and
+# it was published. Hermes keeps a full SQLite state database at
+# ~/.hermes/state.db — sessions, every message, structured tool calls, per-session
+# token and cost accounting — so it is a high-fidelity import source, not a
+# live-only runtime.
+#
+# The guard is deliberately two-sided, the same shape as
+# check_runtime_verification_honesty: the page must not carry the old false claim,
+# AND the properties it now promises must still be true of the code. A doc that
+# promises a read-only open while the importer opens read-write is the more
+# dangerous half, because the promise is about someone else's live database.
+# ---------------------------------------------------------------------------
+
+IMPORTER = ROOT / "crates" / "ctxlake-cli" / "src" / "import" / "hermes.rs"
+
+RETIRED_HERMES_IMPORT_CLAIMS = [
+    "## Hermes — live capture only",
+    "Whether a useful on-disk history exists to backfill depends on your Hermes "
+    "installation",
+    "Plugin captures from install onward",
+]
+
+
+def check_hermes_import_fidelity() -> None:
+    import_md = read("import.md")
+    normalized = norm(import_md)
+
+    for phrase in RETIRED_HERMES_IMPORT_CLAIMS:
+        if norm(phrase) in normalized:
+            fail(
+                f"import.md: contains the retired claim {phrase!r} — Hermes keeps a "
+                f"full SQLite state database at ~/.hermes/state.db, so it is an "
+                f"importable source (finding 5)"
+            )
+
+    # The fidelity table is the summary a reader acts on, so it is checked
+    # independently of whatever the prose says.
+    row = re.search(r"^\|\s*Hermes\s*\|([^|]*)\|([^|]*)\|([^|]*)\|", import_md, re.M)
+    if not row:
+        fail("import.md: no Hermes row in the fidelity table — table shape changed")
+    else:
+        source, fidelity, contents = (c.strip() for c in row.groups())
+        if "state.db" not in source:
+            fail(
+                f"import.md: the Hermes fidelity row names its source as {source!r}; "
+                f"the history lives in ~/.hermes/state.db"
+            )
+        if "—" in source or "live capture only" in fidelity.lower():
+            fail(
+                f"import.md: the Hermes fidelity row still reads {fidelity!r} with "
+                f"source {source!r} (finding 5)"
+            )
+        for expected in ("tool call", "cost"):
+            if expected not in contents.lower():
+                fail(
+                    f"import.md: the Hermes fidelity row does not mention {expected!r}; "
+                    f"state.db carries it and the table is what readers act on"
+                )
+
+    if not IMPORTER.exists():
+        # The importer was removed. The page must stop promising it rather than
+        # describing a command nobody can run — the same inversion
+        # check_runtime_verification_honesty applies to the hook.
+        if "ctxlake import --runtime hermes" in import_md:
+            fail(
+                f"import.md: promises `ctxlake import --runtime hermes`, but "
+                f"{IMPORTER.relative_to(ROOT)} does not exist"
+            )
+        return
+
+    # Only the production half: the test module names SQLITE_OPEN_READ_WRITE on
+    # purpose, in the assertion that it is *absent* from the flags.
+    src = IMPORTER.read_text(encoding="utf-8").split("#[cfg(test)]", 1)[0]
+
+    # Promise: the running agent's database is never contended for. This is the
+    # one claim on the page that is about someone else's data, so the doc and the
+    # code are checked against each other rather than the doc being trusted.
+    if "SQLITE_OPEN_READ_ONLY" not in src or "mode=ro&immutable=1" not in src:
+        fail(
+            "import/hermes.rs no longer opens Hermes's database read-only and "
+            "immutable, but import.md and runtimes/hermes.md both promise it does — "
+            "that promise is about a live agent's own state file"
+        )
+    if "SQLITE_OPEN_READ_WRITE" in src or "SQLITE_OPEN_CREATE" in src:
+        fail(
+            "import/hermes.rs asks for a writable or creating open on Hermes's "
+            "database; the docs promise read-only"
+        )
+    for needed, why in (
+        ("read-only", "the read-only open"),
+        ("immutable=1", "the lock-free open"),
+        ("schema_version", "the fail-loud schema gate"),
+        ("compacted = 1", "the compaction marker import recovers"),
+    ):
+        if needed not in import_md:
+            fail(f"import.md: no longer documents {why} ({needed!r})")
+
+    # The asymmetry worth stating: live capture has no compaction hook on Hermes,
+    # import recovers the marker from the database. Both pages have to agree.
+    hermes_page = norm(read("runtimes/hermes.md")).lower()
+    if "ctxlake import" not in hermes_page:
+        fail(
+            "runtimes/hermes.md: does not mention `ctxlake import` at all, while "
+            "import.md documents a working Hermes importer"
+        )
+    if "state.db" not in hermes_page:
+        fail("runtimes/hermes.md: does not name ~/.hermes/state.db as the import source")
+    # The page still has to be honest that the *hook* surface has no compaction
+    # event — import recovering it does not give live capture the marker.
+    if "no `pre_compact` equivalent" not in norm(read("runtimes/hermes.md")):
+        fail(
+            "runtimes/hermes.md: dropped the live-capture compaction gap. Import "
+            "recovering the marker from state.db does not give the hook surface one."
+        )
+
+
 def main() -> int:
     check_scaling_arithmetic()
     check_lease_bootstrap_honesty()
     check_runtime_verification_honesty()
+    check_hermes_import_fidelity()
 
     if failures:
         print(f"FAIL — {len(failures)} regression check(s) failed:\n")

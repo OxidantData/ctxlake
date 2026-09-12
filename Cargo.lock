@@ -691,6 +691,7 @@ dependencies = [
  "json",
  "object_store",
  "percent-encoding",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

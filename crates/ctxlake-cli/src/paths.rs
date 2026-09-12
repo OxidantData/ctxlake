@@ -75,6 +75,31 @@ pub fn hermes_config_path() -> PathBuf {
     home_dir().join(".hermes").join("config.yaml")
 }
 
+/// Hermes's own SQLite state database — the source `ctxlake import --runtime hermes`
+/// reads (see `import/hermes.rs` and docs/import.md).
+///
+/// This is a *live* database belonging to another process, which is why the importer
+/// opens it read-only and immutable rather than ever writing anywhere near it.
+/// Nothing in ctxlake creates this file; a missing one simply means Hermes has never
+/// run on this host.
+pub fn hermes_state_db_path() -> PathBuf {
+    home_dir().join(".hermes").join("state.db")
+}
+
+/// Where `ctxlake import` persists its dedup ledger for one runtime.
+///
+/// Deliberately **not** inside the spool: `ctxlake sync` drains and deletes spool
+/// files once they reach the store, so a ledger living there would be erased by a
+/// successful upload and the next import would replay every event it had already
+/// sent. Bronze is immutable — a duplicated event is permanent — so the ledger has
+/// to outlive the thing it guards.
+pub fn import_ledger_path(runtime: &str) -> PathBuf {
+    home_dir()
+        .join(".ctxlake")
+        .join("import")
+        .join(format!("{runtime}.ledger"))
+}
+
 /// Where `ctxlake sync`'s background pidfile lives, scoped per fleet — two fleets
 /// running on one host each get their own daemon slot rather than fighting over
 /// (or silently sharing) a single pidfile. See `sync_cmd.rs`.
@@ -109,6 +134,31 @@ mod tests {
     fn cache_is_scoped_per_fleet() {
         assert_ne!(cache_dir("fleet-a"), cache_dir("fleet-b"));
         assert!(cache_dir("myteam").ends_with("cache/myteam"));
+    }
+
+    #[test]
+    fn the_import_ledger_outlives_the_spool_it_guards() {
+        // Regression guard for the one way this ledger can be silently useless: if
+        // it lived under the spool root, `ctxlake sync`'s post-upload cleanup would
+        // delete it and the next `ctxlake import` would replay every event into
+        // immutable bronze a second time.
+        let ledger = import_ledger_path("hermes");
+        assert!(
+            !ledger.starts_with(spool_root()),
+            "the ledger must not live under the spool the daemon deletes: {}",
+            ledger.display()
+        );
+        assert!(ledger.ends_with("import/hermes.ledger"), "{ledger:?}");
+        assert_ne!(import_ledger_path("hermes"), import_ledger_path("cursor"));
+    }
+
+    #[test]
+    fn hermes_state_db_sits_next_to_the_hermes_config() {
+        // Both live in Hermes's own home directory; if one moved without the other,
+        // `doctor` would report Hermes installed while import found nothing to read.
+        let db = hermes_state_db_path();
+        assert_eq!(db.parent(), hermes_config_path().parent());
+        assert!(db.ends_with(".hermes/state.db"), "{db:?}");
     }
 
     #[test]

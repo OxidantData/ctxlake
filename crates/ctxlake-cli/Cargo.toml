@@ -40,6 +40,15 @@ time.workspace = true
 object_store.workspace = true
 url.workspace = true
 futures.workspace = true
+# `object_store::path::Path` percent-encodes a dynamic segment on write
+# (`PathPart`'s `join`/`child`) but exposes no public way to decode one back —
+# `Path::filename()`/`Path::parts()` both return the raw, still-encoded segment.
+# `claims.rs`'s quarantine list needs the real, decoded `agent_id` back out of
+# `claims/quarantine/<agent_id>.json` to compare against `observed_by`, so this
+# crate does the decode itself with the same crate `object_store` uses
+# internally (already resolved in Cargo.lock at 2.3.2 via that dependency —
+# this pins the same version rather than letting it drift independently).
+percent-encoding = "2.3.2"
 # Scoped to this crate only (never linked into ctxlake-hook, AGENTS.md invariant 2
 # governs that crate's tree, not this one's): the installer must merge into a real
 # `~/.hermes/config.yaml` without clobbering key order or an operator's other entries.

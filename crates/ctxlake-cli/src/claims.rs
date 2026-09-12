@@ -16,10 +16,15 @@
 //! whether a claim *will* promote. `--explain` is a read-only, best-effort
 //! evaluator applying docs/memory.md's own documented rules to real candidate data
 //! — good enough to tell an operator *why a candidate looks stuck today*, not a
-//! second implementation of the gate. Two of the four gates (contradiction,
-//! independence) need data this schema does not carry yet — `injected_context`
-//! lineage, a promoted-claim contradiction index — and [`explain`] says so plainly
-//! rather than guessing.
+//! second implementation of the gate. The contradiction gate needs data this
+//! schema does not carry yet — a promoted-claim contradiction index — and
+//! [`explain`] says so plainly rather than guessing; it never reports
+//! `Gate::Contradiction`. The independence gate is the opposite case: this
+//! schema *cannot* carry what it needs (`injected_context` lineage), so rather
+//! than skip it, [`explain`] reports it as failed-unresolved for every
+//! `convention` candidate that clears the raw observer count — a raw count is
+//! not evidence of independence, and docs/memory.md is explicit that thresholds
+//! read `independent_count`, never `evidence_count`.
 //!
 //! **Where candidates live.** `memory_propose` (`ctxlake-mcp`) writes a
 //! `claim_propose` record to the local spool; `ctxlake sync`'s upload loop ships
@@ -77,10 +82,15 @@ fn quarantine_key(agent_id: &str) -> StorePath {
 }
 
 /// The `claim_propose` record shape `ctxlake_mcp::memory::propose` writes — see
-/// that function's doc. Every other field on the wire is either absent from a
-/// candidate (independence, contradiction data) or not yet meaningful (there is
-/// no `subject` field on the wire today), which is exactly why [`explain`] is
-/// explicit about which gates it cannot evaluate.
+/// that function's doc. `evidence` is deserialized (not dropped) specifically so
+/// [`explain`] can enforce docs/memory.md's "no evidence, no claim" rule against
+/// the record actually read from the store, rather than trusting that whatever
+/// wrote it went through `memory_propose`'s own copy of that check — see
+/// [`CandidateGroup::all_events_cite_evidence`]. `injected_context` lineage
+/// (independence) and a contradiction index are still absent from a candidate
+/// and not yet meaningful (there is no `subject` field on the wire today),
+/// which is exactly why [`explain`] is explicit about which gates it cannot
+/// evaluate.
 #[derive(Debug, Clone, Deserialize)]
 struct CandidateEvent {
     #[serde(default)]
@@ -92,6 +102,12 @@ struct CandidateEvent {
     #[serde(default)]
     status: String,
     observed_by: String,
+    /// `(session_id, message_id)` citations `memory_propose` requires at write
+    /// time. Only its emptiness is used here — this evaluator never inspects a
+    /// citation's shape or tries to resolve it against a real session (that
+    /// would need transcript access this crate does not have).
+    #[serde(default)]
+    evidence: Vec<serde_json::Value>,
 }
 
 /// One logical claim, folded from every `claim_propose` event that asserts the
@@ -104,6 +120,14 @@ pub struct CandidateGroup {
     pub claim: String,
     pub observers: BTreeSet<String>,
     pub event_ids: Vec<String>,
+    /// `false` when at least one `claim_propose` event folded into this group
+    /// carried an empty `evidence` array. `memory_propose` (`ctxlake-mcp`)
+    /// already refuses to queue such a record — this field exists for every
+    /// record that reaches `claims/events/` some other way (a hand-written
+    /// object, an older or future writer, a direct store edit), so `--explain`
+    /// cannot be talked into `would_promote: true` for a zero-citation claim
+    /// just because it bypassed the one process that checks at ingest time.
+    pub all_events_cite_evidence: bool,
 }
 
 /// List and parse every `claim_propose` candidate currently in the object store,
@@ -136,9 +160,13 @@ pub async fn load_candidates(ctx: &StoreCtx) -> Result<Vec<CandidateGroup>> {
             claim: event.claim.clone(),
             observers: BTreeSet::new(),
             event_ids: Vec::new(),
+            all_events_cite_evidence: true,
         });
         group.observers.insert(event.observed_by.clone());
         group.event_ids.push(event.id.clone());
+        if event.evidence.is_empty() {
+            group.all_events_cite_evidence = false;
+        }
     }
     Ok(groups.into_values().collect())
 }
@@ -150,34 +178,65 @@ pub async fn load_quarantined(ctx: &StoreCtx) -> Result<HashSet<String>> {
     let mut set = HashSet::new();
     while let Some(meta) = stream.next().await {
         let Ok(meta) = meta else { continue };
+        // `filename()` returns the raw path segment [`quarantine_key`] wrote —
+        // still percent-encoded by `Path::join`'s `PathPart` machinery for any
+        // `agent_id` that isn't already URL-safe (a `/`, a literal `%`, ...).
+        // Comparing that encoded string against `observed_by` (plain text, never
+        // encoded) would silently never match for exactly the agent ids most
+        // likely to need quarantining — decode it back before stripping the
+        // extension. `object_store::path::Path` exposes no public decode of its
+        // own (see this crate's `Cargo.toml` for why `percent-encoding` is a
+        // direct dependency here), so [`filename_decoded`] reverses `PathPart`'s
+        // encoding itself, the same way `object_store` does internally.
         if let Some(name) = meta.location.filename() {
-            if let Some(agent_id) = name.strip_suffix(".json") {
-                set.insert(agent_id.to_string());
+            if let Some(encoded_agent_id) = name.strip_suffix(".json") {
+                if let Some(agent_id) = filename_decoded(encoded_agent_id) {
+                    set.insert(agent_id);
+                }
             }
         }
     }
     Ok(set)
 }
 
+/// Reverse the percent-encoding `object_store::path::Path::join` applies to a
+/// dynamic segment (see [`load_quarantined`]'s doc for why this exists). Returns
+/// `None` on invalid UTF-8 after decoding — that can only happen for a marker
+/// this process never wrote (`quarantine` always encodes a valid `&str`), so
+/// dropping it from the quarantine set is the fail-safe direction: a bogus
+/// marker being *ignored* only means quarantine didn't apply, which is loud (the
+/// next `--explain` run keeps promoting) rather than a corrupted id silently
+/// matching the wrong agent.
+fn filename_decoded(encoded: &str) -> Option<String> {
+    percent_encoding::percent_decode_str(encoded)
+        .decode_utf8()
+        .ok()
+        .map(|cow| cow.into_owned())
+}
+
 /// Which of docs/memory.md's four gates rejected a candidate, or `None` for
 /// "quarantined" (a fifth, separate kill switch — see [`Explanation::gate`]'s
 /// doc) or "passes every gate this evaluator can check."
 ///
-/// `Contradiction` and `Independence` are never produced by [`explain`] today —
-/// see that function's doc for exactly why (no promoted-claim contradiction
-/// index, no `injected_context` lineage in a `claim_propose` record) — but they
-/// are real outcomes in docs/memory.md's model, kept here (rather than deleted)
-/// so [`Gate::name`] and this module's callers already handle all four the day
-/// `ctxlake-maint`'s real gate starts returning them. `#[allow(dead_code)]`
-/// rather than silence via a wildcard match arm, which would hide exactly this
-/// fact from anyone reading the enum.
+/// `Contradiction` is never produced by [`explain`] today — there is no
+/// promoted-claim contradiction index to check a candidate against yet, and that
+/// gap is said plainly in [`explain`]'s doc rather than faked. `Independence`
+/// *is* produced: docs/memory.md is explicit that "[t]hresholds read
+/// `independent_count`, never `evidence_count`," and a `claim_propose` record
+/// carries no `injected_context` lineage to compute that count from — so for the
+/// one claim type whose promotion policy depends on it (`convention`), this
+/// evaluator reports `Gate::Independence` as unresolved rather than letting a
+/// raw observer count stand in for a property it cannot verify (see
+/// [`explain`]'s doc for exactly why that substitution is the bug this gate
+/// exists to not repeat). `#[allow(dead_code)]` on `Contradiction` only, rather
+/// than silencing both via a wildcard match arm, which would hide from anyone
+/// reading the enum which of the two is actually still unimplemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
     Evidence,
     #[allow(dead_code)]
     Contradiction,
     Provenance,
-    #[allow(dead_code)]
     Independence,
 }
 
@@ -210,9 +269,25 @@ pub struct Explanation {
 
 /// Evaluate one candidate group against docs/memory.md's rules, using only the
 /// gate order the docs specify (evidence, then contradiction, then provenance,
-/// then independence) and only the data a `claim_propose` record actually carries.
-/// See the module doc for exactly which checks are real and which are
-/// intentionally reported as unresolvable rather than faked.
+/// then independence) and only the data a `claim_propose` record actually
+/// carries.
+///
+/// **Independence is not a raw observer count, and this function must never
+/// report it as passed without lineage data.** docs/memory.md: "[t]hresholds
+/// read `independent_count`, never `evidence_count`" — `independent_count`
+/// subtracts sessions that had a related claim *injected* into them, because two
+/// agents agreeing is not corroboration when one of them is echoing what it was
+/// just told. A `claim_propose` record carries no `injected_context` lineage, so
+/// there is no way for this evaluator to tell "two agents independently noticed
+/// this" apart from "agent B read agent A's claim via `memory_search` and
+/// re-proposed it" — which is precisely the echo docs/memory.md's independence
+/// gate exists to catch. So for `convention` (the one claim type whose
+/// promotion depends on independence — `environment`/`outcome` promote on a
+/// single observation regardless), clearing the raw 2-observer count is
+/// necessary but never sufficient: [`Gate::Independence`] is returned as
+/// unresolved rather than silently treated as passed. See the module doc for
+/// which other checks are real and which are intentionally reported as
+/// unresolvable.
 pub fn explain(group: &CandidateGroup, quarantined: &HashSet<String>) -> Explanation {
     let observers: Vec<String> = group.observers.iter().cloned().collect();
 
@@ -227,12 +302,31 @@ pub fn explain(group: &CandidateGroup, quarantined: &HashSet<String>) -> Explana
         };
     }
 
+    // Gate 1, part A: "no evidence, no claim" (docs/memory.md). `memory_propose`
+    // already refuses to queue a zero-citation record, but this evaluator reads
+    // straight from `claims/events/` and must not trust that every record there
+    // went through that check — see [`CandidateGroup::all_events_cite_evidence`].
+    if !group.all_events_cite_evidence {
+        return Explanation {
+            would_promote: false,
+            blocked_by_quarantine: false,
+            gate: Some(Gate::Evidence),
+            reason: "at least one observation backing this candidate cites no \
+                      evidence — docs/memory.md's \"no evidence, no claim\" rule \
+                      blocks promotion regardless of observer count"
+                .to_string(),
+        };
+    }
+
     let live_observers: Vec<&String> = observers
         .iter()
         .filter(|o| !quarantined.contains(o.as_str()))
         .collect();
 
-    // Gate 1: evidence, per docs/memory.md's promotion-threshold table.
+    // Gate 1, part B: the per-type observation-count threshold from docs/
+    // memory.md's promotion table. For `convention` this checks only the raw
+    // *count* of distinct observers — never call it "independent" here, that
+    // word is reserved for the real check in Gate 4 below.
     let (passed, reason) = match group.claim_type.as_str() {
         "environment" | "outcome" => (
             true,
@@ -243,7 +337,8 @@ pub fn explain(group: &CandidateGroup, quarantined: &HashSet<String>) -> Explana
                 (
                     true,
                     format!(
-                        "{} independent observer(s) meet the 2-observation threshold",
+                        "{} distinct observer(s) meet the raw 2-observer count \
+                          (independence is checked separately below)",
                         live_observers.len()
                     ),
                 )
@@ -291,17 +386,40 @@ pub fn explain(group: &CandidateGroup, quarantined: &HashSet<String>) -> Explana
         };
     }
 
-    // Gates 2 (contradiction) and 4 (independence) need data this evaluator does
-    // not have: a promoted-claim contradiction index, and injected_context
-    // lineage to compute true independence rather than a raw observer count. Said
-    // plainly rather than silently treated as passed — see the module doc.
+    // Gate 4: independence. Only `convention` claims need it (see this
+    // function's own doc) — and this evaluator can never confirm it, because
+    // confirming it needs `injected_context` lineage no `claim_propose` record
+    // carries. Reported as an unresolved rejection, not a pass: docs/memory.md's
+    // whole independence section exists to stop exactly the failure mode of
+    // treating a raw observer count as if it proved independence.
+    if group.claim_type == "convention" {
+        return Explanation {
+            would_promote: false,
+            blocked_by_quarantine: false,
+            gate: Some(Gate::Independence),
+            reason: format!(
+                "{} distinct observer(s) clear the raw count, but this evaluator \
+                  has no injected_context lineage to confirm they are independent \
+                  rather than one agent echoing another's claim back — \
+                  ctxlake-maint's real gate must resolve this before it promotes \
+                  (see docs/memory.md's independence section)",
+                live_observers.len()
+            ),
+        };
+    }
+
+    // Gate 2 (contradiction) needs a promoted-claim contradiction index this
+    // evaluator does not have. Said plainly rather than silently treated as
+    // passed — see the module doc. (Gate 4 does not apply beyond this point:
+    // every claim_type that reaches here promotes on observation count alone,
+    // per docs/memory.md's table, so there is nothing left for independence to
+    // gate.)
     Explanation {
         would_promote: true,
         blocked_by_quarantine: false,
         gate: None,
         reason: "passes every gate this evaluator can check locally; contradiction \
-                  and independence need data only ctxlake-maint's real gate has \
-                  (see docs/cli.md)"
+                  needs data only ctxlake-maint's real gate has (see docs/cli.md)"
             .to_string(),
     }
 }
@@ -494,6 +612,37 @@ mod tests {
             .unwrap();
     }
 
+    /// Writes a `claim_propose` record with an empty `evidence` array — the
+    /// shape `memory_propose` itself refuses to queue (docs/memory.md's "no
+    /// evidence, no claim"), reachable here only because this test writes
+    /// directly to the store the way a hand-written record or a future/older
+    /// writer might, bypassing that ingest-time check entirely.
+    async fn propose_candidate_with_no_evidence(
+        ctx: &StoreCtx,
+        date: &str,
+        agent: &str,
+        ulid: &str,
+        claim: &str,
+        claim_type: &str,
+    ) {
+        let key = full_path(ctx, &ctxlake_store::layout::claim_event(date, agent, ulid));
+        let body = serde_json::json!({
+            "kind": "claim_propose",
+            "id": ulid,
+            "fleet_id": "myteam",
+            "claim": claim,
+            "claim_type": claim_type,
+            "status": "candidate",
+            "observed_by": agent,
+            "evidence": [],
+            "evidence_count": 0,
+        });
+        ctx.store
+            .put(&key, PutPayload::from(serde_json::to_vec(&body).unwrap()))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn load_candidates_groups_by_claim_type_and_text() {
         let dir = tempfile::tempdir().unwrap();
@@ -523,6 +672,46 @@ mod tests {
         assert_eq!(groups[0].observers.len(), 2);
         assert!(groups[0].observers.contains("cc-01"));
         assert!(groups[0].observers.contains("cc-02"));
+    }
+
+    /// The exact repro from the adversarial review: a `claim_propose` record
+    /// written straight to the store (bypassing `memory_propose`'s own "no
+    /// evidence, no claim" check) with `"evidence": []` must not read back as
+    /// `would_promote: true`. Exercises the real `load_candidates` -> `explain`
+    /// path end to end, not just the unit-constructed `CandidateGroup` in
+    /// `explain_rejects_a_claim_where_any_event_cites_no_evidence` — this is the
+    /// path an operator's `ctxlake claims --explain` actually runs.
+    #[tokio::test]
+    async fn load_candidates_and_explain_reject_a_zero_evidence_record_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = store_ctx::connect(&cfg(dir.path(), "myteam", "cc-01"), "cc-01").unwrap();
+
+        propose_candidate_with_no_evidence(
+            &ctx,
+            "2026-09-11",
+            "cc-01",
+            "01J0000000000000000000EEEE",
+            "staging listens on 2222",
+            "environment",
+        )
+        .await;
+
+        let groups = load_candidates(&ctx).await.unwrap();
+        let group = groups
+            .iter()
+            .find(|g| g.claim.contains("2222"))
+            .expect("the zero-evidence record must still be readable as a candidate");
+        assert!(
+            !group.all_events_cite_evidence,
+            "a record with an empty evidence array must be flagged"
+        );
+
+        let ex = explain(group, &HashSet::new());
+        assert_eq!(ex.gate, Some(Gate::Evidence), "{ex:?}");
+        assert!(
+            !ex.would_promote,
+            "a zero-citation claim must never read as would_promote: true: {ex:?}"
+        );
     }
 
     #[tokio::test]
@@ -586,6 +775,56 @@ mod tests {
         );
     }
 
+    /// The adversarial review's repro: `quarantine_key` percent-encodes any
+    /// `agent_id` `object_store::path::Path::join` considers unsafe (a literal
+    /// `/`, a literal `%`), and until [`filename_decoded`] existed,
+    /// [`load_quarantined`] read that encoded segment back verbatim — so the
+    /// quarantine marker was written, `quarantine()` printed success, and
+    /// `explain` kept comparing the *encoded* id against a plain-text
+    /// `observed_by` that could never match. An agent id containing `/` is not
+    /// exotic here: hook adapters and MCP client ids are free text (AGENTS.md's
+    /// house rule that anything from a peer is untrusted), so this is exactly
+    /// the kind of id the kill switch most needs to work for.
+    #[tokio::test]
+    async fn quarantine_stops_promotion_for_an_agent_id_needing_percent_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let evil_agent = "cc/with-a-slash";
+        let cfg_a = cfg(dir.path(), "quarantine-encoding-test-fleet", "cc-01");
+        let ctx = store_ctx::connect(&cfg_a, "cc-01").unwrap();
+
+        propose_candidate(
+            &ctx,
+            "2026-09-11",
+            evil_agent,
+            "01J0000000000000000000FFFF",
+            "a claim from an agent id that needs percent-encoding",
+            "environment",
+        )
+        .await;
+
+        quarantine(&cfg_a, evil_agent).await.unwrap();
+
+        let quarantined = load_quarantined(&ctx).await.unwrap();
+        assert!(
+            quarantined.contains(evil_agent),
+            "the decoded agent id must be recoverable from the quarantine \
+             marker's filename, not left percent-encoded: {quarantined:?}"
+        );
+
+        let groups = load_candidates(&ctx).await.unwrap();
+        let group = groups
+            .iter()
+            .find(|g| g.claim.contains("percent-encoding"))
+            .expect("the pre-quarantine candidate must still be readable");
+        let ex = explain(group, &quarantined);
+        assert!(
+            ex.blocked_by_quarantine,
+            "an agent id needing percent-encoding must still be recognized as \
+             quarantined: {ex:?}"
+        );
+        assert!(!ex.would_promote, "{ex:?}");
+    }
+
     #[test]
     fn explain_rejects_hypothesis_at_the_evidence_gate() {
         let group = CandidateGroup {
@@ -593,6 +832,7 @@ mod tests {
             claim: "the flake is a colima artifact".into(),
             observers: BTreeSet::from(["cc-01".to_string()]),
             event_ids: vec!["e1".into()],
+            all_events_cite_evidence: true,
         };
         let ex = explain(&group, &HashSet::new());
         assert_eq!(ex.gate, Some(Gate::Evidence));
@@ -608,23 +848,59 @@ mod tests {
             claim: "use just, not make".into(),
             observers: BTreeSet::from(["cc-01".to_string()]),
             event_ids: vec!["e1".into()],
+            all_events_cite_evidence: true,
         };
         let ex = explain(&group, &HashSet::new());
         assert_eq!(ex.gate, Some(Gate::Evidence));
         assert!(ex.reason.contains("2 independent observations"));
     }
 
+    /// The echo scenario docs/memory.md's independence gate exists to catch:
+    /// agent B reads agent A's candidate (or promoted claim) via `memory_search`
+    /// and re-proposes the same convention, so the raw observer count clears the
+    /// evidence gate's "2" threshold even though there is only one real
+    /// observation with two reporters. A `claim_propose` record carries no
+    /// `injected_context` lineage, so this evaluator has no way to tell that
+    /// scenario apart from two truly independent observers — and docs/memory.md
+    /// is explicit that a threshold must read `independent_count`, never
+    /// `evidence_count`. The only correct behavior with no lineage data is to
+    /// refuse to say "would promote," not to guess yes.
+    ///
+    /// This is deliberately the single most load-bearing test in this module: a
+    /// version of it that passes whether or not the independence gate is wired
+    /// up would prove nothing. If a future wave adds real `injected_context`
+    /// lineage and only *then* rejects an echo, this exact test (an echo with no
+    /// lineage data available at all) must still reject — "no data" and "data
+    /// proving non-independence" are both not-yet-promotable, never promotable.
     #[test]
-    fn explain_passes_convention_with_two_independent_observers() {
+    fn explain_refuses_to_promote_a_convention_echo_with_no_lineage_data() {
         let group = CandidateGroup {
             claim_type: "convention".into(),
             claim: "use just, not make".into(),
             observers: BTreeSet::from(["cc-01".to_string(), "cc-02".to_string()]),
             event_ids: vec!["e1".into(), "e2".into()],
+            all_events_cite_evidence: true,
         };
         let ex = explain(&group, &HashSet::new());
-        assert_eq!(ex.gate, None);
-        assert!(ex.would_promote);
+        assert_eq!(
+            ex.gate,
+            Some(Gate::Independence),
+            "two observers clearing the raw count must be rejected at the \
+             independence gate, not treated as a pass: {ex:?}"
+        );
+        assert!(
+            !ex.would_promote,
+            "would_promote must never be true without injected_context lineage \
+             to confirm independence: {ex:?}"
+        );
+        // The reason must not describe the observers as "independent" — that is
+        // exactly the word this evaluator is not entitled to use about a raw
+        // count it cannot verify.
+        assert!(
+            !ex.reason.contains("independent observer"),
+            "reason must not claim independence it cannot verify: {:?}",
+            ex.reason
+        );
     }
 
     #[test]
@@ -634,6 +910,7 @@ mod tests {
             claim: "staging listens on 2222".into(),
             observers: BTreeSet::from(["".to_string()]),
             event_ids: vec!["e1".into()],
+            all_events_cite_evidence: true,
         };
         let ex = explain(&group, &HashSet::new());
         assert_eq!(ex.gate, Some(Gate::Provenance));
@@ -649,18 +926,21 @@ mod tests {
             claim: "x".into(),
             observers: BTreeSet::from(["cc-01".to_string()]),
             event_ids: vec![],
+            all_events_cite_evidence: true,
         };
         let convention_alone = CandidateGroup {
             claim_type: "convention".into(),
             claim: "y".into(),
             observers: BTreeSet::from(["cc-01".to_string()]),
             event_ids: vec![],
+            all_events_cite_evidence: true,
         };
         let preference = CandidateGroup {
             claim_type: "preference".into(),
             claim: "z".into(),
             observers: BTreeSet::from(["cc-01".to_string()]),
             event_ids: vec![],
+            all_events_cite_evidence: true,
         };
         let empty = HashSet::new();
         let a = explain(&hypothesis, &empty);
@@ -675,6 +955,29 @@ mod tests {
         assert_ne!(a.reason, b.reason);
         assert_ne!(b.reason, c.reason);
         assert_ne!(a.reason, c.reason);
+    }
+
+    #[test]
+    fn explain_rejects_a_claim_where_any_event_cites_no_evidence() {
+        // docs/memory.md: "No evidence, no claim." `memory_propose` already
+        // enforces this at ingest, but `explain` reads straight from
+        // `claims/events/`, which a hand-written or future-writer record could
+        // reach without going through that check — see
+        // `CandidateGroup::all_events_cite_evidence`'s doc. Uses `environment`
+        // (1-observation policy) specifically to prove this gate fires
+        // independently of the per-type observer-count check, not as a side
+        // effect of it.
+        let group = CandidateGroup {
+            claim_type: "environment".into(),
+            claim: "staging listens on 2222".into(),
+            observers: BTreeSet::from(["cc-01".to_string()]),
+            event_ids: vec!["e1".into()],
+            all_events_cite_evidence: false,
+        };
+        let ex = explain(&group, &HashSet::new());
+        assert_eq!(ex.gate, Some(Gate::Evidence), "{ex:?}");
+        assert!(!ex.would_promote, "{ex:?}");
+        assert!(ex.reason.contains("no evidence"), "{:?}", ex.reason);
     }
 
     #[tokio::test]

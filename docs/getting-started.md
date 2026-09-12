@@ -161,19 +161,27 @@ refreshes the local cache your hooks read — that part needs to actually be run
 somewhere, on at least one host, or nothing above step 6 reaches the lake.
 
 Maintenance is different: `ctxlake maint` (compaction, digests, and — once configured —
-claim extraction) is **optional**. Point a cron entry or systemd timer at it on every
-host, on one host, or on none — whichever host's `ctxlake maint` acquires the
-fleet-wide maintenance lease does the work, every other one exits immediately, and if
-nobody ever runs it, coordination (leases, roster, `ctxlake status`) keeps working
-exactly the same; you just don't get compaction or the belief layer.
+claim extraction) is **optional**, and — as of this release — the compaction/
+extraction/promotion-gate/snapshot chain it is meant to run doesn't exist yet
+(`ctxlake-maint` ships its own chain in a later wave; see
+[cli.md](cli.md#ctxlake-maint)'s own "Honest about today's chain" note). Point a cron
+entry or systemd timer at it on every host, on one host, or on none — whichever host's
+`ctxlake maint` acquires the fleet-wide maintenance lease finds there is no chain to
+run yet and releases it, every other one exits immediately without contending, and
+either way coordination (leases, roster, `ctxlake status`) keeps working exactly the
+same. Right now you get no compaction and no belief layer regardless of whether
+anything runs `ctxlake maint` — that changes only once the chain lands.
 
-By default, every session gets a **Tier 1** handoff — the agent that just did the work
-writes its own one-line "here's what I did and what's next" note, no LLM key required
-(docs/summarization.md). The belief layer — durable claims extracted *across* sessions
-— is a separate, optional Tier 2 that needs an LLM configured; review what it produces
-with `ctxlake claims --status candidate --explain`, and reach for
-`ctxlake quarantine <agent_id>` if one agent's claims start looking wrong. See
-[summarization.md](summarization.md).
+**Tier 1** is docs/summarization.md's designed default — the agent that just did the
+work writes its own one-line "here's what I did and what's next" note, no LLM key
+required — but as of this release nothing yet calls it: the hook adapter that would
+prompt an agent for its handoff at turn-end hasn't been wired to do so. `ctxlake
+doctor`'s `tier 1 nudges fired: 0 session(s)` line reflects that honestly today, not a
+bug in your install. The belief layer — durable claims extracted *across* sessions — is
+a separate, optional Tier 2 that needs an LLM configured; once `ctxlake-maint`'s chain
+exists, review what it produces with `ctxlake claims --status candidate --explain`, and
+reach for `ctxlake quarantine <agent_id>` if one agent's claims start looking wrong.
+See [summarization.md](summarization.md).
 
 ## Next steps
 

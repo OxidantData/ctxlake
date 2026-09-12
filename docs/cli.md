@@ -180,7 +180,10 @@ Three more lines report on the pieces [`ctxlake sync`](#ctxlake-sync) and
   [summarization.md](summarization.md)'s three tiers) and how many sessions on this
   host currently show a fired Tier 1 nudge marker. Not a health signal by itself, just
   visibility into whether Tier 1 — the default, no-LLM-required tier — is actually
-  firing.
+  firing. `mode: shadow` carries one more line: nothing in this workspace enforces
+  shadow's "reads disabled" promise on a read path yet (`memory_search` never
+  consults `[summarize].mode`), so `doctor` says that plainly rather than let the
+  config value alone imply the guarantee is in effect.
 
 ### Exit code
 

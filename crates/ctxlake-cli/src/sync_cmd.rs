@@ -362,6 +362,27 @@ mod tests {
 
         let cfg = cfg(&store_dir, "sync-fg-test-fleet", "cc-01");
 
+        // Provision the maintenance lease key up front — `ctxlake init`'s job in
+        // production (`lease::provision`'s own doc: safe here because nothing
+        // else is contending for it yet). Without this, `presence::tick` gets
+        // `StoreError::LeaseNotProvisioned` on every attempt (the key has never
+        // been materialized) and swallows it as an expected, self-healing state
+        // (`Presence::tick`'s doc) — so this daemon would never acquire the
+        // lease, the release-on-shutdown assertion below would never execute,
+        // and the whole block would pass with `Daemon::shutdown`'s lease-release
+        // call deleted. Provisioning here is what makes this test actually
+        // exercise "graceful shutdown releases a held lease" rather than
+        // "graceful shutdown does nothing to a lease, which is also fine."
+        {
+            let ctx = store_ctx::connect(&cfg, "cc-01").unwrap();
+            ctxlake_store::lease::provision(
+                ctx.store.as_ref(),
+                &store_ctx::full_path(&ctx, &ctxlake_store::layout::lease_maintenance()),
+            )
+            .await
+            .unwrap();
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let cfg_for_task = cfg.clone();
         let spool_for_task = spool_dir.clone();
@@ -417,19 +438,28 @@ mod tests {
             "expected the cache loop to have refreshed the roster cache"
         );
 
-        // Graceful shutdown released the maintenance lease if this daemon's
-        // presence loop had acquired it (`ctxlake-sync`'s own contract —
+        // Graceful shutdown released the maintenance lease this daemon's
+        // presence loop acquired (`ctxlake-sync`'s own contract —
         // `Daemon::shutdown`'s doc — exercised here through the CLI's own
-        // wiring rather than only inside `ctxlake-sync`'s test suite).
+        // wiring rather than only inside `ctxlake-sync`'s test suite). The lease
+        // key was provisioned above and this daemon is the only contender in
+        // this test, so it must have acquired it during one of its 10ms-cadence
+        // presence ticks over the 300ms it ran — `lease_path.exists()` is
+        // asserted rather than branched on, so a regression that stops
+        // provisioning, acquiring, or releasing the lease fails loudly here
+        // instead of this whole block silently checking nothing.
         let lease_path = store_dir.join(ctxlake_store::layout::lease_maintenance().as_ref());
-        if lease_path.exists() {
-            let text = std::fs::read_to_string(&lease_path).unwrap();
-            let state: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(
-                state["holder"].is_null(),
-                "a maintenance lease this daemon held must be released on \
-                 shutdown, got: {state}"
-            );
-        }
+        assert!(
+            lease_path.exists(),
+            "expected the presence loop to have acquired the (pre-provisioned) \
+             maintenance lease at least once while running"
+        );
+        let text = std::fs::read_to_string(&lease_path).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            state["holder"].is_null(),
+            "a maintenance lease this daemon held must be released on \
+             shutdown, got: {state}"
+        );
     }
 }

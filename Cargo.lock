@@ -689,6 +689,7 @@ dependencies = [
  "glob",
  "json",
  "object_store",
+ "percent-encoding",
  "serde",
  "serde_json",
  "serde_yaml",

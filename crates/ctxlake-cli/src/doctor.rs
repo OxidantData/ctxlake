@@ -197,10 +197,44 @@ impl Report {
 
         println!("\nsummarization");
         println!("  mode: {}", self.summarize_mode);
+        if let Some(note) = summarize_mode_enforcement_note(&self.summarize_mode) {
+            println!("  {note}");
+        }
         println!(
             "  tier 1 nudges fired: {} session(s) (see docs/summarization.md)",
             self.nudged_sessions
         );
+    }
+}
+
+/// The caveat `Report::print` shows under `summarization / mode: <mode>`,
+/// or `None` when `mode` carries no promise this crate could fail to keep. A
+/// separate, pure function rather than inline `println!` logic specifically so
+/// a test can pin the honesty of its wording without capturing stdout.
+///
+/// **Why this note exists, and why it is `shadow`-only.** Of the five modes
+/// (`docs/summarization.md`), only `shadow` makes a claim about what happens on
+/// a *read* path: "runs the whole chain ... with agent reads disabled ...
+/// nothing reaches a context window." `none`/`agent` never produce a claim to
+/// read in the first place, and `batch`/`both` promise extraction, not
+/// read-blocking, so there is nothing for those four to fail to keep here. But
+/// nothing in this workspace enforces `shadow`'s specific promise yet:
+/// `ctxlake_mcp::memory::search` renders promoted claims into an agent's
+/// context window without ever consulting `[summarize].mode`. A bare
+/// `mode: shadow` line would read as that guarantee being in effect — it is
+/// not, so this crate says so rather than letting the config value imply an
+/// enforcement it doesn't perform. (`ctxlake-maint` — the crate that would
+/// produce a promoted claim at all — is also still an empty scaffold, so
+/// `shadow` has nothing to gate today regardless; that is `maint`'s absence,
+/// reported separately above, not this note's concern.)
+fn summarize_mode_enforcement_note(mode: &str) -> Option<&'static str> {
+    if mode == "shadow" {
+        Some(
+            "NOTE: shadow's \"reads disabled\" is not enforced yet — memory_search \
+             does not consult [summarize].mode (see docs/summarization.md)",
+        )
+    } else {
+        None
     }
 }
 
@@ -536,6 +570,29 @@ mod tests {
 
         cfg.summarize.mode = crate::config::SummarizeMode::None;
         assert_eq!(run(&cfg).await.unwrap().summarize_mode, "none");
+    }
+
+    /// `mode: shadow` on an operator's screen must never stand alone: nothing
+    /// in this workspace enforces shadow's "reads disabled" promise on a read
+    /// path today (`memory_search` doesn't consult the config at all), so
+    /// doctor must say so rather than let the bare mode name imply the
+    /// guarantee is active. The other four modes make no read-path promise at
+    /// all (see `summarize_mode_enforcement_note`'s doc for why `batch`/`both`
+    /// don't need this caveat either), so they must print no note — a blanket
+    /// caveat on every mode would bury the one that actually matters.
+    #[test]
+    fn summarize_mode_note_flags_only_shadow() {
+        assert!(
+            summarize_mode_enforcement_note("shadow").is_some_and(|n| n.contains("not enforced")),
+            "shadow must carry an honest not-enforced caveat"
+        );
+        for mode in ["none", "agent", "batch", "both"] {
+            assert_eq!(
+                summarize_mode_enforcement_note(mode),
+                None,
+                "mode {mode:?} makes no read-path promise to caveat"
+            );
+        }
     }
 
     #[tokio::test]

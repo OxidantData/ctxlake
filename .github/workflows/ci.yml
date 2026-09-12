@@ -50,6 +50,16 @@ jobs:
           done
           echo "::error::MinIO did not become ready"; docker logs minio; exit 1
 
+      # Without a bucket the CAS suite probes, finds it unwritable, and SKIPS while
+      # still reporting "ok" — so the one test that proves this design would silently
+      # stop covering the backend it exists for.
+      - name: Create the test bucket
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: |
+          aws --endpoint-url http://localhost:9000 s3 mb s3://ctxlake-test
+          aws --endpoint-url http://localhost:9000 s3 ls
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.90"
@@ -58,6 +68,23 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+      # The MinIO suite skips rather than fails when its bucket is unreachable, which is
+      # right for a laptop and wrong for CI: a green tick would mean nothing. Run it with
+      # output captured and treat the skip message as a failure, so MinIO coverage cannot
+      # quietly lapse.
+      - name: Assert the MinIO CAS suite actually ran
+        env:
+          CTXLAKE_TEST_S3_BUCKET: ctxlake-test
+        run: |
+          set -o pipefail
+          cargo test -p ctxlake-store --test cas_torture -- --nocapture 2>&1 | tee /tmp/torture.log
+          if grep -q "skipping MinIO suite" /tmp/torture.log; then
+            echo "::error::The MinIO CAS suite skipped. MinIO is the backend without \
+          put-if-absent, so skipping it defeats the purpose of running it."
+            exit 1
+          fi
+          echo "MinIO CAS suite ran against a real endpoint."
 
   hook-deps:
     # Invariant 2 (AGENTS.md): ctxlake-hook fires on every tool call and must stay

@@ -23,6 +23,13 @@ pub enum MaintError {
     #[error("parquet/arrow codec: {0}")]
     Codec(String),
 
+    /// Tier 2 extraction failed (a provider call, or a malformed structured-output
+    /// response). Wrapped rather than re-derived so `run::run`'s chain has one
+    /// error type end to end, matching this enum's own "wrap, don't re-derive"
+    /// doc above.
+    #[error(transparent)]
+    Extract(#[from] crate::extract::ExtractError),
+
     #[error("{0}")]
     Other(String),
 }

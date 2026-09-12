@@ -14,6 +14,34 @@ use serde::{Deserialize, Serialize};
 /// Bumped when a field is added. Never bumped to reinterpret an existing field.
 pub const SCHEMA_VERSION: u32 = 1;
 
+use std::cell::RefCell;
+
+thread_local! {
+    /// A monotonic ULID generator per thread.
+    ///
+    /// Plain `Ulid::new()` is NOT monotonic: two ULIDs minted in the same
+    /// millisecond differ only in their random bits, so they sort arbitrarily. That
+    /// would make a session's own events interleave out of order — the one ordering
+    /// property this design actually relies on.
+    static EVENT_ID_GEN: RefCell<ulid::Generator> = RefCell::new(ulid::Generator::new());
+}
+
+/// A ULID that is strictly greater than the previous one from this thread.
+///
+/// Falls back to a random ULID if the generator's random bits would overflow, which
+/// takes on the order of 2^80 ids inside a single millisecond. At that point the
+/// next millisecond restores ordering on its own, so a fallback is better than a
+/// panic on a path that runs inside the user's agent.
+pub fn next_event_id() -> String {
+    EVENT_ID_GEN
+        .with(|g| {
+            g.borrow_mut()
+                .generate()
+                .unwrap_or_else(|_| ulid::Ulid::new())
+        })
+        .to_string()
+}
+
 /// Which agent runtime produced this event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,7 +146,13 @@ pub struct Redaction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub schema_version: u32,
-    /// ULID — sortable, so bronze is chronological without a secondary index.
+    /// ULID. Monotonic *within a writer process* (see [`next_event_id`]), so the
+    /// events of one session are strictly ordered — which is the guarantee that
+    /// matters here, because every key in the lake has exactly one writer.
+    ///
+    /// Across hosts, ordering is by millisecond and same-millisecond ties break
+    /// arbitrarily. Bronze therefore sorts chronologically at millisecond
+    /// resolution with no secondary index, and no finer than that.
     pub event_id: String,
     pub emitted_at: String,
 
@@ -186,7 +220,7 @@ impl Envelope {
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
-            event_id: ulid::Ulid::new().to_string(),
+            event_id: next_event_id(),
             emitted_at: emitted_at.into(),
             fleet_id: fleet_id.into(),
             agent_id: agent_id.into(),
@@ -259,11 +293,34 @@ mod tests {
     }
 
     #[test]
-    fn event_ids_sort_chronologically() {
-        // ULIDs are the reason bronze needs no secondary index.
-        let a = sample().event_id;
-        let b = sample().event_id;
-        assert!(a < b, "ULIDs must be monotonic: {a} !< {b}");
+    fn event_ids_are_strictly_monotonic_within_a_process() {
+        // A session's events are written by one process, and they must replay in the
+        // order they happened. Plain Ulid::new() does not give this: ids minted in the
+        // same millisecond differ only in random bits and sort arbitrarily, so this
+        // test fails roughly half the time against it. 1000 iterations land many ids
+        // inside one millisecond, which is exactly the case that has to hold.
+        let ids: Vec<String> = (0..1000).map(|_| next_event_id()).collect();
+        for w in ids.windows(2) {
+            assert!(w[0] < w[1], "event ids must increase: {} !< {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn event_ids_are_lexicographically_sortable() {
+        // Bronze sorts by key with no secondary index, so byte order must equal
+        // generation order — which needs the fixed-width Crockford base32 encoding,
+        // not just increasing values.
+        let mut ids: Vec<String> = (0..100).map(|_| next_event_id()).collect();
+        let generated = ids.clone();
+        ids.sort();
+        assert_eq!(
+            ids, generated,
+            "lexicographic order must match generation order"
+        );
+        assert!(
+            generated.iter().all(|i| i.len() == 26),
+            "ULIDs are fixed-width"
+        );
     }
 
     #[test]

@@ -475,25 +475,65 @@ def check_tier2_wiring_matches_the_docs() -> None:
 # protect nothing.
 # ---------------------------------------------------------------------------
 
-FORBIDDEN_IDENTITIES = [
-    # Maintainer identity, in every form it has previously leaked — including the
-    # slug encoding (`-Users-vamsi-...`) a transcript path produces, which a plain
-    # search for the home directory does not catch.
-    "vamsi",
-    "kothapalli",
-    # AWS account ids and private infrastructure.
-    "810738286322",
-    "ts.net",
-    ".tailscale",
-]
+# Tokens are derived from the machine this runs on — never written down here.
+# Hardcoding a list of names to forbid would publish those names in the very file
+# meant to keep them out of a public repository, which is the mistake this check
+# exists to catch.
+#
+# Generic account names are excluded: CI runs as `runner`, containers as `root` or
+# `ubuntu`, and those appear legitimately in prose ("build-runner-2"). Flagging them
+# would make the check noise, and a noisy check gets suppressed.
+GENERIC_ACCOUNTS = {
+    "runner", "root", "ubuntu", "user", "admin", "build", "ci", "test",
+    "ec2-user", "vagrant", "docker", "jenkins", "github", "home", "users",
+}
 
 SCANNED_DIRS = ["docs", "crates", "packaging", "site/.vitepress"]
 SCANNED_FILES = ["README.md", "AGENTS.md", "CHANGELOG.md"]
 SCANNED_SUFFIXES = (".md", ".rs", ".py", ".toml", ".yml", ".yaml", ".mts", ".tmpl", ".sh", ".json")
 
 
+def _local_identity_tokens() -> list[str]:
+    """Who is running this, according to the environment — not a stored list."""
+    import getpass
+    import os
+    import socket
+
+    candidates = set()
+    try:
+        candidates.add(getpass.getuser())
+    except Exception:
+        pass
+    home = os.environ.get("HOME") or ""
+    if home:
+        candidates.add(os.path.basename(home.rstrip("/")))
+    host = socket.gethostname()
+    # A hostname's first label, plus the whole thing for tailnet-style names.
+    if host:
+        candidates.add(host)
+        candidates.add(host.split(".")[0])
+
+    # An optional untracked file, for anything the environment cannot tell us
+    # (a maintainer's other logins, an account id). One token per line.
+    extra = ROOT / ".identity-guard"
+    if extra.is_file():
+        candidates.update(
+            line.strip() for line in extra.read_text(encoding="utf-8").splitlines()
+        )
+
+    return sorted(
+        t.lower()
+        for t in candidates
+        if t and len(t) >= 4 and t.lower() not in GENERIC_ACCOUNTS
+    )
+
+
 def check_no_real_identities() -> None:
     import os
+
+    tokens = _local_identity_tokens()
+    if not tokens:
+        return
 
     offenders = []
     paths = [ROOT / f for f in SCANNED_FILES]
@@ -512,9 +552,14 @@ def check_no_real_identities() -> None:
             text = path.read_text(encoding="utf-8", errors="ignore").lower()
         except OSError:
             continue
-        for token in FORBIDDEN_IDENTITIES:
+        for token in tokens:
             if token in text:
-                offenders.append(f"{path.relative_to(ROOT)}: {token!r}")
+                # The token itself is NOT echoed: this output lands in CI logs, which
+                # are as public as the repository.
+                offenders.append(
+                    f"{path.relative_to(ROOT)} contains this machine's user or "
+                    f"hostname ({len(token)} chars)"
+                )
 
     for o in offenders:
         fail(

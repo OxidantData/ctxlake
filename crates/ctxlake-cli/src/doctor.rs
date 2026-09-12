@@ -149,10 +149,16 @@ impl Report {
                 Some(Err(e)) => reasons.push(format!(
                     "[summarize.batch] is configured but the provider rejected a test call: {e}"
                 )),
-                None => reasons.push(format!(
-                    "[summarize.batch] is configured but {} is not set",
-                    llm.env_var
-                )),
+                None => reasons.push(if llm.env_var.trim().is_empty() {
+                    "[summarize.batch] is configured but its provider could not be \
+                     reached"
+                        .to_string()
+                } else {
+                    format!(
+                        "[summarize.batch] is configured but {} is not set",
+                        llm.env_var
+                    )
+                }),
             }
         }
         reasons
@@ -219,13 +225,17 @@ impl Report {
         }
 
         if let Some(llm) = &self.llm {
+            let named = if llm.env_var.trim().is_empty() {
+                "no API key needed".to_string()
+            } else {
+                llm.env_var.clone()
+            };
             match &llm.reachable {
-                Some(Ok(())) => println!("\nllm     {} resolves, provider answered", llm.env_var),
-                Some(Err(e)) => println!(
-                    "\nllm     {} resolves, but the provider FAILED: {e}",
-                    llm.env_var
-                ),
-                None => println!("\nllm     {} does not resolve", llm.env_var),
+                // A keyless provider (claude-cli, ollama) has no variable to name,
+                // and printing an empty one left a blank gap mid-sentence.
+                Some(Ok(())) => println!("\nllm     {named} — provider answered"),
+                Some(Err(e)) => println!("\nllm     {named} — provider FAILED: {e}"),
+                None => println!("\nllm     {named} — does not resolve"),
             }
             if !llm.resolves {
                 println!(
@@ -315,21 +325,27 @@ impl Report {
 /// nothing in this workspace enforces `shadow`'s specific promise yet:
 /// `ctxlake_mcp::memory::search` renders promoted claims into an agent's
 /// context window without ever consulting `[summarize].mode`. A bare
-/// `mode: shadow` line would read as that guarantee being in effect — it is
-/// not, so this crate says so rather than letting the config value imply an
-/// enforcement it doesn't perform. (`ctxlake-maint` — the crate that would
-/// produce a promoted claim at all — is also still an empty scaffold, so
-/// `shadow` has nothing to gate today regardless; that is `maint`'s absence,
-/// reported separately above, not this note's concern.)
-fn summarize_mode_enforcement_note(mode: &str) -> Option<&'static str> {
-    if mode == "shadow" {
-        Some(
-            "NOTE: shadow's \"reads disabled\" is not enforced yet — memory_search \
-             does not consult [summarize].mode (see docs/memory.md)",
-        )
-    } else {
-        None
-    }
+/// Whether a mode's promise needs a caveat printed beside it.
+///
+/// It used to: `shadow` promises that no promoted claim reaches a context window,
+/// and when this was written nothing enforced that — `ctxlake-maint` was an empty
+/// scaffold and `memory_search` consulted no mode. Printing `mode: shadow` alone
+/// would have implied a guarantee that was not in effect.
+///
+/// Both halves are now true, so the caveat is gone. `snapshot::publish` populates
+/// `claims_fts` — the only index `memory_search` queries — from rows marked
+/// `visible_to_agents`, and a caller passing `agent_reads_enabled: false` produces a
+/// snapshot with none. The enforcement is at the *publish* point, which is stronger
+/// than a read-time check: the rows are not there to serve, rather than present and
+/// skipped by a reader who has to remember.
+///
+/// Kept as a function rather than deleted because the shape is right — a mode whose
+/// promise outruns its enforcement should say so here — and because a stale warning
+/// about a safety feature costs as much as a missing one. This one survived past the
+/// work that made it false and was reported by an operator reading their own
+/// `doctor` output.
+fn summarize_mode_enforcement_note(_mode: &str) -> Option<&'static str> {
+    None
 }
 
 fn display_name(probe: &str) -> &'static str {
@@ -472,9 +488,16 @@ pub async fn run(cfg: &Config) -> Result<Report> {
     let llm = if cfg.summarize.mode.needs_batch() {
         match cfg.summarize.batch.as_ref() {
             Some(b) => {
-                let resolves = std::env::var(&b.api_key_env).is_ok();
-                // Only worth a network round trip once the key is there; without it
-                // the failure is already known and named.
+                // Not every provider has a key. `claude-cli` uses the subscription the
+                // CLI is signed in to and `ollama` is a local endpoint, so both leave
+                // `api_key_env` empty — and checking `std::env::var("")` for those
+                // reported "configured but  is not set", with a blank where the
+                // variable name should be, and blocked `ctxlake sync install` on a
+                // machine that was correctly configured. Reported from a real install.
+                let needs_key = !b.api_key_env.trim().is_empty();
+                let resolves = !needs_key || std::env::var(&b.api_key_env).is_ok();
+                // A round trip is worth it whenever there is nothing already known to
+                // be wrong — which for a keyless provider is always.
                 let reachable = if resolves {
                     Some(probe_provider(b).await)
                 } else {
@@ -647,7 +670,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_cache_and_empty_spool_are_reported_not_fatal() {
+    async fn a_missing_cache_and_a_spool_backlog_are_reported_not_fatal() {
+        // Deliberately asserts nothing about the spool's *contents*. `spool_root()`
+        // is not injectable by design (see paths.rs), so this reads the developer's
+        // real `~/.ctxlake/spool` — and the original version required it to be empty,
+        // which held only on a machine where ctxlake had never actually run. It
+        // started failing the moment the tool was installed here and began capturing
+        // a live session: a test that passes only while the product is unused.
+        //
+        // What this test is really for is the exit-code policy — neither a missing
+        // cache nor a backlog breaks capture. Counting is covered hermetically by
+        // `spool_scan_counts_files_recursively` against a tempdir.
         let store_dir = tempfile::tempdir().unwrap();
         let cfg = Config::new(
             format!("file://{}", store_dir.path().display()),
@@ -655,9 +688,11 @@ mod tests {
             "cc-01",
         );
         let report = run(&cfg).await.unwrap();
-        assert!(!report.cache.exists);
-        assert_eq!(report.spool_backlog.file_count, 0);
-        assert!(!report.breaks_capture());
+        assert!(!report.cache.exists, "a fleet with no cache must say so");
+        assert!(
+            !report.breaks_capture(),
+            "neither a missing cache nor a spool backlog is fatal"
+        );
     }
 
     #[test]
@@ -732,16 +767,22 @@ mod tests {
     /// don't need this caveat either), so they must print no note — a blanket
     /// caveat on every mode would bury the one that actually matters.
     #[test]
-    fn summarize_mode_note_flags_only_shadow() {
-        assert!(
-            summarize_mode_enforcement_note("shadow").is_some_and(|n| n.contains("not enforced")),
-            "shadow must carry an honest not-enforced caveat"
-        );
-        for mode in ["none", "agent", "batch", "both"] {
+    fn no_mode_carries_an_enforcement_caveat_now_that_shadow_is_enforced() {
+        // `shadow` used to print "reads disabled is not enforced yet", which was
+        // true when nothing produced a promoted claim and `memory_search` consulted
+        // no mode. Both changed, and the warning outlived them — an operator read it
+        // in their own `doctor` output and reasonably concluded the safety property
+        // they had been promised was not in effect.
+        //
+        // Enforcement now lives in `snapshot::publish`: `claims_fts`, the only index
+        // `memory_search` queries, is built from rows marked `visible_to_agents`, and
+        // shadow marks none. ctxlake-maint's own suite proves it
+        // (`shadow_mode_still_publishes_nothing_agent_queryable` and three others).
+        for mode in ["none", "agent", "batch", "both", "shadow"] {
             assert_eq!(
                 summarize_mode_enforcement_note(mode),
                 None,
-                "mode {mode:?} makes no read-path promise to caveat"
+                "mode {mode:?} makes no promise this crate cannot back"
             );
         }
     }
@@ -800,6 +841,43 @@ mod tests {
             blockers.iter().any(|b| b.contains("unreachable")),
             "expected an unreachable-store blocker, got: {blockers:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_keyless_provider_is_not_blocked_for_a_missing_env_var() {
+        // `claude-cli` and `ollama` authenticate some other way, so `api_key_env` is
+        // empty. Checking `std::env::var("")` for those made `ctxlake sync install`
+        // refuse a correctly configured machine with "configured but  is not set" —
+        // a blank where the variable name should be. Reported from a real install on
+        // a second host.
+        let (_dir, mut report) = healthy_report().await;
+        report.llm = Some(LlmReport {
+            env_var: String::new(),
+            resolves: true,
+            reachable: Some(Ok(())),
+        });
+        assert!(
+            report.blocks_service_install().is_empty(),
+            "a keyless provider that answers must not block: {:?}",
+            report.blocks_service_install()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyless_provider_that_cannot_be_reached_still_blocks_but_reads_sensibly() {
+        let (_dir, mut report) = healthy_report().await;
+        report.llm = Some(LlmReport {
+            env_var: String::new(),
+            resolves: true,
+            reachable: Some(Err("claude is not on PATH".to_string())),
+        });
+        let blockers = report.blocks_service_install();
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(
+            !blockers[0].contains("  is not set"),
+            "must never print a blank variable name: {blockers:?}"
+        );
+        assert!(blockers[0].contains("PATH"), "{blockers:?}");
     }
 
     #[tokio::test]

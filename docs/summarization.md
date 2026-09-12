@@ -16,6 +16,111 @@ sealed session
               → candidate claims → four gates → promoted → snapshot → briefing
 ```
 
+## Turning it on, start to finish
+
+The rest of this page explains the design. This section is the sequence of commands, in
+order, with nothing assumed.
+
+### 1. Confirm what you already have, for free
+
+Nothing below is needed for session history. Tier 0 digests and Tier 1 handoffs run with
+no key and no configuration, and they are what fills the "what happened here recently"
+half of a briefing:
+
+```sh
+ctxlake maint --once     # compact, digest, snapshot — the whole chain, once
+ctxlake status           # who is active now
+```
+
+`ctxlake maint` is the command that does all batch work. Nothing runs it for you: it
+takes the fleet-wide maintenance lease, does a pass, and exits. If no one ever runs it,
+capture keeps working and nothing is derived from it.
+
+Run it on a timer once you are past trying things out — any timer, on any one machine:
+
+```sh
+# crontab -e
+*/15 * * * * /home/you/.local/bin/ctxlake maint --once >/dev/null 2>&1
+```
+
+It is safe to schedule on every machine in the fleet. Whoever gets the lease does the
+work and the rest exit 0 immediately, so there is no coordination to arrange and no
+"primary" host to designate.
+
+### 2. Point it at a model
+
+Extraction is the only part that needs one. In `ctxlake.toml`:
+
+```toml
+[summarize]
+mode = "shadow"          # keep this; see step 4
+
+[summarize.batch]
+provider    = "anthropic"
+model       = "claude-haiku-4-5"
+api_key_env = "ANTHROPIC_API_KEY"
+use_batch_api = true
+```
+
+Then export the key the config *names* — the file holds the variable's name, never its
+value:
+
+```sh
+export ANTHROPIC_API_KEY=...
+ctxlake doctor          # reports whether the named variable resolves. Never its value.
+```
+
+Entirely local instead, if transcripts must not leave the machine:
+
+```toml
+[summarize.batch]
+provider = "ollama"
+model    = "qwen2.5:14b"
+base_url = "http://localhost:11434"
+```
+
+### 3. Let it run, and look at what it produces
+
+```sh
+ctxlake maint --once                          # now also extracts and runs the gates
+ctxlake claims --status candidate --explain   # what was extracted, and what the gates did
+```
+
+`--explain` is the one worth reading. It names *which* of the four gates rejected each
+claim and why — "rejected" on its own teaches you nothing about whether extraction is
+working.
+
+### 4. Read the numbers before turning it on
+
+`mode = "shadow"` means everything above runs and **no agent can read any of it**. That
+is the default, deliberately.
+
+Give it a couple of weeks of real sessions, then look:
+
+```sh
+ctxlake claims --status candidate --explain   # are these claims true?
+ctxlake claims --status contested             # where do they disagree with each other?
+```
+
+You are answering one question: *would I want an agent to act on this?* If a third of the
+claims are wrong, you have learned that for free. If they read well, continue.
+
+> **This step is the whole reason shadow mode exists, and it cannot be shortened by
+> reading more documentation** — it needs your sessions, your repos, and your judgment.
+> Everything a wrong claim costs is paid later and by someone else, in a context window,
+> as a confident assertion with no indication it was ever in doubt.
+
+### 5. Flip it
+
+```toml
+[summarize]
+mode = "live"
+```
+
+Promoted claims now appear in the fleet-context block of every session briefing, each one
+carrying its observer, date, independent-session count and confidence. Reverting is the
+same line.
+
 ## Tier 0 — structural. No LLM, always on.
 
 Derived mechanically from captured events, so it cannot hallucinate:

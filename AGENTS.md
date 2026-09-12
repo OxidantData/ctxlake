@@ -102,6 +102,13 @@ one binary serves all three runtimes. But `result` and `duration_ms` are nested 
 `extra`, not top-level. Verified against Hermes's own source; see
 [`docs/runtimes/hermes.md`](docs/runtimes/hermes.md).
 
+**Claude Code sends `prompt`, not the documented `user_input`.** The published hooks
+reference says `user_input`; the binary sends `prompt`. Reading only the documented name
+captured no prompt text at all — every prompt event hashed the empty string while the
+hook fired, events reached the spool, and nothing reported a problem. `SessionStart`
+likewise sends `source`, not `startup_reason`. See
+`crates/ctxlake-hook/tests/fixtures/claude-code-verified/`.
+
 **The spool is partitioned by runtime, not fleet/agent.** A hook knows its runtime for
 certain; `fleet_id`/`agent_id` come from the environment and may be unset, and a path built
 from an unset value cannot be found later.
@@ -112,9 +119,15 @@ Every bug in the list above **failed silently**. No panic, no error — just a f
 missing from every event of one runtime. Two rules follow, and they are not optional:
 
 **A fixture written from the same source as the implementation agrees with it by
-construction.** The Cursor `duration` bug survived review because its hand-written fixture
-used the integer `42` while the real payload sends `1089.021`. The test passed and agreed
-with the bug. Where a third party's wire format is involved, capture a real payload.
+construction.** This has now happened on all three runtimes. The Cursor `duration` bug
+survived review because its hand-written fixture used the integer `42` while the real
+payload sends `1089.021` — the test passed and agreed with the bug. Claude Code's prompt
+text was never captured at all, because both the adapter and its fixtures were written
+from a reference that names a field the binary does not send.
+
+Neither was findable from inside the repo. Every test passed. **Where a third party's wire
+format is involved, run the real thing and look at what arrives.** Capturing a payload
+costs minutes; these cost a working feature each, silently, for as long as nobody looked.
 
 **Verify that a regression test bites.** Break the code, watch it go red, restore, watch it
 pass. And if your editing tool reformats the file, confirm the mutation actually applied —

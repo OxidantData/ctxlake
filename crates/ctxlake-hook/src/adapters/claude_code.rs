@@ -65,7 +65,15 @@ pub fn normalize(event: &str, v: &Value) -> Result<Envelope, String> {
         env.content = scrub_field(
             &redactor,
             &mut acc,
-            get_str(v, "user_input").map(str::to_string),
+            // `prompt` is what Claude Code actually sends — captured from a live
+            // session (tests/fixtures/claude-code-verified/user_prompt_submit.json).
+            // The published hooks reference documents `user_input`, so both are read:
+            // the docs and the binary disagree, and either could be right on a version
+            // we have not seen. Reading only the documented name captured NO prompt
+            // text at all, silently — every prompt event hashed the empty string.
+            get_str(v, "prompt")
+                .or_else(|| get_str(v, "user_input"))
+                .map(str::to_string),
             false,
         );
     }

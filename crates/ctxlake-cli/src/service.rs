@@ -416,6 +416,38 @@ pub fn refresh_installed_unit() -> Result<bool> {
     write_unit(&unit_path, &contents)
 }
 
+/// The `systemctl --user` invocations `install` makes, in order.
+///
+/// Pure so the one decision that matters here is testable without a systemd session:
+/// **`restart`, not `enable --now`**.
+///
+/// `--now` means *start*, and `systemctl start` on an already-active unit is a no-op.
+/// So re-running `ctxlake sync install` rewrote the unit, reported success, and left
+/// the previous daemon running — with the previous binary. Seen on a real host
+/// mid-upgrade: the unit carried the new `PATH`, the binary on disk was the new
+/// version, and `/proc/<pid>/exe` still pointed at the old one, marked `(deleted)`. It
+/// had been running that way for an hour, writing to a `live/` layout the rest of the
+/// fleet had already moved off — and `sync status` reported `active` throughout.
+///
+/// The launchd branch never had this bug, because `bootout` + `bootstrap` genuinely
+/// replaces the process. `restart` is the systemd equivalent: it starts a stopped unit
+/// and replaces a running one, which is what "install this and run it" has to mean on
+/// both platforms.
+///
+/// `enable` stays separate from `restart` rather than collapsing into `enable --now`,
+/// because the two answer different questions — "come back after a reboot" and "be
+/// running now" — and `--no-start` needs the first without the second.
+fn systemd_install_commands(start: bool) -> Vec<Vec<&'static str>> {
+    let mut cmds = vec![
+        vec!["--user", "daemon-reload"],
+        vec!["--user", "enable", SYSTEMD_UNIT],
+    ];
+    if start {
+        cmds.push(vec!["--user", "restart", SYSTEMD_UNIT]);
+    }
+    cmds
+}
+
 /// `ctxlake sync install` — render the unit and hand the daemon to the supervisor.
 ///
 /// Idempotent: re-running against an unchanged host rewrites nothing and re-loads the
@@ -512,13 +544,9 @@ pub async fn install(
 
     match manager {
         Manager::Systemd => {
-            run_checked("systemctl", &["--user", "daemon-reload"])?;
-            let enable: &[&str] = if start {
-                &["--user", "enable", "--now", SYSTEMD_UNIT]
-            } else {
-                &["--user", "enable", SYSTEMD_UNIT]
-            };
-            run_checked("systemctl", enable)?;
+            for args in systemd_install_commands(start) {
+                run_checked("systemctl", &args)?;
+            }
             report_linger();
         }
         Manager::Launchd => {
@@ -1330,6 +1358,52 @@ mod tests {
         // agent identities is a documented setup.
         assert_eq!(config_path_from_unit("nothing like a unit file"), None);
         assert_eq!(config_path_from_unit("<string>--config</string>"), None);
+    }
+
+    #[test]
+    fn installing_over_a_running_systemd_daemon_replaces_it() {
+        // The bug, on a real host mid-upgrade: `sync install` rewrote the unit with a
+        // new PATH, the installer replaced the binary on disk, and the daemon kept
+        // running the old one for an hour — `/proc/<pid>/exe` pointing at a path
+        // marked `(deleted)`, `sync status` reporting `active` the whole time, and the
+        // host writing to a `live/` layout the rest of the fleet had moved off.
+        //
+        // `enable --now` cannot fix that: `--now` means *start*, and starting an
+        // already-active unit does nothing.
+        let cmds = systemd_install_commands(true);
+        assert!(
+            cmds.iter().any(|c| c.contains(&"restart")),
+            "install must replace a running daemon, not no-op on it: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains(&"--now")),
+            "`enable --now` is a no-op against a running unit: {cmds:?}"
+        );
+        // And it must still survive a reboot.
+        assert!(
+            cmds.iter().any(|c| c.contains(&"enable")),
+            "install must still enable the unit: {cmds:?}"
+        );
+        // The unit file has to be re-read before anything acts on it.
+        assert_eq!(
+            cmds.first().map(|c| c.as_slice()),
+            Some(["--user", "daemon-reload"].as_slice()),
+            "systemd must reload the rewritten unit first: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn no_start_enables_without_starting() {
+        // `--no-start` means "be there after a reboot, but do not run now" — the
+        // air-gapped / staged-rollout case. A `restart` here would defeat it.
+        let cmds = systemd_install_commands(false);
+        assert!(cmds.iter().any(|c| c.contains(&"enable")), "{cmds:?}");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.contains(&"restart") || c.contains(&"start")),
+            "--no-start must not start the daemon: {cmds:?}"
+        );
     }
 
     #[test]

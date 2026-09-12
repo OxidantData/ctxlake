@@ -102,7 +102,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ctxlake_store::lease::LeaseHandle;
 use ctxlake_store::StoreError;
 use object_store::{ObjectStore, PutMode, PutPayload};
 use serde::{Deserialize, Serialize};
@@ -587,20 +586,20 @@ async fn append_event(
 /// why the demotion itself lives there (a standing check re-applied every
 /// run) rather than being done once, here, at the moment of quarantine.
 ///
-/// Requires `lease_maintenance` for the same reason every other writer of
-/// this event log outside a single agent's own proposals does (AGENTS.md
-/// invariant 3: no key written by two processes) — quarantine is an
-/// operator action, not something an agent does to itself, and it is
-/// serialized against the gate and the calibration run through the same
-/// lease so none of the three can interleave a write.
+/// No lock needed: [`append_event`] uses `PutMode::Create` against a fresh
+/// ULID, so two calls — even concurrent ones, even one racing the gate or a
+/// calibration run — never collide on a key. `fold_quarantine` folds
+/// whichever `AgentQuarantined`/`AgentUnquarantined` events exist in ULID
+/// order, so several such events landing close together resolves the same
+/// way an ordinary last-write-wins boolean would: well-defined, just possibly
+/// not what the *last caller by wall-clock time* expected if two operators
+/// raced each other — a human coordination question, not a storage one.
 pub async fn quarantine(
     store: &dyn ObjectStore,
-    lease: &LeaseHandle,
     agent_id: &str,
     at: &str,
     reason: &str,
 ) -> Result<(), StoreError> {
-    gate::require_maintenance_lease(lease, "calibrate::quarantine")?;
     append_event(
         store,
         at,
@@ -618,11 +617,9 @@ pub async fn quarantine(
 /// and does not restore.
 pub async fn unquarantine(
     store: &dyn ObjectStore,
-    lease: &LeaseHandle,
     agent_id: &str,
     at: &str,
 ) -> Result<(), StoreError> {
-    gate::require_maintenance_lease(lease, "calibrate::unquarantine")?;
     append_event(
         store,
         at,
@@ -712,17 +709,17 @@ pub struct CalibrationSummary {
 /// score), and append one updated [`ClaimEvent::CalibrationScored`] per
 /// agent that had at least one newly-resolved hypothesis this run.
 ///
-/// Requires `lease_maintenance` — this writes to the same append-only log
-/// `crate::gate::run` does, under the same single-writer discipline; see
-/// `crate::gate::require_maintenance_lease`'s doc.
-///
-/// Idempotent by construction rather than by a separate marker: a hypothesis
-/// only enters `resolve`'s input once (`ClaimStatus::Candidate`), and this
-/// function's own `Retired` event is what moves it out of that set for every
-/// later run — so calling this twice in a row over an unchanged log resolves
-/// nothing the second time, the same "nothing left to do" idempotency
-/// `crate::compact` and `crate::digest` already rely on elsewhere in this
-/// crate.
+/// No lock needed, and none is taken. Idempotent by construction rather than
+/// by a separate marker: a hypothesis only enters `resolve`'s input once
+/// (`ClaimStatus::Candidate`), and this function's own `Retired` event is what
+/// moves it out of that set for every later run — so calling this twice in a
+/// row over an unchanged log resolves nothing the second time, the same
+/// "nothing left to do" idempotency `crate::compact` and `crate::digest`
+/// already rely on elsewhere in this crate. Two *concurrent* calls read the
+/// same still-open hypotheses and each independently compute the same
+/// cumulative score from the same prior state, so their appended events —
+/// redundant, never conflicting — fold to the identical final answer either
+/// way.
 ///
 /// `outcomes` below is deliberately handed to [`resolve`] unfiltered by
 /// status — [`resolve`] itself is where "must be `Promoted`, must come from
@@ -737,11 +734,8 @@ pub struct CalibrationSummary {
 /// function can enforce on its caller's ordering by itself.
 pub async fn run_calibration(
     store: &dyn ObjectStore,
-    lease: &LeaseHandle,
     now: &str,
 ) -> Result<CalibrationSummary, StoreError> {
-    gate::require_maintenance_lease(lease, "calibrate::run_calibration")?;
-
     let events = claims::list_events(store).await?;
     let previous_scores = fold_scores(events.iter());
     let folded = claims::fold(events.iter());
@@ -1550,27 +1544,6 @@ mod tests {
 
     // ---- end-to-end quarantine: stop promoting, capture continues, demote ----
 
-    async fn test_maintenance_lease(store: &dyn ObjectStore) -> LeaseHandle {
-        let key = ctxlake_store::layout::lease_maintenance();
-        ctxlake_store::lease::provision(store, &key).await.unwrap();
-        match ctxlake_store::lease::acquire(
-            store,
-            &ctxlake_store::clock::SystemClock,
-            &key,
-            "test-maintenance-runner",
-            None,
-            std::time::Duration::from_secs(300),
-        )
-        .await
-        .unwrap()
-        {
-            ctxlake_store::lease::AcquireOutcome::Acquired(handle) => handle,
-            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => {
-                panic!("a freshly provisioned lease on an empty store must always be acquirable")
-            }
-        }
-    }
-
     /// Evidence whose `observed_at` sits inside `windows_for`'s default
     /// window below (`2026-09-09`), unlike the module-level `evidence()`
     /// helper above (fixed at `2026-09-01`, fine for the hypothesis/outcome
@@ -1626,7 +1599,6 @@ mod tests {
     #[tokio::test]
     async fn quarantine_stops_promotion_demotes_promoted_and_capture_continues() {
         let store = object_store::memory::InMemory::new();
-        let lease = test_maintenance_lease(&store).await;
         let known_agents: HashSet<String> = ["cc-99".to_string()].into_iter().collect();
 
         // 1. cc-99 already has a PROMOTED claim (simulated directly, as if an
@@ -1681,7 +1653,6 @@ mod tests {
         // 2. Quarantine cc-99.
         quarantine(
             &store,
-            &lease,
             "cc-99",
             "2026-09-10T00:00:00Z",
             "rising contradiction rate",
@@ -1717,7 +1688,6 @@ mod tests {
         let injected: HashMap<String, HashSet<String>> = HashMap::new();
         let summary = gate::run(
             &store,
-            &lease,
             "2026-09-10T00:05:00Z",
             &known_agents,
             &windows,
@@ -1763,18 +1733,11 @@ mod tests {
     #[tokio::test]
     async fn unquarantining_restores_normal_promotion_for_new_candidates() {
         let store = object_store::memory::InMemory::new();
-        let lease = test_maintenance_lease(&store).await;
         let known_agents: HashSet<String> = ["cc-07".to_string()].into_iter().collect();
 
-        quarantine(
-            &store,
-            &lease,
-            "cc-07",
-            "2026-09-10T00:00:00Z",
-            "temporary hold",
-        )
-        .await
-        .unwrap();
+        quarantine(&store, "cc-07", "2026-09-10T00:00:00Z", "temporary hold")
+            .await
+            .unwrap();
 
         // While quarantined, a qualifying candidate must not promote.
         claims::append_proposed(
@@ -1794,7 +1757,6 @@ mod tests {
         let injected: HashMap<String, HashSet<String>> = HashMap::new();
         let summary = gate::run(
             &store,
-            &lease,
             "2026-09-10T00:05:00Z",
             &known_agents,
             &windows,
@@ -1807,7 +1769,7 @@ mod tests {
         assert_eq!(summary.blocked_by_quarantine, 1);
 
         // Un-quarantine, then a NEW qualifying candidate must promote normally.
-        unquarantine(&store, &lease, "cc-07", "2026-09-11T00:00:00Z")
+        unquarantine(&store, "cc-07", "2026-09-11T00:00:00Z")
             .await
             .unwrap();
         claims::append_proposed(
@@ -1825,7 +1787,6 @@ mod tests {
         .unwrap();
         let summary_after = gate::run(
             &store,
-            &lease,
             "2026-09-11T00:05:00Z",
             &known_agents,
             &windows,
@@ -1866,7 +1827,6 @@ mod tests {
     #[tokio::test]
     async fn run_calibration_resolves_scores_and_retires_in_one_pass() {
         let store = object_store::memory::InMemory::new();
-        let lease = test_maintenance_lease(&store).await;
 
         let hyp = ProposedClaim {
             claim_id: "hyp-1".into(),
@@ -1919,7 +1879,7 @@ mod tests {
         .await
         .unwrap();
 
-        let summary = run_calibration(&store, &lease, "2026-09-06T00:00:00Z")
+        let summary = run_calibration(&store, "2026-09-06T00:00:00Z")
             .await
             .unwrap();
         assert_eq!(summary.resolved, 1);
@@ -1942,7 +1902,7 @@ mod tests {
         // Idempotency: running again over the unchanged log resolves nothing
         // new (the hypothesis is already Retired, so it never re-enters
         // `resolve`'s input).
-        let summary_again = run_calibration(&store, &lease, "2026-09-07T00:00:00Z")
+        let summary_again = run_calibration(&store, "2026-09-07T00:00:00Z")
             .await
             .unwrap();
         assert_eq!(
@@ -1961,7 +1921,6 @@ mod tests {
         // hold even when the self-served outcome is otherwise a completely
         // well-formed, Promoted claim.
         let store = object_store::memory::InMemory::new();
-        let lease = test_maintenance_lease(&store).await;
 
         let hyp = ProposedClaim {
             claim_id: "hyp-self".into(),
@@ -2015,7 +1974,7 @@ mod tests {
 
         // Before the hypothesis's due date: must still be silently pending,
         // not resolved by the self-served outcome.
-        let summary_before_due = run_calibration(&store, &lease, "2026-09-06T00:00:00Z")
+        let summary_before_due = run_calibration(&store, "2026-09-06T00:00:00Z")
             .await
             .unwrap();
         assert_eq!(
@@ -2026,7 +1985,7 @@ mod tests {
 
         // Past the due date, with only the self-served outcome on file: the
         // hypothesis must expire unresolved, never score Correct.
-        let summary_after_due = run_calibration(&store, &lease, "2026-09-10T00:00:00Z")
+        let summary_after_due = run_calibration(&store, "2026-09-10T00:00:00Z")
             .await
             .unwrap();
         assert_eq!(summary_after_due.resolved, 1);
@@ -2049,36 +2008,6 @@ mod tests {
             1.0,
             "expired-only history must stay neutral, never boosted by a \
              self-manufactured Correct"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_calibration_refuses_a_lease_for_the_wrong_key() {
-        let store = object_store::memory::InMemory::new();
-        let wrong_key = object_store::path::Path::from("live/leases/not-maintenance");
-        ctxlake_store::lease::provision(&store, &wrong_key)
-            .await
-            .unwrap();
-        let wrong_lease = match ctxlake_store::lease::acquire(
-            &store,
-            &ctxlake_store::clock::SystemClock,
-            &wrong_key,
-            "someone-else",
-            None,
-            std::time::Duration::from_secs(300),
-        )
-        .await
-        .unwrap()
-        {
-            ctxlake_store::lease::AcquireOutcome::Acquired(h) => h,
-            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => unreachable!(),
-        };
-        let err = run_calibration(&store, &wrong_lease, "2026-09-06T00:00:00Z")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("lease_maintenance"),
-            "expected a lease-key error, got: {err}"
         );
     }
 }

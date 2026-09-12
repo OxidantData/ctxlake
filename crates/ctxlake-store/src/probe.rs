@@ -7,7 +7,7 @@
 //! against the configured bucket and reports pass/fail with a human-readable reason.
 //! This is meant to be run once against a new bucket, before anything depends on the
 //! result (`ctxlake doctor`), so a MinIO-specific gap is a config note, not a 2am
-//! page when a lease first contends.
+//! page when the roster or snapshot pointer first contends.
 //!
 //! Every probe cleans up the scratch objects it creates, on both the pass and the
 //! fail path, and everything lives under `layout::internal::probe_prefix`, keyed by
@@ -50,8 +50,9 @@ fn fail(name: &'static str, detail: impl Into<String>) -> ProbeResult {
 }
 
 /// Run every probe against `store` and return one result per primitive, in a fixed
-/// order matching how `ctxlake-store` actually uses each one (lease creation, lease
-/// contention, the roster fan-in, generic housekeeping).
+/// order matching how ctxlake actually uses each one (create-if-absent, CAS
+/// updates, CAS conflict rejection, the roster fan-in's conditional-GET, generic
+/// housekeeping).
 ///
 /// `caller_id` scopes every scratch key this run touches (AGENTS.md invariant 3) —
 /// pass something unique to this invocation (an agent id, a run id) so a concurrent
@@ -67,12 +68,14 @@ pub async fn run(store: &dyn ObjectStore, caller_id: &str) -> Vec<ProbeResult> {
     ]
 }
 
-/// `PutMode::Create` — no longer used anywhere else in this crate (`lease` was the
-/// last caller; see its module doc for why it had to stop), so this is now purely
-/// diagnostic. Note a `fail` here does not mean ctxlake is broken on this backend:
-/// nothing here depends on `Create` giving real put-if-absent semantics (AGENTS.md
-/// invariant 4) — it means an operator should not assume the primitive works if
-/// they were relying on it for something outside ctxlake.
+/// `PutMode::Create` — not used anywhere else in this crate (nothing under `live/`
+/// ever depends on put-if-absent semantics: AGENTS.md invariant 4), so this is
+/// diagnostic here, but it is a real, load-bearing primitive one crate over:
+/// `ctxlake_maint::extract`'s idempotency marker (`claims/extracted/<id>`) is a
+/// genuine create-if-absent lock and needs `Create` to actually work on the
+/// configured backend. Note a `fail` here does not mean ctxlake is broken
+/// everywhere — it means an operator should not assume the primitive works if
+/// they were relying on it for something outside what ctxlake itself uses it for.
 async fn put_if_absent(store: &dyn ObjectStore, caller_id: &str) -> ProbeResult {
     let key = probe_prefix(caller_id).join("put-if-absent.json");
     let _ = store.delete(&key).await;
@@ -102,7 +105,8 @@ async fn put_if_absent(store: &dyn ObjectStore, caller_id: &str) -> ProbeResult 
 }
 
 /// `PutMode::Update(version)` succeeding against a version we just wrote — the one
-/// write every `lease::acquire`/`renew`/`release` call makes.
+/// write every CAS publisher in this codebase makes (the roster fan-in, the
+/// snapshot pointer swap).
 async fn cas_update(store: &dyn ObjectStore, caller_id: &str) -> ProbeResult {
     let key = probe_prefix(caller_id).join("cas-update.json");
     let _ = store.delete(&key).await;
@@ -133,9 +137,9 @@ async fn cas_update(store: &dyn ObjectStore, caller_id: &str) -> ProbeResult {
 }
 
 /// `PutMode::Update(version)` correctly rejecting a *stale* version — the failure
-/// mode every acquire/renew/release call must be able to detect as "someone else
-/// won" (AGENTS.md invariant 4). A pass here is what makes the CAS-torture suite in
-/// `lease.rs` meaningful on this backend.
+/// mode every CAS publisher must be able to detect as "a fresher write already
+/// landed" (AGENTS.md invariant 4). A pass here is what makes this crate's own
+/// CAS tests (`tests/cas.rs`) meaningful on this backend.
 async fn cas_conflict_detection(store: &dyn ObjectStore, caller_id: &str) -> ProbeResult {
     let key = probe_prefix(caller_id).join("cas-conflict.json");
     let _ = store.delete(&key).await;

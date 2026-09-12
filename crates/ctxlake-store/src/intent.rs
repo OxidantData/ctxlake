@@ -79,7 +79,7 @@ mod tests {
             branch: Some("wave1/store".into()),
             cwd: None,
             task: Some("implementing ctxlake-store".into()),
-            paths: vec!["crates/ctxlake-store/src/lease.rs".into()],
+            paths: vec!["crates/ctxlake-store/src/roster.rs".into()],
             updated_at: OffsetDateTime::now_utc(),
         }
     }

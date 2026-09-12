@@ -1,30 +1,40 @@
 //! Presence: publish this agent's own `live/agents/<id>.json` intent, and
-//! opportunistically hold `live/leases/_maintenance` to build `live/roster.json` —
-//! the O(N) fan-in `ctxlake_store::roster`'s module doc explains the cost of
-//! *not* having — when nobody else currently does.
+//! periodically build `live/roster.json` — the O(N) fan-in
+//! `ctxlake_store::roster`'s module doc explains the cost of *not* having.
 //!
-//! ## "Renew at 60s with a 5-minute TTL" for a primitive with no TTL field
+//! ## Several daemons building the roster is fine, not a bug
 //!
-//! `ctxlake_store::intent` is a plain single-writer overwrite with no expiry of its
-//! own (see that module's doc: there is exactly one writer for this key, so CAS —
-//! and the TTL bookkeeping CAS-based leases need — buys nothing). The 60s/5min
-//! cadence named in the task brief is the *lease* renewal ratio from
-//! `docs/architecture.md`'s knobs table (renew at 1/5 of TTL, so one missed cycle
-//! doesn't expire anything), reused here for the one lease this module actually
-//! does hold — [`layout::lease_maintenance`] — and applied *by convention* to the
-//! intent republish too: a consumer of the roster treats an agent whose
-//! `updated_at` hasn't moved in 5 minutes as gone, the same reasoning as a lapsed
-//! lease, even though nothing enforces that expiry server-side for `live/agents/`.
-//! Both cadences share one poll interval here because there is no reason to wake
-//! twice as often for one over the other.
+//! An earlier version of this module opportunistically held a fleet-wide
+//! maintenance lease so that exactly one daemon built the roster at a time. That
+//! lease is gone (see `ctxlake_store`'s crate doc: leases were belt-and-braces on
+//! top of work that was already safe). Without it, **every daemon may build the
+//! roster**, and that is fine: [`ctxlake_store::roster::build`] publishes with a
+//! CAS write, so two daemons racing to publish produce at most one landed write
+//! and a harmless `Skipped` for the loser — `roster.json` is fully recomputed
+//! from a fresh listing each time, so there is nothing a "losing" build
+//! contributed that the winner's doesn't already contain, and a reader following
+//! the pointer never observes a torn write either way. If this read like a bug at
+//! first — "wait, several hosts write this?" — that CAS write is the whole
+//! answer; see `ctxlake_store::roster`'s own module doc for the mechanism.
 //!
-//! ## Graceful shutdown
+//! What a lock bought that a CAS write doesn't: avoiding *redundant* O(N) list
+//! work when N daemons all rebuild every cycle. [`ROSTER_BUILD_INTERVAL`] is the
+//! cheap answer to that — each daemon only attempts a rebuild once every interval
+//! (staggered per agent, via [`crate::backoff::XorShift`], so a fleet that started
+//! up all at once doesn't converge on rebuilding in lockstep forever) rather than
+//! on every presence tick. This is a rate limit on redundant work, not a
+//! correctness mechanism — do not read "staggered" as "coordinated": nothing
+//! prevents two daemons' independently-chosen schedules from landing in the same
+//! cycle, and nothing needs to.
 //!
-//! [`Presence::shutdown`] releases the maintenance lease if held. An un-released
-//! lease is not incorrect — it is advisory (AGENTS.md invariant 5) and simply
-//! expires on its own TTL — but releasing it promptly lets another agent pick up
-//! roster maintenance immediately instead of waiting out however much of the TTL
-//! is left, which matters more the smaller a fleet is.
+//! ## Publishing this agent's own intent
+//!
+//! `ctxlake_store::intent` is a plain single-writer overwrite with no expiry of
+//! its own (see that module's doc: there is exactly one writer for this key, so
+//! CAS buys nothing). A consumer of the roster treats an agent whose `updated_at`
+//! hasn't moved in a while as gone, the same reasoning `docs/architecture.md`'s
+//! knob table describes for the intent republish cadence, even though nothing
+//! enforces that expiry server-side for `live/agents/`.
 
 use std::time::Duration;
 
@@ -34,14 +44,17 @@ use time::OffsetDateTime;
 
 use ctxlake_store::clock::Clock;
 use ctxlake_store::intent::{self, Intent};
-use ctxlake_store::lease::{self, AcquireOutcome, LeaseHandle};
-use ctxlake_store::{layout, roster, StoreError};
+use ctxlake_store::{roster, StoreError};
 
-/// The lease TTL this daemon requests when it holds `_maintenance` — matches
-/// `docs/architecture.md`'s documented default. Renewed every `poll_interval` the
-/// caller passes to [`Presence::tick`], which should be 1/5 of this (60s here) for
-/// the same missed-cycle safety margin the docs describe.
-pub const MAINTENANCE_LEASE_TTL: Duration = Duration::from_secs(300);
+use crate::backoff::{JitterSource, XorShift};
+
+/// The base interval between one daemon's own roster rebuilds — deliberately not
+/// the same as the presence tick interval (`docs/architecture.md`'s knob table),
+/// or every daemon would redo the full O(N) listing every single tick, which is
+/// exactly the request-volume problem `ctxlake_store::roster` exists to avoid. The
+/// actual interval used is this plus a per-agent random jitter up to the same
+/// amount again — see [`Presence::next_roster_build_at`].
+pub const ROSTER_BUILD_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct PresenceConfig {
@@ -98,32 +111,38 @@ pub async fn publish_intent(
     intent::write(store, &intent_snapshot(cfg, existing.as_ref())).await
 }
 
-/// Tracks whether this process currently holds the maintenance lease, across
-/// calls to [`Presence::tick`].
-#[derive(Debug, Default)]
-pub struct Presence {
-    held: Option<LeaseHandle>,
+/// One daemon's presence loop state: when it last decided to rebuild the roster,
+/// and the jitter source that decides when to try again — see the module doc for
+/// why this is a rate limit on redundant work, not a lock.
+#[derive(Debug)]
+pub struct Presence<J: JitterSource = XorShift> {
+    next_roster_build_at: Option<OffsetDateTime>,
+    jitter: J,
 }
 
-impl Presence {
+impl Default for Presence<XorShift> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Presence<XorShift> {
     pub fn new() -> Self {
-        Self { held: None }
+        Self::with_jitter(XorShift::seeded())
+    }
+}
+
+impl<J: JitterSource> Presence<J> {
+    pub fn with_jitter(jitter: J) -> Self {
+        Self {
+            next_roster_build_at: None,
+            jitter,
+        }
     }
 
-    pub fn holds_maintenance_lease(&self) -> bool {
-        self.held.is_some()
-    }
-
-    /// One cycle: publish intent, then try to acquire (or renew) the maintenance
-    /// lease, and build the roster iff this call ends up holding it.
-    ///
-    /// [`StoreError::LeaseNotProvisioned`] — the lease key has never been
-    /// materialized, because `ctxlake init` (a different wave's command) hasn't run
-    /// against this bucket yet — is swallowed rather than propagated as a tick
-    /// failure: it is an expected, self-healing state (the *next* fleet member to
-    /// run `ctxlake init` fixes it for everyone), not evidence the store is having
-    /// trouble, so it must not drive [`crate::backoff`] the way a real store fault
-    /// should.
+    /// One cycle: publish intent, and rebuild the roster iff this daemon's own
+    /// schedule (see the module doc) says it's due — never gated on anyone else's
+    /// state, because there is no "anyone else's state" left to gate on.
     pub async fn tick(
         &mut self,
         store: &dyn ObjectStore,
@@ -132,77 +151,29 @@ impl Presence {
     ) -> Result<(), StoreError> {
         publish_intent(store, cfg).await?;
 
-        match self.try_hold_maintenance(store, clock, cfg).await {
-            Ok(()) => {}
-            Err(StoreError::LeaseNotProvisioned(_)) => {
-                tracing::debug!(
-                    "maintenance lease not provisioned yet; skipping roster build this cycle"
-                );
-            }
-            Err(e) => return Err(e),
-        }
-
-        if self.held.is_some() {
+        let now = OffsetDateTime::from(clock.now().await?);
+        if self.next_roster_build_at.is_none_or(|due| now >= due) {
             match roster::build(store).await? {
                 roster::BuildOutcome::Published(_) => {}
                 roster::BuildOutcome::Skipped => {
-                    // Another builder's snapshot from the same instant landed
+                    // A concurrent builder's snapshot from the same instant landed
                     // first — see `roster::build`'s doc. Nothing lost.
                 }
             }
+            self.next_roster_build_at = Some(now + self.jittered_interval());
         }
         Ok(())
     }
 
-    async fn try_hold_maintenance(
-        &mut self,
-        store: &dyn ObjectStore,
-        clock: &dyn Clock,
-        cfg: &PresenceConfig,
-    ) -> Result<(), StoreError> {
-        if let Some(handle) = self.held.as_mut() {
-            if lease::renew(store, clock, handle, MAINTENANCE_LEASE_TTL).await? {
-                return Ok(());
-            }
-            // Renew reported false: someone else's steal already landed (see
-            // `lease::renew`'s doc) — we no longer hold it, full stop.
-            self.held = None;
-        }
-
-        match lease::acquire(
-            store,
-            clock,
-            &layout::lease_maintenance(),
-            &cfg.agent_id,
-            Some("roster maintenance"),
-            MAINTENANCE_LEASE_TTL,
-        )
-        .await?
-        {
-            AcquireOutcome::Acquired(handle) => {
-                self.held = Some(handle);
-            }
-            AcquireOutcome::NotAcquired { .. } => {
-                // Normal contention (AGENTS.md invariant 4) — someone else holds
-                // it and hasn't lapsed. Nothing to do this cycle.
-            }
-        }
-        Ok(())
-    }
-
-    /// Release the maintenance lease if held. See the module doc for why this is a
-    /// courtesy, not a correctness requirement — the lease is advisory and expires
-    /// on its own regardless.
-    pub async fn shutdown(&mut self, store: &dyn ObjectStore) -> Result<(), StoreError> {
-        if let Some(handle) = self.held.take() {
-            lease::release(store, handle).await?;
-        }
-        Ok(())
+    /// `ROSTER_BUILD_INTERVAL` plus a random extra amount up to the same interval
+    /// again, so this daemon's cadence doesn't stay locked in phase with every
+    /// other daemon that happened to start at the same moment.
+    fn jittered_interval(&mut self) -> Duration {
+        ROSTER_BUILD_INTERVAL + self.jitter.uniform_up_to(ROSTER_BUILD_INTERVAL)
     }
 }
 
-/// Run the presence loop until `shutdown` fires, releasing the maintenance lease
-/// (if held) on the way out.
+/// Run the presence loop until `shutdown` fires.
 pub async fn run(
     store: std::sync::Arc<dyn ObjectStore>,
     clock: std::sync::Arc<dyn Clock>,
@@ -241,18 +212,16 @@ pub async fn run(
             }
         }
     }
-
-    if let Err(e) = presence.shutdown(store.as_ref()).await {
-        tracing::warn!(error = %e, "failed to release maintenance lease on shutdown");
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ctxlake_store::clock::SystemClock;
+    use futures::future::BoxFuture;
     use object_store::memory::InMemory;
     use object_store::ObjectStoreExt;
+    use std::sync::Mutex;
 
     fn cfg() -> PresenceConfig {
         PresenceConfig {
@@ -262,6 +231,34 @@ mod tests {
             repo: Some("github.com/OxidantData/ctxlake".into()),
             branch: Some("wave2/sync".into()),
             cwd: None,
+        }
+    }
+
+    /// A clock the test advances by hand, so the roster-build backoff can be
+    /// asserted exactly instead of racing real wall-clock time.
+    #[derive(Debug)]
+    struct ManualClock(Mutex<std::time::SystemTime>);
+    impl ManualClock {
+        fn new() -> Self {
+            Self(Mutex::new(std::time::SystemTime::now()))
+        }
+        fn advance(&self, d: Duration) {
+            *self.0.lock().unwrap() += d;
+        }
+    }
+    impl Clock for ManualClock {
+        fn now(&self) -> BoxFuture<'_, Result<std::time::SystemTime, StoreError>> {
+            Box::pin(async move { Ok(*self.0.lock().unwrap()) })
+        }
+    }
+
+    /// A jitter source that always returns zero, so a test can assert the
+    /// schedule at the exact base interval rather than "somewhere in a range."
+    #[derive(Debug)]
+    struct NoJitter;
+    impl JitterSource for NoJitter {
+        fn uniform_up_to(&mut self, _cap: Duration) -> Duration {
+            Duration::ZERO
         }
     }
 
@@ -280,9 +277,9 @@ mod tests {
         // None, paths: Vec::new()` on every call. Because `intent::write` is a
         // whole-object `PutMode::Overwrite`, omitting a field IS clearing it (the
         // `skip_serializing_if` attributes drop it from the JSON either way) — so
-        // this daemon's own 60s "I am alive" republish erased a richer intent
-        // (session_id, task, paths) that any session-aware writer had just set,
-        // exactly contradicting this module's own doc comment.
+        // this daemon's own heartbeat republish erased a richer intent (session_id,
+        // task, paths) that any session-aware writer had just set, exactly
+        // contradicting this module's own doc comment.
         let store = InMemory::new();
         let rich = Intent {
             agent_id: "cc-01".into(),
@@ -320,95 +317,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_without_provisioning_the_lease_still_publishes_intent_and_does_not_error() {
+    async fn the_first_tick_builds_the_roster_immediately() {
+        // No lease to acquire any more — a brand-new daemon's very first tick
+        // should still get a roster published promptly, not wait out a full
+        // interval before anyone answers "who else is here."
         let store = InMemory::new();
-        let clock = SystemClock;
         let mut presence = Presence::new();
-        // No `lease::provision` call — mirrors a fleet where `ctxlake init` hasn't
-        // run yet against this bucket.
-        presence.tick(&store, &clock, &cfg()).await.unwrap();
+
+        presence.tick(&store, &SystemClock, &cfg()).await.unwrap();
+
+        assert!(
+            store.get(&ctxlake_store::layout::roster()).await.is_ok(),
+            "roster.json should have been built on the very first tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_agent_also_builds_the_roster_independently() {
+        // The property that replaced the lock: several daemons ticking is fine,
+        // not a conflict — neither is refused, neither errors.
+        let store = InMemory::new();
+        let mut a = Presence::new();
+        let mut b = Presence::new();
+
+        a.tick(&store, &SystemClock, &cfg()).await.unwrap();
+        let cfg_b = PresenceConfig {
+            agent_id: "cc-02".into(),
+            ..cfg()
+        };
+        b.tick(&store, &SystemClock, &cfg_b).await.unwrap();
 
         assert!(intent::read(&store, "cc-01").await.unwrap().is_some());
-        assert!(!presence.holds_maintenance_lease());
+        assert!(intent::read(&store, "cc-02").await.unwrap().is_some());
+        assert!(store.get(&ctxlake_store::layout::roster()).await.is_ok());
     }
 
     #[tokio::test]
-    async fn tick_acquires_the_lease_and_builds_the_roster_when_provisioned() {
+    async fn a_tick_before_the_interval_elapses_does_not_rebuild_the_roster() {
+        // The backoff that replaced the lock's request-volume savings: a second
+        // tick shortly after the first must not pay the O(N) listing cost again,
+        // observed the only way available from outside — a roster rebuilt in
+        // between would have picked up cc-02's intent, so its *absence* proves no
+        // rebuild happened.
         let store = InMemory::new();
-        let clock = SystemClock;
-        lease::provision(&store, &layout::lease_maintenance())
-            .await
-            .unwrap();
-        let mut presence = Presence::new();
+        let clock = ManualClock::new();
+        let mut presence = Presence::with_jitter(NoJitter);
+
+        presence.tick(&store, &clock, &cfg()).await.unwrap();
+        clock.advance(ROSTER_BUILD_INTERVAL / 2);
+
+        // A second agent's intent lands directly (not through a tick of its own),
+        // simulating something changing in the fleet between this daemon's builds.
+        let cfg_b = PresenceConfig {
+            agent_id: "cc-02".into(),
+            ..cfg()
+        };
+        publish_intent(&store, &cfg_b).await.unwrap();
 
         presence.tick(&store, &clock, &cfg()).await.unwrap();
 
-        assert!(presence.holds_maintenance_lease());
-        let roster_obj = store.get(&layout::roster()).await;
-        assert!(roster_obj.is_ok(), "roster.json should have been built");
-    }
-
-    #[tokio::test]
-    async fn a_second_agent_does_not_steal_a_freshly_held_lease() {
-        let store = InMemory::new();
-        let clock = SystemClock;
-        lease::provision(&store, &layout::lease_maintenance())
-            .await
-            .unwrap();
-
-        let mut a = Presence::new();
-        a.tick(&store, &clock, &cfg()).await.unwrap();
-        assert!(a.holds_maintenance_lease());
-
-        let mut b = Presence::new();
-        let cfg_b = PresenceConfig {
-            agent_id: "cc-02".into(),
-            ..cfg()
-        };
-        b.tick(&store, &clock, &cfg_b).await.unwrap();
-        assert!(
-            !b.holds_maintenance_lease(),
-            "a live holder must not be stolen from"
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_releases_a_held_lease_so_another_agent_can_take_over_immediately() {
-        let store = InMemory::new();
-        let clock = SystemClock;
-        lease::provision(&store, &layout::lease_maintenance())
-            .await
-            .unwrap();
-
-        let mut a = Presence::new();
-        a.tick(&store, &clock, &cfg()).await.unwrap();
-        assert!(a.holds_maintenance_lease());
-        a.shutdown(&store).await.unwrap();
-
-        let state = lease::read(&store, &layout::lease_maintenance())
-            .await
-            .unwrap();
+        let roster = store.get(&ctxlake_store::layout::roster()).await.unwrap();
+        let snapshot: roster::RosterSnapshot =
+            serde_json::from_slice(&roster.bytes().await.unwrap()).unwrap();
         assert_eq!(
-            state.holder, None,
-            "a graceful shutdown must free the lease, not merely let it lapse"
-        );
-
-        let mut b = Presence::new();
-        let cfg_b = PresenceConfig {
-            agent_id: "cc-02".into(),
-            ..cfg()
-        };
-        b.tick(&store, &clock, &cfg_b).await.unwrap();
-        assert!(
-            b.holds_maintenance_lease(),
-            "a freed lease must be immediately acquirable"
+            snapshot.agents.len(),
+            1,
+            "a tick inside the backoff window must not have rebuilt the roster"
         );
     }
 
     #[tokio::test]
-    async fn shutdown_without_ever_holding_the_lease_is_a_no_op() {
+    async fn a_tick_after_the_interval_elapses_rebuilds_the_roster() {
         let store = InMemory::new();
-        let mut presence = Presence::new();
-        presence.shutdown(&store).await.unwrap();
+        let clock = ManualClock::new();
+        let mut presence = Presence::with_jitter(NoJitter);
+
+        presence.tick(&store, &clock, &cfg()).await.unwrap();
+
+        let cfg_b = PresenceConfig {
+            agent_id: "cc-02".into(),
+            ..cfg()
+        };
+        publish_intent(&store, &cfg_b).await.unwrap();
+
+        clock.advance(ROSTER_BUILD_INTERVAL + Duration::from_secs(1));
+        presence.tick(&store, &clock, &cfg()).await.unwrap();
+
+        let roster = store.get(&ctxlake_store::layout::roster()).await.unwrap();
+        let snapshot: roster::RosterSnapshot =
+            serde_json::from_slice(&roster.bytes().await.unwrap()).unwrap();
+        let mut ids: Vec<_> = snapshot.agents.iter().map(|a| a.agent_id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["cc-01".to_string(), "cc-02".to_string()],
+            "a tick past the interval must have rebuilt the roster and picked up cc-02"
+        );
     }
 }

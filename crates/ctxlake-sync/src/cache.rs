@@ -35,7 +35,6 @@ use serde::Deserialize;
 
 use crate::atomic_file::write_atomic;
 use crate::backoff::{should_backoff, Backoff};
-use ctxlake_store::clock::Clock;
 use ctxlake_store::roster::Roster;
 use ctxlake_store::{layout, StoreError};
 
@@ -81,11 +80,10 @@ struct SnapshotPointer {
 /// durable).
 pub async fn refresh_roster(
     store: &dyn ObjectStore,
-    clock: &dyn Clock,
     cfg: &CacheConfig,
     state: &mut RefreshState,
 ) -> Result<bool, StoreError> {
-    match ctxlake_store::roster::fetch(store, clock, state.roster_etag.as_deref()).await? {
+    match ctxlake_store::roster::fetch(store, state.roster_etag.as_deref()).await? {
         Roster::Unchanged => Ok(false),
         Roster::Fresh { snapshot, etag } => {
             let bytes = serde_json::to_vec_pretty(&snapshot)?;
@@ -155,7 +153,6 @@ pub async fn refresh_snapshot(
 /// Run the refresh loop until `shutdown` fires.
 pub async fn run(
     store: Arc<dyn ObjectStore>,
-    clock: Arc<dyn Clock>,
     cfg: CacheConfig,
     poll_interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -167,7 +164,7 @@ pub async fn run(
             break;
         }
         let mut hit_error = false;
-        if let Err(e) = refresh_roster(store.as_ref(), clock.as_ref(), &cfg, &mut state).await {
+        if let Err(e) = refresh_roster(store.as_ref(), &cfg, &mut state).await {
             tracing::warn!(error = %e, "roster refresh failed");
             hit_error |= should_backoff(&e);
         }
@@ -211,7 +208,6 @@ pub(crate) fn read_snapshot_cache(cfg: &CacheConfig) -> Vec<u8> {
 mod tests {
     use super::*;
     use ctxlake_core::Runtime;
-    use ctxlake_store::clock::SystemClock;
     use ctxlake_store::intent::{write as write_intent, Intent};
     use object_store::memory::InMemory;
     use object_store::PutPayload;
@@ -249,14 +245,11 @@ mod tests {
     async fn refresh_roster_writes_the_cache_and_reports_a_change() {
         let dir = tempfile::tempdir().unwrap();
         let store = InMemory::new();
-        let clock = SystemClock;
         seed_intent(&store, "cc-01").await;
         let c = cfg(dir.path());
         let mut state = RefreshState::default();
 
-        let changed = refresh_roster(&store, &clock, &c, &mut state)
-            .await
-            .unwrap();
+        let changed = refresh_roster(&store, &c, &mut state).await.unwrap();
         assert!(changed);
         let bytes = read_roster_cache(&c);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -267,30 +260,26 @@ mod tests {
     async fn a_second_refresh_with_no_change_costs_no_body_and_reports_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let store = InMemory::new();
-        let clock = SystemClock;
         seed_intent(&store, "cc-01").await;
         let c = cfg(dir.path());
         let mut state = RefreshState::default();
 
-        assert!(refresh_roster(&store, &clock, &c, &mut state)
-            .await
-            .unwrap());
+        assert!(refresh_roster(&store, &c, &mut state).await.unwrap());
         let first_write = std::fs::metadata(c.roster_path())
             .unwrap()
             .modified()
             .unwrap();
 
-        // No maintenance-lease holder in this test, so `fetch` falls back to a
-        // direct list every call rather than trusting an etag — assert the module
-        // still reports "no meaningful change" the one way available to it: the
-        // file's content and mtime are untouched by a cycle that found nothing new
-        // to say. (`RosterSource::RosterBuild`'s conditional-GET 304 path is
-        // covered directly against `ctxlake_store::roster` already; this test is
-        // about this module's plumbing, not re-proving that primitive.)
+        // Nobody in this test ever calls `roster::build`, so `roster.json` never
+        // exists in the store and `fetch` falls back to a direct list every call
+        // rather than trusting an etag — assert the module still reports "no
+        // meaningful change" the one way available to it: the file gets rewritten
+        // (a fresh direct-list snapshot each time), but its mtime only ever moves
+        // forward, never backward or into an error. (The conditional-GET 304 path
+        // is covered directly against `ctxlake_store::roster` already; this test
+        // is about this module's plumbing, not re-proving that primitive.)
         std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(refresh_roster(&store, &clock, &c, &mut state)
-            .await
-            .unwrap());
+        assert!(refresh_roster(&store, &c, &mut state).await.unwrap());
         let second_write = std::fs::metadata(c.roster_path())
             .unwrap()
             .modified()

@@ -2,7 +2,8 @@
 //! implement `PutMode::Update` at all (it returns `Error::NotImplemented`; only
 //! `Create`, via an atomic hard link, and `Overwrite`, via an atomic rename, are
 //! supported). The local filesystem is a documented backend (`docs/storage.md`) and
-//! the CAS-torture suite's default target, so leases need to actually work there.
+//! this crate's own CAS test suite's default target (`tests/cas.rs`), so CAS needs
+//! to actually work there, not just on the cloud backends.
 //!
 //! POSIX gives no primitive for "replace this file's contents only if they still
 //! match X" — `rename(2)` is atomic but unconditional, and `link(2)` is atomic but
@@ -112,7 +113,7 @@ impl ObjectStore for CasLocalFileSystem {
                 store: "CasLocalFileSystem",
                 source: format!("lock task panicked: {e}").into(),
             })?
-            .map_err(|e| io_err("acquiring lease lock", &location_owned, e))?;
+            .map_err(|e| io_err("acquiring the local CAS lock", &location_owned, e))?;
 
         let current_etag = match self.inner.head(location).await {
             Ok(meta) => meta.e_tag,
@@ -185,7 +186,7 @@ mod tests {
     async fn update_succeeds_against_the_version_just_written() {
         let dir = tempfile::tempdir().unwrap();
         let fs = store(dir.path());
-        let key = Path::from("lease.json");
+        let key = Path::from("object.json");
 
         let created = fs.put(&key, PutPayload::from_static(b"v1")).await.unwrap();
         let version = UpdateVersion::from(created);
@@ -206,7 +207,7 @@ mod tests {
     async fn update_against_a_stale_version_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let fs = store(dir.path());
-        let key = Path::from("lease.json");
+        let key = Path::from("object.json");
 
         let created = fs.put(&key, PutPayload::from_static(b"v1")).await.unwrap();
         let stale_version = UpdateVersion::from(created);
@@ -230,7 +231,7 @@ mod tests {
     async fn concurrent_updates_against_the_same_key_never_both_succeed() {
         let dir = tempfile::tempdir().unwrap();
         let fs = std::sync::Arc::new(store(dir.path()));
-        let key = Path::from("lease.json");
+        let key = Path::from("object.json");
         let created = fs.put(&key, PutPayload::from_static(b"v0")).await.unwrap();
         let version = UpdateVersion::from(created);
 

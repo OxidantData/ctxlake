@@ -483,10 +483,10 @@ pub async fn run_for_session(
         thresholds,
     );
     // Plain overwrite, not CAS: a digest is a pure function of immutable sealed
-    // data, so a concurrent recompute (two maintenance hosts racing before the
-    // lease serializes them, or a retry after a crash) always produces the same
-    // bytes — "two writers" racing to write identical content is not the hazard
-    // AGENTS.md invariant 3 is about.
+    // data, so a concurrent recompute (two maintenance hosts racing over the same
+    // session, or a retry after a crash) always produces the same bytes — "two
+    // writers" racing to write identical content is not the hazard AGENTS.md
+    // invariant 3 is about.
     store
         .put(
             &digest_key,

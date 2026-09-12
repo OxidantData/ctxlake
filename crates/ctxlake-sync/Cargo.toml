@@ -12,9 +12,9 @@ authors.workspace = true
 ctxlake-core = { path = "../ctxlake-core" }
 ctxlake-store = { path = "../ctxlake-store" }
 # Direct access to `ObjectStore`/`PutPayload`/`GetOptions` etc. — ctxlake-store wraps
-# these for its own coordination primitives (lease/intent/roster) but does not
-# re-export the crate itself, and this daemon also reads/writes `sessions/` and
-# `snapshot/` directly, which ctxlake-store has no wrapper for.
+# these for its own coordination primitives (intent/roster) but does not re-export
+# the crate itself, and this daemon also reads/writes `sessions/` and `snapshot/`
+# directly, which ctxlake-store has no wrapper for.
 object_store.workspace = true
 tokio.workspace = true
 serde.workspace = true

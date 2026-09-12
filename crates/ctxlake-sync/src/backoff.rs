@@ -3,8 +3,11 @@
 //! CAS race (`412 Precondition Failed`) is the mechanism working as designed
 //! (AGENTS.md invariant 4, `docs/architecture.md`'s failure-mode table), not a
 //! failure to escalate. Backing off after a normal CAS loss would slow down the
-//! *next* legitimate attempt on a lease or the roster for no reason — the retry
-//! there is supposed to be immediate, driven by a fresh read, not throttled.
+//! *next* legitimate attempt on the roster for no reason — the retry there is
+//! supposed to be immediate, driven by a fresh read, not throttled.
+//!
+//! [`XorShift`] is reused by [`crate::presence`] for an unrelated purpose (staggering
+//! how often each daemon rebuilds the roster) — see that module's doc.
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -138,7 +141,7 @@ mod tests {
     #[test]
     fn precondition_failed_never_backs_off() {
         let err: StoreError = OsError::Precondition {
-            path: "live/leases/x.json".into(),
+            path: "live/roster.json".into(),
             source: "etag mismatch".into(),
         }
         .into();

@@ -1,0 +1,25 @@
+[package]
+name = "ctxlake-maint"
+description = "Compaction, digests, extraction, the promotion gate, and snapshot building."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ctxlake-core = { path = "../ctxlake-core" }
+ctxlake-store = { path = "../ctxlake-store" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+rusqlite.workspace = true
+reqwest.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "ctxlake-cli"
+description = "The ctxlake binary: init, doctor, install, import, status, claim, sync, mcp, maint."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ctxlake"
+path = "src/main.rs"
+
+[dependencies]
+ctxlake-core = { path = "../ctxlake-core" }
+ctxlake-store = { path = "../ctxlake-store" }
+ctxlake-maint = { path = "../ctxlake-maint" }
+ctxlake-mcp = { path = "../ctxlake-mcp" }
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+glob.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

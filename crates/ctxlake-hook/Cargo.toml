@@ -1,0 +1,24 @@
+[package]
+name = "ctxlake-hook"
+description = "The per-event hook binary. Budget: 5ms p99. Fires on every tool call."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ctxlake-hook"
+path = "src/main.rs"
+
+# DO NOT ADD DEPENDENCIES HERE without reading AGENTS.md invariant 2.
+# CI (.github/workflows/ci.yml :: hook-deps) fails if this tree gains an async
+# runtime, an HTTP stack, or an object store.
+[dependencies]
+ctxlake-core = { path = "../ctxlake-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

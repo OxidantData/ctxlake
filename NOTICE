@@ -1,0 +1,36 @@
+ctxlake
+=======
+
+Copyright (C) 2026 Vamsi Krishna Kothapalli and the Oxidant Data contributors.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 of the License (see LICENSE). This program is
+distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+Commercial licenses are available for organizations that cannot use AGPLv3 —
+see COMMERCIAL.md. The Oxidant and ctxlake names and logos are trademarks —
+see TRADEMARK.md.
+
+Relationship to Oxidant
+-----------------------
+
+ctxlake is a separate project from the Oxidant query engine
+(https://github.com/OxidantData/Oxidant). It does not link Oxidant, and it
+requires no query engine to run. The lake it writes is plain partitioned
+Parquet, readable by DuckDB, Oxidant, Spark, or anything else that reads
+Parquet.
+
+Third-party components
+----------------------
+
+This project depends on the Apache Arrow `object_store` crate, Apache Arrow,
+Apache Parquet, tokio, and other open-source crates under Apache-2.0 / MIT /
+BSD licenses; see Cargo.lock for the full dependency inventory.
+
+The Hermes adapter (adapters/hermes/) is a plugin for the Hermes agent runtime
+and uses only the Python standard library. Claude Code, Cursor, and Hermes are
+products of their respective owners; this project is not affiliated with,
+sponsored by, or endorsed by any of them.

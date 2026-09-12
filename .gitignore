@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+
+# docs site
+site/node_modules
+site/.vitepress/cache
+site/.vitepress/dist
+
+# local runtime state — never commit a spool, it contains transcripts
+.ctxlake/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

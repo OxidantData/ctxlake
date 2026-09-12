@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      # MinIO is a first-class backend, and it is the one that lacks
+      # `If-None-Match: *`. The CAS suite must pass here, not only on S3.
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports: ["9000:9000"]
+    env:
+      CTXLAKE_TEST_S3_ENDPOINT: http://localhost:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  hook-deps:
+    # Invariant 2 (AGENTS.md): ctxlake-hook fires on every tool call and must stay
+    # under 5ms. It may not link an async runtime, an HTTP stack, or an object store.
+    # This job is the enforcement; without it the boundary erodes one PR at a time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90"
+      - name: Assert the hook's dependency tree stays small
+        run: |
+          tree=$(cargo tree -p ctxlake-hook --edges normal --prefix none | awk '{print $1}' | sort -u)
+          echo "$tree"
+          banned='^(tokio|object_store|reqwest|hyper|aws-sdk-.*|aws-config|arrow|parquet|rusqlite|axum|tonic)$'
+          if echo "$tree" | grep -qE "$banned"; then
+            echo "::error::ctxlake-hook linked a banned dependency (see AGENTS.md invariant 2)"
+            echo "$tree" | grep -E "$banned"
+            exit 1
+          fi

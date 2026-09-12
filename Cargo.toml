@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/OxidantData/ctxlake"
+homepage = "https://github.com/OxidantData/ctxlake"
+authors = ["Vamsi Krishna Kothapalli and the Oxidant Data contributors"]
+
+[workspace.dependencies]
+# --- shared by everything ---
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+thiserror    = "2"
+anyhow       = "1"
+
+# --- hook path: these are the ONLY deps ctxlake-hook may take. ---
+# CI asserts ctxlake-hook's dependency tree contains no async runtime, no HTTP
+# stack and no object store. See .github/workflows/ci.yml :: hook-deps.
+ulid         = "1"
+sha2         = "0.10"
+aho-corasick = "1"
+
+# --- store / maintenance path (never linked into the hook) ---
+object_store = { version = "0.14", features = ["aws", "gcp", "azure"] }
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
+bytes        = "1"
+futures      = "0.3"
+url          = "2"
+arrow        = "58"
+parquet      = "58"
+rusqlite     = { version = "0.37", features = ["bundled"] }
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+toml         = "0.9"
+clap         = { version = "4", features = ["derive"] }
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time         = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"] }
+glob         = "0.3"
+hex          = "0.4"
+
+# --- dev ---
+tempfile     = "3"
+proptest     = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

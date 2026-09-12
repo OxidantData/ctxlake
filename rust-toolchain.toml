@@ -1,0 +1,5 @@
+# The store and maintenance crates (object_store, arrow, parquet) need a recent
+# compiler. 1.90 matches the Oxidant engine's pin so one rustup install serves both.
+[toolchain]
+channel = "1.90"
+components = ["rustfmt", "clippy"]

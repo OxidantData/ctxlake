@@ -1,0 +1,23 @@
+[package]
+name = "ctxlake-core"
+description = "Envelope schema, config, and redaction for ctxlake."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Kept deliberately small: ctxlake-hook depends on this crate and must stay under
+# 5ms (AGENTS.md invariant 2). Nothing here may pull an async runtime or HTTP stack.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+aho-corasick.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

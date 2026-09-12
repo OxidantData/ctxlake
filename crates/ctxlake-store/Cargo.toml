@@ -1,0 +1,24 @@
+[package]
+name = "ctxlake-store"
+description = "Object-storage coordination: compare-and-swap, leases, roster, capability probe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ctxlake-core = { path = "../ctxlake-core" }
+object_store.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+futures.workspace = true
+url.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

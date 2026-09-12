@@ -1,0 +1,17 @@
+[package]
+name = "ctxlake-mcp"
+description = "stdio JSON-RPC MCP server exposing fleet and memory tools."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ctxlake-core = { path = "../ctxlake-core" }
+ctxlake-store = { path = "../ctxlake-store" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

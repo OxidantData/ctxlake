@@ -23,7 +23,8 @@ thread_local! {
     /// millisecond differ only in their random bits, so they sort arbitrarily. That
     /// would make a session's own events interleave out of order — the one ordering
     /// property this design actually relies on.
-    static EVENT_ID_GEN: RefCell<ulid::Generator> = RefCell::new(ulid::Generator::new());
+    static EVENT_ID_GEN: RefCell<ulid::Generator> =
+        const { RefCell::new(ulid::Generator::new()) };
 }
 
 /// A ULID that is strictly greater than the previous one from this thread.

@@ -27,13 +27,24 @@ pub enum StoreError {
 
     #[error("{0}")]
     Config(String),
+
+    /// `lease::acquire` was called against a key that has never been materialized.
+    /// AGENTS.md invariant 4 forbids using `PutMode::Create` to do that lazily
+    /// (MinIO rejects `If-None-Match: *` outright, not only on conflict — see
+    /// minio/minio#20346), so materializing a lease is a one-time, pre-contention
+    /// step: call `lease::provision` once (`ctxlake init` does this) before any
+    /// contender may call `acquire`. See the `lease` module doc.
+    #[error(
+        "lease {0} was never provisioned — call lease::provision() once, before any \
+         contender calls acquire(), see AGENTS.md invariant 4"
+    )]
+    LeaseNotProvisioned(String),
 }
 
 impl StoreError {
-    /// True for `PutMode::Create` losing to a concurrent writer. Every caller that
-    /// uses `Create` (the lazy lease-creation race, the CAS-primitive probe) must
-    /// treat this as a normal outcome of contention, never as a bug to log loudly —
-    /// see the `lease` module doc for why the race it guards is bounded and benign.
+    /// True for `PutMode::Create` losing to a concurrent writer — the capability
+    /// probe's `put-if-absent` check is the only caller left that exercises
+    /// `Create` at all; `lease` no longer does (see its module doc for why).
     pub fn is_already_exists(&self) -> bool {
         matches!(
             self,

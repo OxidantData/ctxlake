@@ -47,6 +47,11 @@ async fn run_torture(
     iterations: usize,
 ) {
     let key = torture_key();
+    // One-time, pre-contention provisioning — exactly the step `ctxlake init`
+    // would run, done here before any of the tasks below start contending. This
+    // must happen before any task can call acquire(), never inside the loop those
+    // tasks run (see lease.rs's module doc on why acquire() itself never does it).
+    lease::provision(store.as_ref(), &key).await.unwrap();
     let currently_held: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let total_successes = Arc::new(AtomicU64::new(0));
 
@@ -198,6 +203,7 @@ async fn dies_mid_hold_only_one_contender_steals() {
     let store = local_store(dir.path());
     let clock = SystemClock;
     let key = Path::from("live/leases/dies-mid-hold.json");
+    lease::provision(store.as_ref(), &key).await.unwrap();
 
     let AcquireOutcome::Acquired(handle) = lease::acquire(
         store.as_ref(),
@@ -291,6 +297,7 @@ async fn clock_skew_of_plus_and_minus_ten_minutes_never_causes_a_double_hold() {
     let dir = tempfile::tempdir().unwrap();
     let store = local_store(dir.path());
     let key = Path::from("live/leases/skew-race.json");
+    lease::provision(store.as_ref(), &key).await.unwrap();
 
     let ahead = SkewedClock(600); // +10 minutes
     let behind = SkewedClock(-600); // -10 minutes

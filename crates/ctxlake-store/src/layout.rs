@@ -155,8 +155,15 @@ pub(crate) mod internal {
 
     /// Scratch prefix the capability probe (`ctxlake doctor`) writes into and
     /// deletes when it is done. Never left behind on a clean run.
-    pub fn probe_prefix() -> Path {
-        Path::from("_meta").join("probe")
+    ///
+    /// Keyed by `caller_id` for the same reason [`clock_probe`] is (AGENTS.md
+    /// invariant 3): two `ctxlake doctor` runs against the same bucket — a fleet
+    /// where every agent doctors itself at startup, say — must not write each
+    /// other's scratch objects out from under them mid-probe. An unkeyed prefix
+    /// makes `put-if-absent` see a real conflict and `list` see the wrong count,
+    /// both misreported as the *backend* lacking a primitive it actually has.
+    pub fn probe_prefix(caller_id: &str) -> Path {
+        Path::from("_meta").join("probe").join(caller_id)
     }
 }
 
@@ -253,5 +260,20 @@ mod tests {
         assert!(internal::clock_probe("agent-a")
             .as_ref()
             .starts_with("_meta/clock/"));
+    }
+
+    #[test]
+    fn internal_probe_prefixes_are_keyed_per_caller() {
+        // Same requirement as clock_probe, for the same reason (AGENTS.md
+        // invariant 3): two concurrent `ctxlake doctor` runs must not share a
+        // scratch prefix, or each one's cleanup and setup collide with the
+        // other's, misreporting a real backend as missing a CAS primitive.
+        assert_ne!(
+            internal::probe_prefix("doctor-run-a"),
+            internal::probe_prefix("doctor-run-b")
+        );
+        assert!(internal::probe_prefix("doctor-run-a")
+            .as_ref()
+            .starts_with("_meta/probe/"));
     }
 }

@@ -62,11 +62,17 @@ pub fn build(url: &Url, opts: &BackendOptions) -> Result<(Arc<dyn ObjectStore>, 
             // `object_store` 0.14's `LocalFileSystem` has no `PutMode::Update` at
             // all (it returns `NotImplemented`) — see `local_cas` for why leases
             // need real CAS here too, and how this wrapper provides it.
-            let path_str = url.path();
-            if path_str.is_empty() {
+            //
+            // `url.path()` is the raw, percent-*encoded* path component ("my
+            // lake" comes back as "my%20lake") — handing that to `PathBuf`
+            // produces a path that doesn't exist on disk for anything but plain
+            // ASCII. `to_file_path()` decodes it back into the real OS path.
+            let root: PathBuf = url.to_file_path().map_err(|_| {
+                StoreError::Config(format!("file url {url} is not a valid local path"))
+            })?;
+            if root.as_os_str().is_empty() {
                 return Err(StoreError::Config(format!("file url {url} has no path")));
             }
-            let root = PathBuf::from(path_str);
             let inner = LocalFileSystem::new_with_prefix(&root)?;
             Ok((
                 Arc::new(CasLocalFileSystem::new(inner, root)),
@@ -138,6 +144,7 @@ pub fn build(url: &Url, opts: &BackendOptions) -> Result<(Arc<dyn ObjectStore>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
 
     #[test]
     fn file_scheme_builds_a_local_store() {
@@ -145,6 +152,40 @@ mod tests {
         let url = Url::from_directory_path(dir.path()).unwrap();
         let (_store, path) = build(&url, &BackendOptions::default()).unwrap();
         assert_eq!(path.as_ref(), "");
+    }
+
+    #[tokio::test]
+    async fn file_scheme_handles_a_path_containing_a_space() {
+        // Regression test: `url.path()` is percent-encoded ("my lake" becomes
+        // "my%20lake"), so building the root from it instead of
+        // `url.to_file_path()` handed `LocalFileSystem` a path that doesn't exist
+        // on disk. Routine on macOS/Windows (anything under an iCloud or OneDrive
+        // folder), and the local filesystem is the default backend.
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("my lake");
+        std::fs::create_dir(&dir).unwrap();
+        let url = Url::from_directory_path(&dir).unwrap();
+        assert!(
+            url.path().contains("%20"),
+            "test assumption: the URL's path component is percent-encoded: {url}"
+        );
+
+        let (store, _path) = build(&url, &BackendOptions::default())
+            .unwrap_or_else(|e| panic!("expected a space in the path to work fine: {e}"));
+
+        // Prove it's actually rooted at the real directory, not just that
+        // construction didn't panic: round-trip a write through it.
+        store
+            .put(
+                &Path::from("probe.json"),
+                object_store::PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            dir.join("probe.json").exists(),
+            "write should have landed in the real 'my lake' directory"
+        );
     }
 
     #[test]

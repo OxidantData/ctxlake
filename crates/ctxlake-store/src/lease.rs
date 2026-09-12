@@ -5,13 +5,19 @@
 //! A lease object always exists once first touched; its contents say free or held.
 //! We never use `PutMode::Create`/`If-None-Match: *` to decide who holds a lease,
 //! because MinIO rejects that precondition outright (minio/minio#20346, closed
-//! "working as intended") — a design that relied on it would work on AWS S3 in
-//! development and then break in front of the one backend this project exists to
-//! support. Every state transition here (acquire from free, steal from an expired
-//! holder, renew, release) is the same primitive: read the current JSON body and its
-//! [`UpdateVersion`], then `PutMode::Update(version)`. `Create` appears exactly once,
-//! in `read_or_create_free`, purely to materialize a never-touched key into the
-//! free state — see that function's doc for why the race there is harmless.
+//! "working as intended") — and not only on conflict: MinIO returns a plain error
+//! for `Create` even on the very first write to a key that has never existed, so a
+//! design that lazily "self-heals" a missing lease with `Create` does not merely
+//! race sometimes on MinIO, it never works at all. Every state transition here
+//! (acquire from free, steal from an expired holder, renew, release) is the same
+//! primitive: read the current JSON body and its [`UpdateVersion`], then
+//! `PutMode::Update(version)`. That requires the key to already exist, so
+//! materializing it is split out into [`provision`] — a one-time, single-writer
+//! step (`ctxlake init` calls it once per lease key, before any contender exists)
+//! that [`acquire`] never calls on a caller's behalf. See `provision`'s doc for why
+//! it must never run concurrently with `acquire`, and [`AcquireOutcome`] /
+//! [`StoreError::LeaseNotProvisioned`](crate::StoreError::LeaseNotProvisioned) for
+//! what happens if it hasn't run yet.
 //!
 //! Leases are advisory, and that should stay visible everywhere. Nothing on any
 //! backend in scope can make a write fail because it came from a "stale" holder —
@@ -84,7 +90,14 @@ impl LeaseState {
     /// at all — it grants nothing by itself. Two contenders can both see `true` here
     /// and race for real in the write that follows; the CAS is what actually decides
     /// (AGENTS.md invariant 4).
-    fn stealable(&self, now: OffsetDateTime) -> bool {
+    ///
+    /// `pub(crate)` because [`crate::roster::fetch`] needs the identical question —
+    /// "is anyone actually maintaining this right now?" — for a lease it never
+    /// intends to acquire. Duplicating this logic there (even just `holder.is_none()`
+    /// without the expiry half) is exactly how the two drift, which is what let a
+    /// dead maintainer's lapsed-but-still-`Some` lease freeze `fetch`'s fallback
+    /// forever — see the regression test on `fetch`.
+    pub(crate) fn stealable(&self, now: OffsetDateTime) -> bool {
         match (&self.holder, self.expires_at) {
             (None, _) => true,
             (Some(_), Some(expires_at)) => now >= expires_at,
@@ -124,54 +137,39 @@ pub enum AcquireOutcome {
     },
 }
 
-/// Reads `key`, lazily creating it in the free state if it has never been touched.
+/// Materialize `key` into the free state if it has never been touched. Idempotent:
+/// a key that already holds any state — free or held — is left completely alone.
 ///
-/// Two processes racing to create the same never-touched key both attempt
-/// `PutMode::Create` with the *identical* free-state payload — the free state has no
-/// fields that vary per-writer. So whichever `Create` the backend accepts, the
-/// object ends up holding the same bytes either way; the loser's `AlreadyExists`
-/// just means "the value I was about to write is already there," and a plain
-/// re-`GET` recovers it. The race is over *who gets to write*, never over *what gets
-/// written*, which is exactly why it is bounded (resolves in one extra round trip)
-/// and benign (no observer can tell who won).
-async fn read_or_create_free(
-    store: &dyn ObjectStore,
-    key: &Path,
-) -> Result<(LeaseState, UpdateVersion), StoreError> {
+/// This is a one-time, pre-contention provisioning step (`ctxlake init` calls it
+/// once per lease key), never something [`acquire`] does on a caller's behalf —
+/// that is the whole fix for the bug this function replaces. The write here is an
+/// unconditional `PutMode::Overwrite`, which is safe *only* under the precondition
+/// that nobody could possibly be racing to hold this lease yet: if a contender's
+/// `acquire` could run concurrently with `provision`, an `Overwrite` landing after
+/// that contender's real `PutMode::Update` would silently reset a live "held"
+/// record back to "free" — the exact kind of clobber invariant 4 exists to rule
+/// out. Calling `provision` a second time on an already-provisioned key is safe
+/// (it's a no-op, verified by the initial `GET`), but calling it *while agents are
+/// already contending* for the key is not, so it belongs in `ctxlake init` or
+/// equivalent single-writer setup, never in a hot path any lease contender runs.
+pub async fn provision(store: &dyn ObjectStore, key: &Path) -> Result<(), StoreError> {
     match store.get(key).await {
-        Ok(res) => {
-            let version = UpdateVersion {
-                e_tag: res.meta.e_tag.clone(),
-                version: res.meta.version.clone(),
-            };
-            let bytes = res.bytes().await?;
-            Ok((serde_json::from_slice(&bytes)?, version))
-        }
+        Ok(_) => Ok(()),
         Err(OsError::NotFound { .. }) => {
-            let free = LeaseState::free();
-            let payload = PutPayload::from(serde_json::to_vec(&free)?);
-            match store.put_opts(key, payload, PutMode::Create.into()).await {
-                Ok(result) => Ok((free, UpdateVersion::from(result))),
-                Err(OsError::AlreadyExists { .. }) => {
-                    let res = store.get(key).await?;
-                    let version = UpdateVersion {
-                        e_tag: res.meta.e_tag.clone(),
-                        version: res.meta.version.clone(),
-                    };
-                    let bytes = res.bytes().await?;
-                    Ok((serde_json::from_slice(&bytes)?, version))
-                }
-                Err(e) => Err(e.into()),
-            }
+            let payload = PutPayload::from(serde_json::to_vec(&LeaseState::free())?);
+            store
+                .put_opts(key, payload, PutMode::Overwrite.into())
+                .await?;
+            Ok(())
         }
         Err(e) => Err(e.into()),
     }
 }
 
 /// Read a lease without side effects. Reports the free state for a never-touched
-/// key rather than lazily creating it — a read-only caller (the roster fan-in
+/// key rather than materializing one — a read-only caller (the roster fan-in
 /// checking whether anyone holds [`crate::layout::lease_maintenance`]) should never
-/// cause a write.
+/// cause a write, and unlike `acquire` it never needs a version to CAS against.
 pub async fn read(store: &dyn ObjectStore, key: &Path) -> Result<LeaseState, StoreError> {
     match store.get(key).await {
         Ok(res) => {
@@ -191,6 +189,11 @@ pub async fn read(store: &dyn ObjectStore, key: &Path) -> Result<LeaseState, Sto
 /// and a holder re-acquiring its own lease. All three are "the object currently
 /// permits a new holder to take it," which is exactly `LeaseState::stealable` plus
 /// the same-holder case, followed by the identical `PutMode::Update` write.
+///
+/// Returns [`StoreError::LeaseNotProvisioned`] if `key` has never been touched —
+/// call [`provision`] once, before any contender exists, rather than treating that
+/// as something `acquire` should paper over (see the module doc and `provision`'s
+/// doc for why it can't do so safely).
 pub async fn acquire(
     store: &dyn ObjectStore,
     clock: &dyn Clock,
@@ -199,7 +202,20 @@ pub async fn acquire(
     reason: Option<&str>,
     ttl: Duration,
 ) -> Result<AcquireOutcome, StoreError> {
-    let (state, version) = read_or_create_free(store, key).await?;
+    let (state, version) = match store.get(key).await {
+        Ok(res) => {
+            let version = UpdateVersion {
+                e_tag: res.meta.e_tag.clone(),
+                version: res.meta.version.clone(),
+            };
+            let bytes = res.bytes().await?;
+            (serde_json::from_slice::<LeaseState>(&bytes)?, version)
+        }
+        Err(OsError::NotFound { .. }) => {
+            return Err(StoreError::LeaseNotProvisioned(key.to_string()));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let now = OffsetDateTime::from(clock.now().await?);
 
     let eligible = state.holder.as_deref() == Some(holder) || state.stealable(now);
@@ -325,6 +341,7 @@ mod tests {
     async fn acquires_a_never_touched_lease() {
         let store = InMemory::new();
         let clock = SystemClock;
+        provision(&store, &key()).await.unwrap();
         let outcome = acquire(
             &store,
             &clock,
@@ -348,6 +365,7 @@ mod tests {
     async fn second_contender_is_refused_while_held() {
         let store = InMemory::new();
         let clock = SystemClock;
+        provision(&store, &key()).await.unwrap();
         let _first = acquire(
             &store,
             &clock,
@@ -377,6 +395,7 @@ mod tests {
     async fn renew_extends_ttl_and_release_frees_it() {
         let store = InMemory::new();
         let clock = SystemClock;
+        provision(&store, &key()).await.unwrap();
         let AcquireOutcome::Acquired(mut handle) = acquire(
             &store,
             &clock,
@@ -405,6 +424,7 @@ mod tests {
     async fn expired_lease_can_be_stolen_by_exactly_one_contender() {
         let store = InMemory::new();
         let clock = SystemClock;
+        provision(&store, &key()).await.unwrap();
         let AcquireOutcome::Acquired(handle) = acquire(
             &store,
             &clock,
@@ -458,6 +478,7 @@ mod tests {
     async fn renew_fails_cleanly_once_someone_else_has_stolen_it() {
         let store = InMemory::new();
         let clock = SystemClock;
+        provision(&store, &key()).await.unwrap();
         let AcquireOutcome::Acquired(mut stale_handle) = acquire(
             &store,
             &clock,
@@ -527,6 +548,7 @@ mod tests {
 
         let store = InMemory::new();
         let real_clock = SystemClock;
+        provision(&store, &key()).await.unwrap();
         let AcquireOutcome::Acquired(_holder) = acquire(
             &store,
             &real_clock,
@@ -560,11 +582,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_never_issues_put_if_absent_against_an_existing_lease() {
-        // MinIO rejects If-None-Match: * (minio/minio#20346) — PutMode::Create is
-        // only ever correct for materializing a never-touched key (see
-        // read_or_create_free's doc). Once the object exists, every write acquire()
-        // makes — including a steal — must be PutMode::Update.
+    async fn acquire_never_issues_put_if_absent() {
+        // MinIO rejects If-None-Match: * outright (minio/minio#20346) — not only on
+        // conflict, on the very first write too — so AGENTS.md invariant 4 forbids
+        // acquire() from ever reaching for PutMode::Create, full stop, whether the
+        // key is never-touched, free, held, or expired. provision() uses Overwrite
+        // (untracked by this spy) to materialize the key instead.
         #[derive(Debug)]
         struct PutModeSpy {
             inner: Arc<dyn ObjectStore>,
@@ -641,7 +664,11 @@ mod tests {
         };
         let clock = SystemClock;
 
-        // First touch: the only Create this whole test should ever see.
+        // Provisioning happens once, out-of-band, via Overwrite — not tracked as a
+        // Create, and not something acquire() itself ever does.
+        provision(&spy, &key()).await.unwrap();
+        assert_eq!(spy.creates.load(Ordering::SeqCst), 0);
+
         let AcquireOutcome::Acquired(handle) = acquire(
             &spy,
             &clock,
@@ -654,7 +681,7 @@ mod tests {
         .unwrap() else {
             panic!("expected to acquire");
         };
-        assert_eq!(spy.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.creates.load(Ordering::SeqCst), 0);
         assert_eq!(spy.updates.load(Ordering::SeqCst), 1);
 
         release(&spy, handle).await.unwrap();
@@ -688,8 +715,145 @@ mod tests {
 
         assert_eq!(
             spy.creates.load(Ordering::SeqCst),
-            1,
-            "no acquire against an existing lease — free, held, or expired — may use PutMode::Create"
+            0,
+            "acquire() must never issue PutMode::Create, against any lease state"
+        );
+    }
+
+    /// A minimal stand-in for MinIO's actual behavior (minio/minio#20346): every
+    /// `PutMode::Create` is rejected with a plain backend error, not
+    /// `Error::AlreadyExists` — even the very first `Create` against a key that has
+    /// never been written, which is the part the old `read_or_create_free` design
+    /// got wrong (it assumed a failing `Create` always meant "someone beat me to
+    /// it," recoverable by re-reading). Everything else passes straight through.
+    #[derive(Debug)]
+    struct CreateAlwaysRejectingStore {
+        inner: InMemory,
+    }
+    impl std::fmt::Display for CreateAlwaysRejectingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CreateAlwaysRejectingStore({})", self.inner)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ObjectStore for CreateAlwaysRejectingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if matches!(opts.mode, PutMode::Create) {
+                // Real MinIO returns some non-{AlreadyExists,Precondition,NotModified}
+                // error for this header regardless of whether the object exists —
+                // a raw `Generic` is representative of "not a shape acquire() can
+                // recover from by re-reading."
+                return Err(OsError::Generic {
+                    store: "CreateAlwaysRejectingStore",
+                    source: "If-None-Match: * is not supported (minio/minio#20346)".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_works_on_a_backend_where_create_never_succeeds() {
+        // Regression test for the critical bug: the old acquire() lazily called
+        // PutMode::Create to materialize a never-touched lease, which is exactly
+        // the request MinIO rejects outright — not just on conflict, on the very
+        // first attempt. On a backend shaped like that, the old code could never
+        // create a single lease: this failed with the real production error before
+        // provision() existed to take Create out of acquire()'s hot path entirely.
+        let store = CreateAlwaysRejectingStore {
+            inner: InMemory::new(),
+        };
+        let clock = SystemClock;
+        let key = key();
+
+        // The one-time provisioning step an operator (ctxlake init) runs before
+        // any contender exists — it uses Overwrite, which this backend supports
+        // fine, unlike Create.
+        provision(&store, &key).await.unwrap();
+
+        let outcome = acquire(
+            &store,
+            &clock,
+            &key,
+            "agent-a",
+            None,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, AcquireOutcome::Acquired(_)),
+            "acquire must succeed once provisioned, even though this backend's \
+             PutMode::Create never works: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_reports_not_provisioned_rather_than_guessing() {
+        // A never-touched key is a caller error (provision() was skipped), not
+        // silent contention — acquire() must say so explicitly rather than trying
+        // (and, on MinIO-shaped backends, failing) to fix it itself.
+        let store = InMemory::new();
+        let clock = SystemClock;
+        let err = acquire(
+            &store,
+            &clock,
+            &key(),
+            "agent-a",
+            None,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, StoreError::LeaseNotProvisioned(_)),
+            "expected LeaseNotProvisioned, got {err:?}"
         );
     }
 }

@@ -1,9 +1,8 @@
 # Scaling — where this does not scale, with the cost arithmetic
 
 Object storage has no idle cost and no server to size. It also has a request-pricing
-model that punishes the naive version of exactly the thing a coordination layer wants
-to do — poll for what changed. This page is the arithmetic behind that tradeoff, so
-"does this scale" has a number attached instead of a vibe.
+model that punishes the naive version of exactly what a coordination layer wants to
+do — poll for what changed. This page puts a number on "does this scale."
 
 ## The price list this page uses
 
@@ -15,26 +14,21 @@ Real S3 request pricing, per 1,000 requests:
 | `PUT` (including a CAS write) | $0.005 |
 | `GET` | $0.0004 |
 
-**A `LIST` or `PUT` costs 12.5x a `GET`.** That ratio is the single most important
-number on this page — every section below is a variation on "something in this design
-issues a `LIST` or a `PUT` where a `GET` would do, and it costs 12.5x more than it
-looked like it would."
+**A `LIST` or `PUT` costs 12.5x a `GET`.** Every section below is a variation on
+"something here issues a `LIST` or `PUT` where a `GET` would do."
 
 ## The O(N²) polling problem
 
-The naive way to answer "who else is active" is: every agent, on every poll cycle,
-lists the roster prefix and then fetches every peer's object individually to read its
-contents. That's `O(N)` list-ish work and `O(N²)` fetch work across the fleet, because
-each of `N` agents fetches `N-1` others.
+Naively, "who else is active" means every agent, every poll cycle, lists the roster
+prefix and fetches every peer's object individually. That's `O(N)` list work and
+`O(N²)` fetch work fleet-wide, because each of `N` agents fetches `N-1` others.
 
-At a 5-second poll interval, that's 17,280 cycles/day. Per cycle, each agent issues 1
-`LIST` (of `live/agents/`) and `N-1` `GET`s (one per peer). Fleet-wide, that's `N`
-`LIST`s and `N(N-1)` `GET`s per cycle:
+At a 5-second poll interval (17,280 cycles/day), fleet-wide that's `N` `LIST`s and
+`N(N-1)` `GET`s per cycle:
 
 ```text
 LISTs/day = N × 17,280
 GETs/day  = N(N-1) × 17,280
-
 cost/day  = LISTs × $0.005/1000  +  GETs × $0.0004/1000
 ```
 
@@ -44,29 +38,18 @@ cost/day  = LISTs × $0.005/1000  +  GETs × $0.0004/1000
 | 20 agents | 345,600 | 6,566,400 | $1.73 + $2.63 ≈ **$4.35/day** |
 | 50 agents | 864,000 | 42,336,000 | $4.32 + $16.93 ≈ **$21.25/day** (~$640/mo) |
 
-(This is LIST-then-GET discovery traffic only — the sum of the two columns to its
-left, nothing more. Each agent's own heartbeat `PUT` is `O(N)` under either discovery
-strategy on this page, naive or fan-in, so it is excluded from both totals rather than
-folded into one and not the other; the fan-in section below makes the same exclusion
-explicitly, for the same reason.)
+(Discovery traffic only — each agent's own heartbeat `PUT` is `O(N)` either way and
+excluded from both this total and the fan-in total below, for the same reason.) The
+`N(N-1)` term is the problem: doubling the fleet roughly quadruples discovery cost.
 
-The `N(N-1)` term is the problem, not the constant factor: doubling the fleet
-roughly quadruples the discovery cost, because everyone is now checking on everyone.
+## Roster fan-in: O(N) instead of O(N²)
 
-## Roster fan-in: making discovery O(N) instead of O(N²)
-
-The fix is the same one every polling system eventually reaches: don't have every
-consumer fetch every producer directly — fan the producers **in** to one shared object,
-and have every consumer read that one object instead.
-
-Concretely: agents still each write their own heartbeat (that traffic is `O(N)` either
-way, and is not part of this comparison — same exclusion as the naive total above).
-Once per poll cycle, one aggregation step does a single `LIST` of `live/agents/`,
-`GET`s each of the `N` heartbeats to merge them, and `PUT`s one merged roster snapshot.
-Every agent then reads *that one snapshot* instead of its `N-1` peers directly — one
-`GET` each. That merged-snapshot `PUT` is cost the naive scheme never pays — it exists
-only because fan-in introduces an aggregation step — so unlike the heartbeat traffic
-excluded above, it belongs in this model.
+Don't have every consumer fetch every producer — fan producers **in** to one shared
+object, and have every consumer read that instead. Once per poll cycle, one
+aggregation step `LIST`s `live/agents/`, `GET`s each of the `N` heartbeats, and `PUT`s
+one merged roster snapshot; every agent then does one `GET` of that snapshot instead
+of `N-1` peer fetches. That merged-snapshot `PUT` is cost the naive scheme never pays,
+so it belongs in this model:
 
 ```text
 LISTs/day (aggregation, once/cycle)     = 17,280
@@ -84,108 +67,39 @@ cost/day  = (LISTs + PUTs) × $0.005/1000  +  GETs × $0.0004/1000
 | 20 agents | $0.1728 + 20 × $0.0138 ≈ **$0.45/day** |
 | 50 agents | $0.1728 + 50 × $0.0138 ≈ **$0.86/day** (~$26/mo) |
 
-Same fleet, same freshness interval, **~25x cheaper at 50 agents** — because discovery
-went from `O(N²)` GETs to `O(N)`, even after counting the aggregation `PUT` that fan-in
-adds and the naive scheme never pays. This is the entire justification for the roster
-being a fanned-in snapshot in `live/` rather than something every agent's daemon
-reconstructs independently.
+Same fleet, same freshness interval, **~25x cheaper at 50 agents** — discovery goes
+from `O(N²)` GETs to `O(N)`, even counting the aggregation `PUT` the naive scheme never
+pays. This is why the roster is a fanned-in snapshot in `live/`, not something every
+agent's daemon reconstructs independently.
 
-## The latency floor, and why the local cache exists
+## Other costs worth knowing
 
-S3-class object storage has a real latency floor: p50 around 20–100ms, p99 routinely
-over 200ms, even against a healthy bucket in the right region. That is not a
-misconfiguration to fix — it is the physics of a request crossing a network to a
-multi-tenant service and back. A design that puts this on the hook path makes every
-tool call feel like it has 200ms of unexplained lag. That number is the entire reason
-invariant 1 exists and the entire reason the local cache exists: the hook never waits
-on this, ever, no matter how fast or slow the store is having a day.
-
-## S3 Express One Zone — for `live/` only
-
-S3 Express One Zone offers single-digit-millisecond latency and roughly 50% cheaper
-per-request pricing than S3 Standard, at roughly 4.8x the storage cost and — the part
-that matters here — **single-AZ** durability. That tradeoff is exactly right for
-`live/`: small, ephemeral, replaceable-on-restart objects where losing an AZ just means
-the roster goes stale until it re-heartbeats. It is exactly wrong for `sessions/`: that
-plane is the permanent record, bronze is never rewritten, and losing an AZ there is
-losing history. Never move `sessions/` or `snapshot/` onto single-AZ storage to save
-money on `live/`'s latency — put only `live/` there, if you use it at all.
-
-## CAS contention on a hot key
-
-Every `live/` write that loses a CAS race costs a `412` and a retry — that's expected,
-not a bug (see the failure-modes table in [architecture.md](architecture.md)). But a
-genuinely *hot* key — many agents trying to acquire the same lease at once, or a
-fan-in roster snapshot being rebuilt by an overlapping set of writers — turns retries
-into a real cost line: every failed attempt still billed as a `PUT`, at the same
-$0.005/1000 rate as one that succeeds. Backoff with jitter keeps this from becoming a
-thundering herd; it does not make the underlying contention free.
-
-## Heartbeat write amplification
-
-A `PUT` costs 12.5x a `GET`. A heartbeat renewed every cycle is a `PUT`, not a `GET` —
-so renewing more often than necessary is the single easiest way to overspend on this
-system. The 60-second renewal interval against a 5-minute TTL (see the knob table in
-architecture.md) is chosen specifically to keep the renewal-to-TTL ratio safe (one
-missed cycle doesn't expire the lease) without renewing so often that the `PUT` cost
-dominates the bill the way the naive `O(N²)` discovery pattern does above.
-
-## Small-object explosion
-
-Every plane here writes lots of small objects — one Parquet file per session, one JSON
-object per heartbeat, one blob per snapshot publish. Left uncompacted, `sessions/`
-accumulates thousands of small files, which costs more in `LIST` overhead (pricier per
-request, and paginated at scale) and in per-object metadata overhead on most backends,
-without adding any real information density. This is what `ctxlake maint`'s compaction
-step exists to control — see the maintenance chain in [architecture.md](architecture.md).
-
-## Snapshot fan-out egress
-
-Every agent's cache-refresh cycle fetches the current briefing blob. That's `N` GETs of
-the *same* object per refresh interval, fleet-wide — bandwidth that scales linearly
-with fleet size and blob size. Two things keep this cheap: a conditional GET against
-the `current.json` pointer means most cycles cost a `304 Not Modified`, not a full body
-transfer, and the refresh interval itself is a knob that trades freshness directly
-against this cost (architecture.md's knob table).
-
-## No cross-key atomicity, at scale
-
-This isn't a scale problem so much as a scale-*doesn't-fix-it* problem: nothing above —
-fan-in, compaction, caching — changes the fact that a snapshot publish is two separate
-writes with no transaction between them, or that a claim's proposal and its promotion
-are two different keys. Scaling this system means doing more single-object-atomic
-operations faster and cheaper; it never means acquiring a multi-key transaction that
-doesn't exist on any backend here.
-
-## Clock skew
-
-Lease expiry is computed from the store's `Date` response header, never a local clock
-(invariant 6), specifically because a fleet has no shared clock and a skewed laptop
-must not be able to decide a live peer's lease has expired. This has no scaling cost —
-it's one extra header read per lease check — but it is worth naming here because it's
-the reason "just check `SystemTime::now()`" was never on the table as a cheaper option.
+| Source | What it costs | Mitigation |
+|---|---|---|
+| **Latency floor** | S3-class stores: p50 20–100ms, p99 200ms+. Putting this on the hook path makes every tool call feel laggy. | The local cache — the hook never waits on the network (invariant 1). |
+| **S3 Express One Zone** | ~50% cheaper per request, single-digit-ms latency, but single-AZ durability and ~4.8x storage cost. | Use it for `live/` only — small, replaceable-on-restart objects. Never for `sessions/` or `snapshot/`: bronze is the permanent record, and losing an AZ there is losing history. |
+| **CAS contention on a hot key** | A failed CAS write still bills as a full `PUT`. Many agents' heartbeats landing on the fan-in roster snapshot at once turns retries into a real cost line. | Backoff with jitter avoids a thundering herd; it doesn't make the contention free. |
+| **Heartbeat write amplification** | A `PUT` costs 12.5x a `GET`. Renewing a heartbeat more often than necessary is the easiest way to overspend. | The default renewal interval is 1/5 of the roster TTL — one missed cycle doesn't drop a live peer, without renewing so often the `PUT` cost dominates. |
+| **Small-object explosion** | Thousands of small session files cost more in `LIST` overhead and per-object metadata than they add in information density. | `ctxlake maint`'s compaction step — see [architecture.md](architecture.md). |
+| **Snapshot fan-out egress** | Every agent's cache refresh fetches the current briefing blob — `N` GETs of the same object per interval. | A conditional GET against the pointer means most cycles cost a cheap `304`, not a full transfer. |
+| **No cross-key atomicity** | A snapshot publish is two writes with no transaction between them; a claim's proposal and promotion are two separate keys. Scaling never buys a multi-key transaction that doesn't exist on any backend here. | Doing more single-object-atomic operations, faster and cheaper — not a bigger primitive. |
+| **Clock skew** | A fleet has no shared clock. | Every expiry check reads the store's own `Date` response header, never a local clock — one extra header read, no scaling cost. |
 
 ## The honest ceiling: about 50 agents
 
 Put the fan-in numbers next to the latency floor and the answer is plain: somewhere
-around 50 concurrently active agents polling `live/` at these intervals, the `O(N)`
-(post-fan-in) request volume and the accumulated CAS contention on shared keys (the
-roster snapshot, hot leases) stop being "a few dollars a day" and start being an
-operational concern — retries queuing, renewal cycles missing their window under load,
-and a bill that, while still small in absolute terms, is growing faster than the value
-of adding one more agent.
+around 50 concurrently active agents polling `live/` at these intervals, `O(N)`
+(post-fan-in) request volume and CAS contention on the roster snapshot stop being "a
+few dollars a day" and start being an operational concern.
 
 **ctxlake does not autoscale past this ceiling.** The documented path is to move
-`live/` specifically — roster, intents, leases — onto DynamoDB or Redis, which are
-built for exactly this access pattern (small objects, high write rate, real
-conditional-write semantics with no per-vendor asterisks), while `sessions/` and
-`snapshot/` stay exactly where they are, unchanged, on the lake. Nothing about bronze
-or the serving plane requires this migration; it is scoped entirely to the one plane
-whose access pattern actually outgrows plain object storage.
+`live/` specifically — roster and intents — onto DynamoDB or Redis, built for exactly
+this access pattern (small objects, high write rate, conditional writes with no
+per-vendor asterisks), while `sessions/` and `snapshot/` stay unchanged on the lake.
 
 ## Next steps
 
-- [architecture.md](architecture.md) — where the knobs referenced above (TTL, poll
-  interval, renewal interval) live, and their individual blast radius
+- [architecture.md](architecture.md) — where the knobs referenced above live, and
+  their individual blast radius
 - [storage.md](storage.md) — the CAS matrix this entire cost model assumes
-- [coordination.md](coordination.md) — what a lease costs to hold, from the user's side
+- [coordination.md](coordination.md) — what a roster heartbeat costs, from the user's side

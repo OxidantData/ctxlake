@@ -10,7 +10,6 @@ e.g. `s3://my-bucket/ctxlake`. This is the full tree, prefix by prefix.
   live/                                           # control plane — CAS only, see concepts.md
     agents/<agent_id>.json                        # roster heartbeat: runtime, repo, branch, current tool, expires_at
     intents/<agent_id>.json                       # declared "about to touch" — advisory, no contention
-    leases/<resource_key>.json                    # advisory lock — status: free | held, owner, expires_at
 
   sessions/                                       # data plane — single-writer append, bronze, immutable
     dt=<yyyy-mm-dd>/fleet=<fleet_id>/runtime=<runtime>/agent=<agent_id>/session=<session_id>/
@@ -24,6 +23,7 @@ e.g. `s3://my-bucket/ctxlake`. This is the full tree, prefix by prefix.
   claims/                                         # data plane — single-writer append
     events/dt=<yyyy-mm-dd>/agent=<agent_id>/<ulid>.json  # proposed claims (memory_propose) — one file per proposal
     fleet/<claim_id>.json                         # promoted claims — only the gate (ctxlake maint) writes here
+    extracted/<session_id>                        # idempotency marker — PutMode::Create, at most one host extracts a session
 
   snapshot/                                       # serving plane — immutable publish + CAS pointer swap
     <sha256-of-content>.sqlite                    # content-addressed, written once, never overwritten — see below
@@ -35,12 +35,10 @@ e.g. `s3://my-bucket/ctxlake`. This is the full tree, prefix by prefix.
 
 ## Reading the tree
 
-**`<resource_key>`** is `resource_key(repo, resource)` from
-[`hash.rs`](../crates/ctxlake-core/src/hash.rs) — a SHA-256 over `repo\0resource`
-(the null byte is there specifically so `("ab", "c")` and `("a", "bc")` can never
-collide into the same lease). It's deterministic, so two agents locking the same
-logical resource always compute the same key without coordinating first, and it's
-plain hex, so it's a safe object-key component on every backend.
+**`claims/extracted/<session_id>`** is written with `PutMode::Create` before
+extraction touches a session — an idempotency marker, not a lock. Exactly one host's
+create succeeds; every other host's identical attempt fails and moves on. There is no
+holder, no TTL, and nothing to renew or steal, because nothing waits on it.
 
 **`sessions/` is Hive-partitioned** on `dt`, `fleet`, `runtime`, and `agent` so any
 Parquet engine — DuckDB, Spark, Oxidant — can prune by any of the four without reading

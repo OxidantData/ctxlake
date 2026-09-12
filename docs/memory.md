@@ -134,35 +134,21 @@ One flag per agent, reversible, auditable, one line: its claims stop promoting, 
 already-promoted claims move to `contested`, and **its capture continues** — you want the
 record of the failure, not a gap where it used to be.
 
-The signal to reach for it: a rising contradiction rate from one agent. That usually means
-its extraction has drifted, and it is the early warning that lets you act before the pool
-is polluted rather than after — `crate::calibrate::contradiction_rates` computes exactly
-this ratio (contested / (promoted + contested)) per agent from the current claim log, so
-an operator can watch it rise before reaching for the flag rather than discovering the
-pool is polluted afterwards.
+The signal to reach for it: a rising contradiction rate from one agent usually means its
+extraction has drifted — the early warning that lets you act before the pool is polluted
+rather than after.
 
-**The real kill switch lives in the gate, not in a CLI flag — and as of this wave the two
-are not yet the same thing.** `crate::calibrate::quarantine`/`unquarantine` append
-`AgentQuarantined`/`AgentUnquarantined` events to the same claim event log everything else
-here lives in; `crate::gate::run_gate` checks that log *before* any of the four gates (a
-fifth, separate lever, not one of them — a quarantined agent's candidate never even
-reaches the evidence check), and `crate::gate::run` demotes that agent's already-`Promoted`
-claims to `contested` on *every* run, not only the run right after quarantine was flagged —
-a standing invariant re-checked every time, not a one-time reaction. Un-quarantining is
-real and reversible but is not a rollback: a claim already demoted to `contested` stays
-there for a human to review, exactly like any other contradiction. Lifting quarantine only
-restores the *ability* to promote again.
+The gate's own quarantine log checks every candidate *before* the four gates (a
+quarantined agent's candidate never reaches the evidence check) and demotes that agent's
+already-promoted claims to `contested` on every run, not just once. Un-quarantining
+restores the *ability* to promote again — a claim already demoted stays `contested` for a
+human to review, like any other contradiction.
 
-> **Known gap: `ctxlake quarantine <agent_id>`, the CLI command, does not call any of
-> this yet.** It writes a marker under `claims/quarantine/` and edits the *local* fleet
-> cache mirror directly — bookkeeping an operator can read back, but `gate::run_gate` and
-> `gate::run` never consult either of those, only the `AgentQuarantined` event log above.
-> Today there is no command-line entry point to the kill switch that actually stops
-> promotion; running the documented command demotes the local cache view of an agent's
-> claims without touching what the gate will do on its next run. Wiring the CLI command to
-> append the real event (or retiring the marker-file path entirely) is the natural next
-> step, and until it lands, treat the two as separate mechanisms rather than assuming the
-> command name implies the effect described above.
+> **Known gap: `ctxlake quarantine <agent_id>`, the CLI command, does not reach the gate's
+> quarantine log yet.** It writes a marker and edits the local fleet cache mirror, which
+> the gate never consults — so today there is no command-line entry point to the kill
+> switch that actually stops promotion. Treat the CLI command and the real mechanism as
+> separate until this is wired up.
 
 ## Confidence is derived, not claimed
 
@@ -178,192 +164,54 @@ from track record instead:
 This only works because provenance and independence were kept from the start. It is the
 payoff that justifies the discipline on the rest of this page.
 
-`crate::calibrate::resolve` is that join: among the `outcome` claims on a hypothesis's own
-`subject`, observed no earlier than the hypothesis itself, **already `Promoted` by the
-gate**, and **observed by a different agent than the hypothesis**, the earliest is the
-answer. The last two of those are enforced by `resolve` itself, not left to a caller to
-remember: without them, `memory_propose("outcome", ...)` lets any agent manufacture its
-own track record — propose a hypothesis, then propose an agreeing "outcome" under its own
-identity, and score itself `Correct` with no gate ever having compared either to reality.
-Requiring a different observer closes that off, because an agent's identity is fixed by
-its adapter for the life of a session, not a field a tool call can set; requiring
-`Promoted` means the "outcome" had to survive real evidence and provenance checks first,
-not merely exist. Whether the matched outcome *agrees* with the hypothesis is its own
-proxy — see the honest-limitations section below for exactly what it does and does not
-catch, and why it is deliberately not the same check the contradiction gate uses despite
-the resemblance. A hypothesis whose resolution date has passed with no matching outcome at
-all is `Expired`,
-which is deliberately **not** the same outcome as `Incorrect`: an unanswered question must
-never lower a score the way a wrong answer does, or the calibration loop would punish an
-agent for questions nobody ever answered. `crate::calibrate::score_agent` keeps that
-distinction all the way through — `expired_count` is tracked for visibility but never
-enters the Brier-style score, which is mean squared error over `{0, 1}` (`correct` → 0,
-`incorrect` → 1) across resolved predictions only.
+The resolver joins each hypothesis to the earliest matching, already-promoted `outcome`
+claim observed by a *different* agent — requiring a different observer closes off an
+agent manufacturing its own track record (propose a hypothesis, then an agreeing
+"outcome" under its own identity). A hypothesis whose resolution date passes with no
+matching outcome is `Expired`, deliberately **not** the same as `Incorrect`: an
+unanswered question must never lower a score the way a wrong answer does.
 
-That score is deliberately hard to over-trust on a small sample: an agent's true score is
-blended with a neutral prior weighted by a fixed pseudo-count (Bayesian shrinkage), so
-three resolved predictions — even three-for-three — cannot swing an agent's trust nearly
-as far as three hundred can. `AgentScore::low_sample` flags the raw case explicitly on top
-of that, so nothing downstream can present "1.00" from three data points as if it meant
-what "1.00" from three hundred would mean. Every score is itself an event —
-`ClaimEvent::CalibrationScored`, carrying the cumulative total as of that moment — in the
-same append-only log everything else in this page lives in, for the identical reason: an
-agent's track record must be exactly as auditable and replayable as the claims it is
-scoring.
+An agent's score is blended with a neutral prior weighted by a fixed pseudo-count
+(Bayesian shrinkage), so three resolved predictions — even three-for-three — cannot
+swing trust nearly as far as three hundred can; a `low_sample` flag marks the raw case
+explicitly so a "1.00" from three data points is never read as a "1.00" from three
+hundred.
 
-The payoff lands in `crate::gate::derive_confidence`: a newly-promoted claim's confidence
-is still a structural function of `independent_count` (unchanged), scaled by the observing
-agent's `trust_multiplier` — neutral (`1.0`) for an agent with no resolved track record
-yet, above `1.0` for a proven-reliable one, below `1.0` for a proven-unreliable one. There
-is no self-reported confidence anywhere on a proposed claim for this to silently fall back
-to — the schema simply carries no such field — so the only way an agent's assertions carry
-more or less weight is by earning it.
+A newly-promoted claim's confidence is still a structural function of
+`independent_count`, scaled by the observing agent's trust multiplier — neutral for an
+agent with no resolved track record yet, above or below neutral for a proven-reliable
+or unreliable one. There is no self-reported confidence anywhere on a proposed claim —
+the schema carries no such field — so the only way an agent's assertions carry more or
+less weight is by earning it.
 
-## Where this lives, and what's still a placeholder
-
-`ctxlake-maint` (wave 3) implements the pipeline this page describes:
-
-- **The event log** — `crates/ctxlake-maint/src/claims.rs`. `Proposed` / `Promoted` /
-  `Contested` / `Retired` / `Superseded` are separate append objects under
-  `claims/events/` (see [layout.md](layout.md)); `fold()` replays them into current
-  state, and nothing anywhere overwrites one of these events in place. The one exception
-  is `claims/fleet/<claim_id>.json`, which the gate *does* overwrite as a claim's status
-  changes — safe specifically because `gate::run` *requires* a
-  `ctxlake_store::lease::LeaseHandle` for `lease_maintenance` as a parameter (checked
-  against its key at runtime), not merely a comment saying the caller ought to hold one,
-  so there is never a second writer to race. `publish_fleet_state` and
-  `list_fleet_claims` are `pub(crate)`: nothing outside this crate can reach
-  `claims/fleet/` directly, only through the gate or the shadow-mode-aware read path
-  below.
-- **Extraction** — `crates/ctxlake-maint/src/extract.rs`. Context fencing, the
-  provider trait over `reqwest` (`anthropic` / `openai-compatible` / `ollama`), and
-  "no evidence, no claim" all live here. Citation verification is real: an
-  `excerpt_hash`, and each citation's own `observed_at`, are always computed from the
-  session's own captured content, never taken from what a model claims. A raw claim
-  that matches an existing one on file (same `claim_type`, `subject`, and normalized
-  claim text — `find_existing_claim_id`) reuses that claim's `claim_id` instead of
-  minting a new one, so corroborating evidence from a later session actually
-  accumulates onto the same claim rather than creating an indistinguishable sibling —
-  this is what makes independence checking (below) mean anything across real
-  extraction runs, not only in a hand-built test fixture.
-- **The four gates** — `crates/ctxlake-maint/src/gate.rs`. "No evidence, no claim" is
-  enforced as a floor beneath every claim type in `evidence_precheck`, including a
-  human-approved `preference` — human approval is an *additional* requirement, not a
-  substitute for having any evidence at all. Provenance checks each evidence citation's
-  own `observed_at` against its own session's window, never the claim's single
-  first-proposed timestamp against every cited session — a claim's evidence can, and
-  for `convention`'s two-independent-session bar routinely will, span sessions on
-  different days. Independence (`compute_independent_count`) joins evidence sessions
-  against `injected_context` and is the authoritative threshold check; the earlier
-  evidence check is a cheap pre-filter on raw evidence, not the real gate — see that
-  module's doc comment for why the order in this page's list and the order of
-  enforcement aren't quite the same thing. Shadow mode is enforced in
-  `claims::claims_visible_to_agents` and `claims::read_promoted_for_agents`, and
-  because `list_fleet_claims`/`publish_fleet_state` are `pub(crate)`, those two
-  functions are the only way anything *outside this crate* can read a fleet-scope
-  claim. That guarantee does not extend to `claims::list_events`/`claims::fold`
-  themselves, which stay `pub` and shadow-unaware on purpose — the gate needs the full,
-  unfiltered state to run at all, in shadow mode included, since shadow mode changes
-  who may *read* a promoted claim, not whether one gets promoted. Anything rendering a
-  claim into an agent's context window must go through the two agent-facing functions,
-  never `fold`/`list_events` directly; see `claims_visible_to_agents`'s doc for why
-  that boundary is enforced by convention there, not by the type system.
-- **The read side** — `crates/ctxlake-mcp/src/{memory,snapshot}.rs` (wave 4).
-  `memory_search`/`memory_timeline` read `<cache_root>/<fleet_id>/snapshot.bin` —
-  the local, byte-for-byte mirror of `ctxlake-maint::snapshot::publish`'s SQLite
-  artifact `ctxlake sync`'s cache leg already produces — and never the object
-  store, never the event log directly (AGENTS.md invariant 1). `memory_search`
-  combines FTS5 lexical matching with brute-force cosine over each claim's
-  256-dim embedding, both filtered to `visible_to_agents = 1` at the SQL level:
-  shadow mode's "reads nothing" guarantee is therefore a property of the query,
-  not a mode flag this crate checks and might get wrong — see `snapshot.rs`'s
-  module doc. `memory_propose` mirrors `ClaimEvent::Proposed`'s exact wire shape
-  (byte-for-byte, without `ctxlake-mcp` depending on `ctxlake-maint` — see
-  `wire.rs`'s doc for why that's a deliberate second definition of the same
-  format, not an oversight) and enforces "no evidence, no claim" at the level of
-  an individual citation, not only "the array is non-empty": a citation missing
-  either `session_id` or `message_id` is rejected before it ever reaches the
-  spool.
-- **The briefing's fleet-context block** —
-  `crates/ctxlake-cli/src/briefing.rs` (wave 4). The third block of a session's
-  briefing, alongside live agents and recent sessions, reads the exact same
-  local snapshot through `ctxlake_mcp::memory::briefing_claims` rather than a
-  separate implementation — one attribution renderer, one sanitizer, one
-  shadow-mode gate, used everywhere a claim reaches a context window. Empty in
-  shadow mode and on a fresh install, for the identical structural reason
-  `memory_search` is.
-- **Calibration** — `crates/ctxlake-maint/src/calibrate.rs`. `resolve` joins due
-  `hypothesis` claims to the `outcome` claims that answer them; `score_agent` turns
-  resolved predictions into a shrinkage-adjusted, low-sample-flagged `AgentScore`,
-  appended to the same event log as `ClaimEvent::CalibrationScored`; `derive_confidence`
-  (in `gate.rs`) folds that score into a promoted claim's confidence. `quarantine` /
-  `unquarantine` append `AgentQuarantined` / `AgentUnquarantined` events that
-  `run_gate`/`run` consult directly — see the "Quarantine" section above for exactly
-  what each one does and does not do. `require_maintenance_lease` (factored out of
-  `gate::run`) is the one check every writer in both modules shares, so quarantine,
-  calibration, and promotion can never interleave a write to the same log.
-One thing this wave deliberately does not claim to have solved:
+## Known limitations
 
 - **Contradiction detection is a proxy, not semantics.** There is no NLI model here to
-  tell "confirms" from "contradicts" apart. The gate treats "same subject, high cosine
-  similarity or lexical overlap, different claim text" as a conflict worth a human's
-  attention. That is a coarse recall-favoring heuristic, not a classifier — it will
-  send some genuine corroboration to `contested` for a human to wave through, and that
-  false-positive rate is the intentional trade against the alternative (silently
-  trusting two similar-but-different claims to agree).
+  tell "confirms" from "contradicts" apart — the gate treats "same subject, high
+  similarity, different claim text" as a conflict worth a human's attention. That sends
+  some genuine corroboration to `contested` for a human to wave through; the trade is
+  intentional, against silently trusting two similar-but-different claims to agree.
 - **Confidence is a placeholder formula**, not the resolver described above. It climbs
-  with `independent_count` and is bounded, which is all today's gate logic depends on
-  it for. The hypothesis-to-outcome resolver that would make confidence mean "this
-  agent's track record" is future work.
-- **`memory_search`'s vector search runs over a stand-in embedding, because
-  nothing anywhere in this codebase computes a real one yet.** Extraction's
-  `Provider` trait (`crates/ctxlake-maint/src/extract.rs`) has no `embed()`
-  method today, so every claim proposed anywhere — by extraction or by
-  `memory_propose` — carries `embedding: None`. Rather than ship no vector
-  search until a future wave adds a real embedder, `ctxlake-mcp::snapshot` uses
-  a deterministic, dependency-free hashing-trick bag-of-words fingerprint as
-  both the query vector and the fallback for any claim with no stored
-  embedding — which, today, is every claim, so the comparison is at least
-  internally consistent. It is a lexical proxy, not a semantic one, and a real
-  embedder landing later will need its own matching query-side embedder before
-  a stored real vector and a hash-derived query vector could be compared
-  meaningfully — see `snapshot.rs`'s module doc for the honest limitation
-  stated once, in code, rather than silently.
-- **`calibrate::resolve`'s agreement check is a *different* proxy from the contradiction
-  gate's, on purpose, not the same one reused.** An earlier version of this module did
-  reuse `find_contradiction`'s exact threshold check and read a hit as *agreement*
-  instead of *conflict* — which inverted the one thing a bag-of-words overlap score
-  cannot do: tell "X" from "not X" apart. A negation shares nearly every word with what
-  it refutes, so that version scored a hypothesis flatly contradicted by its own outcome
-  (`"the flake is a colima scheduling artifact"` vs. `"the flake is **not** a colima
-  scheduling artifact"`) as `Correct`. That direction of error is the dangerous one:
-  it inflates the very `trust_multiplier` this whole module exists to keep honest, on
-  exactly the agents whose predictions are most reliably wrong, with nothing downstream
-  able to tell the difference from an earned score. `outcome_agrees` now requires
-  identical claim text, or embedding similarity with no lopsided negation between the two
-  texts, before it will call anything `Correct`; everything else — including high
-  *lexical* overlap alone — resolves `Incorrect`.
-- **The residual risk runs in both directions, and the honest one is now the milder
-  one.** An outcome phrased very differently from a hypothesis it actually confirms, with
-  no embedding on either side, still misreads as `Incorrect` — that costs an agent
-  unearned credit, which a later, better-worded outcome can still recover, and it is the
-  direction this design deliberately biases toward (see above). The negation guard is
-  itself only a word-list check, not real negation parsing: a refutation that avoids
-  every listed negation word and cue ("the scheduler theory turned out to be wrong",
-  say, with no embedding available to catch the semantic reversal) can still slip through
-  as an unwarranted `Correct` if its lexical overlap were ever read as agreement again —
-  which is exactly why this function no longer reads lexical overlap as agreement at
-  all, only as a signal it explicitly refuses to trust in that direction. Watch this in
-  shadow mode like every other proxy on this page, not as a settled classifier.
-- **Extraction does not yet ask the model for a resolution date.** `resolves_at` exists on
-  `ProposedClaim`/`ClaimState` and `calibrate::resolve` reads it, but `extract.rs`'s
-  `RawClaim` — the schema the LLM's structured output is parsed into — has no such field
-  today, so every hypothesis extraction currently produces has `resolves_at: None`. That
-  degrades gracefully rather than silently: a hypothesis with no resolution date simply
-  never `Expired`s on the calendar, it can still resolve early the moment a matching
-  `outcome` claim lands (see `calibrate::resolve`'s doc) — but the "the pool doesn't fester
-  with stale, permanently-unresolved hypotheses" property this page describes needs a real
-  date, and wiring the extraction prompt/schema to produce one is the natural next step.
+  with `independent_count` and is bounded. The hypothesis-to-outcome resolver that
+  would make confidence mean "this agent's track record" is future work.
+- **`memory_search`'s vector search runs over a stand-in embedding.** Nothing in this
+  codebase computes a real one yet, so every claim carries `embedding: None` and search
+  falls back to a deterministic, dependency-free lexical fingerprint. It is a lexical
+  proxy, not a semantic one.
+- **The hypothesis/outcome agreement check is a word-overlap heuristic**, not real
+  negation parsing. A refutation phrased without a recognized negation word or cue can
+  still misread as agreement; conversely, an outcome phrased very differently from a
+  hypothesis it actually confirms can misread as disagreement. The bias runs toward the
+  milder direction (unearned credit an agent can still lose later), not the dangerous
+  one (inflating a demonstrably wrong agent's trust).
+- **Extraction does not yet ask the model for a resolution date.** Every hypothesis
+  extraction today has no resolution date, so a hypothesis never expires on the
+  calendar — it can still resolve early the moment a matching outcome claim lands, but
+  the pool can otherwise accumulate stale, unresolved hypotheses.
+
+Watch all of the above in shadow mode, like any other proxy on this page, before
+trusting it.
+
 ## Anti-goals
 
 - Do not auto-promote hypotheses beyond agent scope. Ever.

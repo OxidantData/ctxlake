@@ -33,8 +33,8 @@ ctxlake status           # who is active now
 ```
 
 `ctxlake maint` is the command that does all batch work. Nothing runs it for you: it
-takes the fleet-wide maintenance lease, does a pass, and exits. If no one ever runs it,
-capture keeps working and nothing is derived from it.
+does one pass — compact, extract, promote, publish — and exits. If no one ever runs
+it, capture keeps working and nothing is derived from it.
 
 Run it on a timer once you are past trying things out — any timer, on any one machine:
 
@@ -43,9 +43,9 @@ Run it on a timer once you are past trying things out — any timer, on any one 
 */15 * * * * /home/you/.local/bin/ctxlake maint --once >/dev/null 2>&1
 ```
 
-It is safe to schedule on every machine in the fleet. Whoever gets the lease does the
-work and the rest exit 0 immediately, so there is no coordination to arrange and no
-"primary" host to designate.
+It is safe to schedule on every machine in the fleet, or just one — every step is
+idempotent by content, so there is no coordination to arrange and no "primary" host to
+designate ([coordination.md](coordination.md)).
 
 ### 2. Point it at a model
 

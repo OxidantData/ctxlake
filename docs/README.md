@@ -14,7 +14,7 @@ New here? Start with [getting-started.md](getting-started.md). Debugging somethi
 | [adopting.md](adopting.md) | "I already use Claude Code, Cursor and Hermes — can I just start?" |
 | [import.md](import.md) | Backfilling the history already on your disk, and its per-runtime fidelity |
 | [concepts.md](concepts.md) | The three planes and the one-write-pattern-per-plane rule |
-| [coordination.md](coordination.md) | Roster, intents, leases — and what advisory leases do not promise |
+| [coordination.md](coordination.md) | Roster and intents, and why concurrent maintenance needs no lock |
 | [summarization.md](summarization.md) | The three tiers; why the default needs no LLM key; configuring one if you want it |
 | [memory.md](memory.md) | Claims, the four promotion gates, scopes, attribution, shadow mode |
 | [cli.md](cli.md) | Command reference |

@@ -1,73 +1,44 @@
 # mcp — `ctxlake mcp`
 
 `ctxlake mcp` is a stdio MCP server: JSON-RPC 2.0 over newline-delimited stdin/stdout,
-speaking protocol revision `2024-11-05`. It is the one integration surface that works
-identically on every runtime this project supports — Claude Code, Cursor, and Hermes
-are all MCP clients, so a runtime with no native hook surface for something can still
-get it through this server, and a runtime *with* hooks gets a second, symmetric way to
-ask for the same information mid-turn instead of only at fixed lifecycle points.
+protocol revision `2024-11-05`. Claude Code, Cursor, and Hermes are all MCP clients, so
+this is the one integration surface that works identically on every runtime — a
+runtime with no native hook for something can still get it through here, and a runtime
+*with* hooks gets a second, symmetric way to ask for the same information mid-turn.
 
-> **Status: the server is implemented; `ctxlake mcp` is not wired up yet.** The protocol
-> layer and every tool — fleet and memory alike — work today against the local
-> filesystem, and this crate ships a real `ctxlake-mcp` binary that runs them on real
-> stdin/stdout. What does **not** exist yet is `ctxlake-cli`'s `mcp` subcommand, so
-> there is no `ctxlake mcp` to spawn and no `ctxlake install` to write the config block
-> below into a runtime's settings. If you want to run this server today, point a
-> runtime's MCP config at the `ctxlake-mcp` binary this crate builds directly
-> (`cargo build -p ctxlake-mcp --bin ctxlake-mcp`), or call
-> [`ctxlake_mcp::run_stdio()`](../crates/ctxlake-mcp/src/lib.rs) from your own thin
-> wrapper — both do exactly what `ctxlake mcp` will do once it exists.
+> **Status: the server is implemented; `ctxlake mcp` is not wired up yet.** Every
+> tool works today against the local filesystem via a real `ctxlake-mcp` binary, but
+> `ctxlake-cli` has no `mcp` subcommand yet and no `install` support for the config
+> block below. To run this today, point a runtime's MCP config directly at the
+> `ctxlake-mcp` binary (`cargo build -p ctxlake-mcp --bin ctxlake-mcp`).
 >
-> `memory_search`/`memory_timeline` (wave 4) now read the real local claim snapshot —
-> `<cache_root>/<fleet_id>/snapshot.bin`, `ctxlake sync`'s byte-for-byte mirror of
-> `ctxlake-maint::snapshot::publish`'s SQLite artifact — rather than a placeholder
-> cache file with no writer. `"enabled": false` means exactly what it always did: no
-> `ctxlake maint` run has ever published a snapshot for this fleet (the common case on
-> a fresh install, or any install with `[summarize] mode = "none"`/`"agent"`, the
-> documented default). A fleet that *has* run extraction but is sitting in
-> `[summarize] mode = "shadow"` (also a documented default while an operator builds
-> trust in the extracted claims — see [memory.md](memory.md)) instead reads
-> `"enabled": true` with an always-empty `"results"`/`"entries"` array: the snapshot
-> exists and opens fine, every claim in it is simply marked not-agent-visible at the
-> row level. Both are deliberate "reads nothing" outcomes, not bugs to chase down —
-> [memory.md](memory.md) has the full claim model they're built against.
+> `memory_search`/`memory_timeline` read the real local claim snapshot. `"enabled":
+> false` means no `ctxlake maint` run has published a snapshot for this fleet yet (the
+> default on a fresh install). A fleet running `[summarize] mode = "shadow"` instead
+> reads `"enabled": true` with an always-empty result — the snapshot exists, every
+> claim in it is simply marked not-agent-visible. Both are deliberate "reads nothing"
+> outcomes — see [memory.md](memory.md).
 
 ## Why this process never touches the object store
 
-`docs/architecture.md`'s component table draws the same box around `ctxlake-mcp` that it
-draws around `ctxlake-hook`, for the same reason: this process is on a path an agent is
-synchronously waiting on, so AGENTS.md invariant 1 — the store is never on the hook path,
-in either direction — applies here too. Concretely:
+Same reason as the hook (invariant 1): this process is on a path an agent is
+synchronously waiting on.
 
-- **Reads** come from the local **cache**: `~/.ctxlake/cache/<fleet_id>/*.json`, whatever
-  `ctxlake sync`'s store→cache leg most recently wrote there.
-- **Writes** go to the local **spool**: `~/.ctxlake/spool/mcp/<fleet_id>.ndjson`, one JSON
-  line per write-shaped tool call, for `ctxlake sync` to apply later.
-- `crates/ctxlake-mcp/Cargo.toml` links only `ctxlake-core`, `serde`, and `serde_json` —
-  no `object_store`, no `tokio`. That is not merely a description of current behavior;
-  it means the network boundary can't be crossed by accident. Reintroducing either
-  dependency would be a visible, explainable diff, not a quiet regression.
+- **Reads** come from the local cache: `~/.ctxlake/cache/<fleet_id>/*.json`.
+- **Writes** go to the local spool: `~/.ctxlake/spool/mcp/<fleet_id>.ndjson`, for
+  `ctxlake sync` to apply later.
+- `crates/ctxlake-mcp` links only `ctxlake-core`, `serde`, and `serde_json` — no
+  `object_store`, no `tokio`. A write-shaped tool's result can only ever say "this
+  request is queued," never that it reached the fleet — this process cannot observe
+  that round trip completing.
 
-One consequence worth being explicit about, because it's easy to expect otherwise:
-**`fleet_claim` cannot tell you that you now hold a lease.** Holding a lease is a fact
-about the object store's `live/leases/` key (see [coordination.md](coordination.md)),
-and this process never reads or writes that key directly. What it *can* honestly say is
-"this request is queued for `ctxlake sync` to apply" — so that's exactly what every
-write-shaped tool's result says. Leases are advisory even when the full round trip
-happens (AGENTS.md invariant 5); a tool that can't even complete the round trip has to be
-more careful about its claims, not less.
-
-The on-disk root is `~/.ctxlake/{spool,cache}` (override with `CTXLAKE_SPOOL_DIR` /
-`CTXLAKE_CACHE_DIR`), resolved through `ctxlake_core::paths` — the single definition every
-crate shares. Cache reads are scoped per fleet (`<cache_root>/<fleet_id>/`), because one
-host can legitimately run agents in more than one fleet and an unscoped roster would have
-them overwrite each other's view of who is active.
+Override the on-disk root with `CTXLAKE_SPOOL_DIR` / `CTXLAKE_CACHE_DIR`. Cache reads
+are scoped per fleet (`<cache_root>/<fleet_id>/`), since one host can run agents in
+more than one fleet.
 
 ## Wiring it up
 
-The eventual shape — once `ctxlake-cli` grows an `mcp` subcommand and an `install`
-command to go with it (see the status callout above) — is each runtime's own MCP config
-pointing at the `ctxlake` binary:
+The eventual shape is each runtime's own MCP config pointing at the `ctxlake` binary:
 
 ```json
 {
@@ -77,200 +48,120 @@ pointing at the `ctxlake` binary:
 }
 ```
 
-with `ctxlake install` merging that block into a runtime's config (see
-[getting-started.md](getting-started.md)) the same way it merges the hook entries.
-Neither `ctxlake mcp` nor `ctxlake install` exists today, so that block is not yet
-something you can paste in and expect to work — point `"command"` at the `ctxlake-mcp`
-binary this crate builds instead (see the status callout for how to build it).
-
-`CTXLAKE_FLEET_ID` and `CTXLAKE_AGENT_ID` scope every read and write this process
-does — set them in the runtime's MCP config's `env` block until `ctxlake install` can
-set them for you.
+with `ctxlake install` merging that block in, the same way it merges hook entries.
+Neither `ctxlake mcp` nor that install support exists yet (see the status callout) —
+point `"command"` at the `ctxlake-mcp` binary instead, and set `CTXLAKE_FLEET_ID` /
+`CTXLAKE_AGENT_ID` in the MCP config's `env` block yourself in the meantime.
 
 ## The tools
 
 | Tool | Shape | What it does |
 |---|---|---|
-| `fleet_status()` | read | Who's active and what they hold, as of the last cache refresh. |
-| `fleet_claim(paths[], reason, ttl_secs?)` | write | Queue an advisory-lease request. |
-| `fleet_release(paths[]?)` | write | Queue a release; omit `paths` for "everything I hold." |
+| `fleet_status()` | read | Who's active and what they're touching, as of the last cache refresh. |
 | `fleet_history(repo?, since?, limit?)` | read | Recent sessions and outcomes from the cache. |
 | `fleet_handoff(summary, status, next?)` | write | Leave a note for whoever picks this up next. |
-| `memory_search(query, scope?, subject?, claim_type?, k?)` | read | Promoted claims matching `query` (FTS5 lexical + brute-force cosine), with attribution. |
+| `memory_search(query, scope?, subject?, claim_type?, k?)` | read | Promoted claims matching `query`, with attribution. |
 | `memory_propose(claim, type, subject, evidence[])` | write | File a claim **candidate**. Never promotes. |
 | `memory_timeline(subject, since?, limit?)` | read | What this fleet has actually tried, re: `subject`. |
 
-Every *read* tool degrades honestly when its cache file is missing or unparseable: an
-empty result with a `note` explaining why, never an error and never a guess. Every
-*write* tool queues to the local spool and returns once the write is durably queued
-locally — never once it has reached the fleet, which this process cannot observe.
+Every read tool degrades honestly when its cache file is missing or unparseable — an
+empty result with a `note`, never an error, never a guess. Every write tool returns
+once the write is durably queued locally, not once it has reached the fleet.
 
-### Row counts are capped, independently of field length
-
-`sanitize.rs`'s per-field length bound (below) stops one oversized field from crowding
-out a model's context window; it does nothing about *row count*. `fleet_history`,
-`memory_search`, and `memory_timeline` each cap how many rows a single call can return —
-`limit`/`k` default to 50 (10 for `memory_search`, unchanged) and are clamped to a hard
-ceiling of 200 no matter what a caller asks for. A result that had more matching rows
-than it returned says so with `"truncated": true`, rather than silently dropping the
-tail the way the length bound's truncation marker makes visible for a single field.
-`memory_propose`'s `evidence` array gets the same treatment on the write side: at most
-20 citations per call, rejected outright over that rather than silently trimmed.
+`fleet_history`, `memory_search`, and `memory_timeline` each cap rows per call —
+`limit`/`k` default to 50 (10 for `memory_search`) and clamp to a hard ceiling of 200;
+an over-limit result says so with `"truncated": true`. `memory_propose`'s `evidence`
+array is capped at 20 citations, rejected outright over that rather than trimmed.
 
 ### `memory_propose` never writes a promoted claim
 
-This is AGENTS.md invariant 9, enforced structurally, not by convention: there is no
-`memory_write` tool in `tools/list`, `propose()` spools a `ClaimEvent::Proposed` whose
-`scope` is hard-coded `"agent"` with no argument on the function's signature that could
-widen it, and nothing in `crates/ctxlake-mcp/` ever constructs a `claims/fleet/*` write —
-that key is written only by the promotion gate inside `ctxlake maint`, a different binary
-this crate does not even depend on. A conformance test asserts the tool list stays free
-of `memory_write`; other tests assert a proposed claim's spooled record is a `proposed`
-event and never contains the word `promoted`, and that its `scope` is never anything but
-`"agent"`.
-
-`propose` also enforces [memory.md](memory.md)'s "no evidence, no claim" rule itself,
-before anything is queued, at the level of a single citation: an empty `evidence` array
-is refused outright, and so is any citation missing a non-empty `session_id` or
-`message_id` — `[{}]` used to pass the old "array is non-empty" check even though it
-cites nothing at all.
-
-The record `propose` spools is byte-for-byte the same shape
-`ctxlake-maint::claims::ClaimEvent::Proposed` serializes to (see
-`crates/ctxlake-mcp/src/wire.rs`) — a deliberate second definition of the same wire
-format, not a shortcut, since this crate cannot depend on `ctxlake-maint` without pulling
-in `object_store`/`tokio`. A future daemon-side drain of `spool/mcp/*.ndjson` into real
-`claims/events/*.json` objects (not yet built anywhere in this codebase) can therefore
-append this record with zero translation.
+This is invariant 9, enforced structurally: there is no `memory_write` tool, `propose`
+hard-codes `scope: "agent"`, and nothing in this crate ever constructs a
+`claims/fleet/*` write — that key belongs to the promotion gate inside `ctxlake maint`
+alone. `propose` also enforces [memory.md](memory.md)'s "no evidence, no claim" rule
+itself, before anything is queued: an empty `evidence` array is refused, and so is any
+citation missing a non-empty `session_id` or `message_id`.
 
 ### `memory_search`'s attribution shape
 
-`memory_search` reads `<cache_root>/<fleet_id>/snapshot.bin` (see the status note above)
-and combines FTS5 lexical matching with brute-force cosine over each claim's 256-dim
-embedding — `crates/ctxlake-mcp/src/snapshot.rs` has the full contract, including the
-honest limitation that no real embedder exists anywhere in this codebase yet, so the
-"embedding" today is a deterministic, dependency-free lexical hash rather than anything
-semantic. A hit renders exactly like [memory.md](memory.md) specifies, never as bare
-fact:
+A hit renders exactly like [memory.md](memory.md) specifies, never as bare fact:
 
 ```text
 [cc-03, 2026-09-09, 2 independent sessions, conf 0.81]
   `cargo test --workspace` needs RUSTFLAGS=-D warnings or the clippy gate fails later.
 ```
 
-A contested claim says so inline (`, CONTESTED`), and a claim resting on a single session
-reads as "1 independent session," not silently rounded up to sound more corroborated than
-it is. `independent_count` is the only session count ever rendered — there is no
-`evidence_count` field on the type `render()` accepts, so a raw evidence tally (which can
-overcount correlated, non-independent corroboration) can never leak into a rendered
-result by accident.
+A contested claim says so inline (`, CONTESTED`), and a claim resting on a single
+session reads as "1 session," never rounded up. Search combines FTS5 lexical matching
+with cosine similarity over each claim's embedding — today a deterministic,
+dependency-free lexical hash, not a real embedder (see [memory.md](memory.md)'s known
+limitations).
 
 ## Every field read from the lake is treated as an attack surface
 
-A claim, a roster entry, a handoff note — all of it was written by another agent's
-session, mirrored into the local cache by a daemon this process trusts to move bytes
-faithfully but not to have sanitized them. Before any such field reaches a tool result:
+A claim, a roster entry, a handoff note — all written by another agent's session, and
+this process trusts the daemon to move those bytes faithfully but not to have
+sanitized them. Before any such field reaches a tool result:
 
-1. **Zero-width and bidi control codepoints are stripped** — zero-width
-   joiners/non-joiners/space, the BOM, the word joiner, and bidi embedding/override/
-   isolate controls. All of them can make text *read* differently than it *renders*,
-   which is exactly the property an injected instruction hiding inside a claim would
-   want.
-2. **Every field is length-bounded**, with a visible `…[truncated]` marker rather than a
-   silent cut, so an oversized field can't quietly dominate a rendered result.
+1. **Zero-width and bidi control codepoints are stripped** — anything that can make
+   text *read* differently than it *renders*, which is exactly what an injected
+   instruction hiding inside a claim would want.
+2. **Every field is length-bounded**, with a visible `…[truncated]` marker.
 
-This happens in `crates/ctxlake-mcp/src/sanitize.rs`, at render time, on every field this
-crate ever hands back — not only once, at ingest, on the theory that whatever wrote the
-cache already cleaned it. Concretely, `sanitize::clean_value` recurses over the *whole*
-JSON value a cache file handed back — object keys and values, array elements, at any
-depth — rather than naming a fixed list of fields to clean. This crate does not control
-the schema the future cache-writer (`ctxlake sync`, Wave 3) will actually use, so a fixed
-field list would only cover whatever shape today's author guessed at; a field the list
-didn't name, or one nested inside a field it did, would pass through untouched. Recursing
-over the value has no such gap: whatever shape a cache record takes, every string in it
-is cleaned before this crate hands it back.
-
-It deliberately does **not** try to pattern-match phrases like "ignore previous
-instructions"; that's a losing game, and it isn't the actual defense here. The actual
-defense is architectural: [memory.md](memory.md)'s attribution framing means a peer's
-claim never arrives as a bare assertion the reading model might follow — it arrives
-labeled as somebody else's observation, with a session count and confidence attached,
-under a "verify before relying on these" heading. Sanitization's job is only to make sure
-that framing can't be visually hidden or defeated by an invisible character.
+This runs recursively over the whole JSON value at render time, on every field this
+crate ever hands back, not only once at ingest. It does **not** try to pattern-match
+phrases like "ignore previous instructions" — that's a losing game. The actual defense
+is architectural: [memory.md](memory.md)'s attribution framing means a peer's claim
+never arrives as a bare assertion — it arrives labeled as somebody else's observation,
+under a "verify before relying on these" heading. Sanitization only makes sure that
+framing can't be visually hidden.
 
 ## Every write-shaped argument is scrubbed for secrets before the spool
 
-The read-time cleaning above closes an injection channel; it says nothing about a
-different direction of harm, AGENTS.md invariant 7: a secret an agent pastes into a
-`fleet_claim` reason, a `fleet_handoff` summary, or a `memory_propose` claim or evidence
-citation must never reach `spool.rs`'s ndjson file, because `ctxlake sync` ships that
-file's contents into bronze, and bronze is immutable — nothing after this point can
-un-leak it. `crates/ctxlake-mcp/src/write_guard.rs` runs every free-text argument to
-`fleet_claim`, `fleet_release`, `fleet_handoff`, and `memory_propose` through
-`ctxlake_core::redact::Redactor` — the same scrubber `ctxlake-hook`'s adapters use for the
-identical reason — before the record is ever built, so a literal secret marker (`sk-`,
-`AKIA`, a PEM header, ...) is withheld rather than written verbatim. `evidence` is
-caller-shaped JSON, not a fixed set of named fields, so it gets the same recursive
-treatment as the read path: every string at any depth is scrubbed, not only the fields
-this crate happens to know about.
+The read-time cleaning above closes an injection channel; it says nothing about the
+other direction of harm (invariant 7): a secret pasted into a `fleet_handoff` summary
+or a `memory_propose` claim must never reach the spool file, because bronze is
+immutable and nothing after that point can un-leak it. Every free-text argument runs
+through the same `Redactor` `ctxlake-hook`'s adapters use, before the record is ever
+built — recursively, so an `evidence` array's citations get the same treatment as any
+named field.
 
-Nothing drains `spool/mcp/*.ndjson` yet either (that daemon-side consumer is later work,
-same as `ctxlake-hook`'s own spool), and every agent in a fleet shares one file per fleet.
-`spool.rs` caps that directory's total size and rotates a fleet's file once it gets large,
-mirroring `ctxlake-hook`'s own spool guard — but where the hook must silently drop an
-over-cap event (it can never fail the host agent's turn), this server has a real return
-channel: hitting the cap comes back as an ordinary tool-call error the calling agent can
-see and act on.
+The MCP spool caps its directory's total size and rotates a fleet's file once it gets
+large. Unlike the hook, which must silently drop an over-cap event, this server has a
+real return channel: hitting the cap comes back as an ordinary tool-call error the
+calling agent can see and act on.
 
 ## The briefing's fleet-context block
 
-`ctxlake-cli`'s SessionStart briefing (`crates/ctxlake-cli/src/briefing.rs`) has a third
-block alongside live agents and recent sessions: promoted claims, via
-`ctxlake_mcp::memory::briefing_claims`. It reuses this crate's own snapshot read and
-attribution renderer rather than a second implementation — same sanitizer, same
-attribution shape, same structural shadow-mode emptiness described above — capped small
-(five lines by default) since a briefing rides in on every session's context window,
-where `memory_search` is the tool to reach for anything more. This is a documented
-divergence from `docs/architecture.md`'s diagram, which describes `ctxlake maint`
-pre-rendering a briefing blob server-side instead; see `briefing.rs`'s own module doc for
-why this wave took the client-side rendering path that was actually buildable within its
-scope.
+The `SessionStart` briefing has a third block alongside live agents and recent
+sessions: promoted claims, reusing this crate's own snapshot read and attribution
+renderer — same sanitizer, same shape, same shadow-mode emptiness — capped small (five
+lines by default), since `memory_search` is the tool to reach for anything more.
 
 ## Protocol conformance
 
-`initialize`, `tools/list`, and `tools/call` are the whole method surface (plus `ping`,
-answered but not required). Every other input path returns a JSON-RPC error rather than
-a panic or a dropped connection:
+`initialize`, `tools/list`, and `tools/call` are the whole method surface (plus
+`ping`). Every other input path returns a JSON-RPC error rather than a panic or a
+dropped connection:
 
 | Input | Response |
 |---|---|
 | Malformed JSON | `-32700` Parse error, `id: null` |
 | A JSON value that isn't an object | `-32600` Invalid Request |
-| An object with no `method` | `-32600` Invalid Request (if it has an `id`) or dropped (if not — a notification) |
+| An object with no `method` | `-32600` Invalid Request (if it has an `id`) or dropped (if not) |
 | An unknown method | `-32601` Method not found |
-| `tools/call` for an unknown tool name | `-32602` Invalid params |
-| `tools/call` with a missing/wrong-typed required argument | `-32602` Invalid params |
-| A tool called correctly but refusing on its own terms (e.g. no evidence) | a normal result with `isError: true` — not a protocol error, so the session keeps going |
-| A notification (`id` absent) | never answered, even for an unknown method — the JSON-RPC 2.0 rule |
-| A stray `result`/`error` frame with no `method` | never answered — it isn't addressed to this server |
+| `tools/call` for an unknown tool, or a missing/wrong-typed argument | `-32602` Invalid params |
+| A tool refusing on its own terms (e.g. no evidence) | a normal result with `isError: true` — the session keeps going |
+| A notification (`id` absent) | never answered, even for an unknown method |
+| A stray `result`/`error` frame with no `method` | never answered — not addressed to this server |
 
-**stdout carries JSON-RPC frames and nothing else.** Every diagnostic in this crate goes
-to stderr. A client parses stdout one line at a time as JSON; a stray `println!` would
-corrupt every frame after it in a way that is hard to diagnose from the client's side.
-Two tests check this from two different vantage points, because they catch different
-bugs: `lib.rs`'s in-memory test drives a full mixed session (well-formed calls, garbage,
-notifications, bad arguments) through `serve()` against a buffer it controls, which
-proves the *response-building* logic never emits more or less than one frame per
-request — but it cannot see a stray write to the process's *real* stdout, since nothing
-in that test path touches it. `tests/stdio_subprocess.rs` closes that gap by spawning the
-actual `ctxlake-mcp` binary as a child process and asserting every line on its real
-stdout is exactly one valid JSON-RPC frame; a `println!`/`eprintln!`-to-stdout mistake
-anywhere on the dispatch path fails this test and only this test.
+**stdout carries JSON-RPC frames and nothing else.** Every diagnostic goes to stderr —
+a stray `println!` would corrupt every frame after it. A subprocess test asserts every
+line on the real binary's stdout is exactly one valid JSON-RPC frame.
 
 ## Next steps
 
 - [memory.md](memory.md) — the claim model `memory_search`/`memory_propose` are built
   against, and the belief layer they're waiting on
-- [coordination.md](coordination.md) — what an advisory lease actually promises, and
-  what it does not
+- [coordination.md](coordination.md) — what the roster and intents actually promise
 - [architecture.md](architecture.md) — this process's place in the full component map

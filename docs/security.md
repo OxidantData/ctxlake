@@ -135,12 +135,9 @@ What ctxlake defends against, and — as importantly — what it explicitly does
   hook support) is captured *not at all*, not partially — there is no fallback capture
   path, by design, since a fallback that reads process output some other way would
   itself be a much larger attack surface than the hook it was meant to backstop.
-  **A stale lease being honored by a stalled process is a coordination gap, not a
-  security one** — see [coordination.md](coordination.md)'s "what advisory leases do
-  not promise" for why that's named there instead of implied to be covered here.
 
 ## Next steps
 
-- [coordination.md](coordination.md) — what a lease does and does not protect against
+- [coordination.md](coordination.md) — the roster and intents, and what they promise
 - [layout.md](layout.md) — where quarantined content and promoted claims live
 - [architecture.md](architecture.md) — "what ctxlake does not guarantee," the fuller list

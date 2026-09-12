@@ -157,45 +157,16 @@ def check_scaling_arithmetic() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Finding 1: lease (and roster) bootstrap cannot be "seeded at ctxlake init"
-# because resource_key(repo, resource) hashes unbounded, arbitrary runtime
-# input (crates/ctxlake-core/src/hash.rs) — init cannot enumerate a claim
-# nobody has typed yet. Guard against the impossible claim reappearing, and
-# require the actual (lazy, unconditional-PUT) bootstrap mechanism to be
-# documented in its place.
+# Finding 1 (retired): this used to guard the lease object's bootstrap story —
+# resource_key(repo, resource) hashed unbounded runtime input, so `ctxlake
+# init` could never pre-seed a lease nobody had named yet. The lease
+# abstraction itself (holders, TTLs, expiry, stealing) has since been removed
+# from ctxlake entirely: every unit of batch work turned out to be idempotent
+# by content already (compaction's gen=<hash> directories, extraction's
+# create-if-absent claim marker, the snapshot's content-addressed publish),
+# so nothing needed a lock and there is no bootstrap story left to guard.
+# See docs/coordination.md.
 # ---------------------------------------------------------------------------
-
-IMPOSSIBLE_BOOTSTRAP_PHRASES = [
-    "seeds every lease object a fleet might need",
-    "every lease object is seeded to `free` at init time",
-    "after first creation by `ctxlake init`",
-    "seeded at ctxlake init (never put-if-absent",
-]
-
-REQUIRED_BOOTSTRAP_PHRASES = {
-    "coordination.md": ["unconditional `PUT`", "rules out pre-seeding"],
-    "storage.md": ["unconditional `PUT`", "cannot pre-seed a resource"],
-    "architecture.md": ["lazily created on first claim"],
-}
-
-
-def check_lease_bootstrap_honesty() -> None:
-    for name in ("coordination.md", "storage.md", "architecture.md"):
-        text = norm(read(name))
-        for phrase in IMPOSSIBLE_BOOTSTRAP_PHRASES:
-            if norm(phrase) in text:
-                fail(
-                    f"{name}: contains the impossible bootstrap claim "
-                    f"{phrase!r} — resource_key() hashes unbounded runtime "
-                    f"input, so ctxlake init cannot pre-seed it (finding 1)"
-                )
-        for phrase in REQUIRED_BOOTSTRAP_PHRASES.get(name, []):
-            if norm(phrase) not in text:
-                fail(
-                    f"{name}: missing the corrected bootstrap explanation "
-                    f"{phrase!r} — the lazy unconditional-PUT mechanism "
-                    f"should be documented here"
-                )
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +241,6 @@ def check_runtime_verification_honesty() -> None:
 
 def main() -> int:
     check_scaling_arithmetic()
-    check_lease_bootstrap_honesty()
     check_runtime_verification_honesty()
 
     if failures:

@@ -148,8 +148,8 @@ The table below is about **Hermes's own hook mechanism** — what the shell-hook
 is capable of, verified against Hermes's source the same way the rest of this page is.
 It is not a status report on `adapters::hermes`: this wave's adapter only *captures*.
 `hermes::response_for` returns `{}` for every event — briefing injection and blocking
-both need the daemon's view of the lake (a lease, a synthesized digest), which does not
-reach the hook in this wave, the same gap `claude_code.rs` and `cursor.rs` both document
+both need the daemon's view of the lake (roster state, a synthesized digest), which
+does not reach the hook in this wave, the same gap `claude_code.rs` and `cursor.rs` both document
 for their own runtimes. Wiring an actual `{"context": "..."}` or `{"action": "block"}`
 response is later work, not something this page can claim is live today.
 
@@ -169,9 +169,10 @@ A `pre_llm_call` hook returning `{"context": "..."}` has that text appended to t
 turn's **user message**, never the system prompt. Hermes does this to protect the prompt
 cache: the system prompt stays byte-identical across turns so cached tokens are reused.
 
-This suits ctxlake exactly. The briefing is per-turn, volatile context — a peer's lease
-acquired thirty seconds ago — and volatile content belongs after the cache breakpoint, not
-in front of it. Injecting into the system prompt would invalidate the cache on every turn.
+This suits ctxlake exactly. The briefing is per-turn, volatile context — a peer's
+roster entry updated thirty seconds ago — and volatile content belongs after the cache
+breakpoint, not in front of it. Injecting into the system prompt would invalidate the
+cache on every turn.
 
 When several plugins inject, their contributions are joined with blank lines in
 alphabetical order of directory name.

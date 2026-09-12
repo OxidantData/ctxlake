@@ -58,8 +58,7 @@ long-lived connection: exactly the shape invariant 1 requires.
 denying a tool call outright — a hook can return a decision that blocks execution. But
 ctxlake's own default posture is **fail-open** for capture: if `ctxlake-hook` errors or
 panics while building an envelope, the tool call proceeds anyway, because coordination
-metadata is advisory and must never be able to block real work (this is the same
-philosophy as invariant 5's leases, applied to the hook itself). The one deliberate
+metadata is advisory and must never be able to block real work. The one deliberate
 exception is the path denylist in
 [`Redactor::is_denied_path`](../../crates/ctxlake-core/src/redact.rs): when a read
 targets a known-sensitive path, `ctxlake-hook` can use the very same `PreToolUse`

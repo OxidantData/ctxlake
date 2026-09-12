@@ -29,7 +29,7 @@ Almost every question reduces to looking at one of these. Nothing else is author
 |---|---|---|
 | Config | `~/.config/ctxlake/ctxlake.toml` | attribution is wrong, or the wrong store is in use |
 | Spool | `~/.ctxlake/spool/<runtime>/<session_id>.ndjson` | asking "was this event captured at all" |
-| Cache | `~/.ctxlake/cache/{briefing,roster,leases}.json` | the briefing is empty, stale, or missing peers |
+| Cache | `~/.ctxlake/cache/{briefing,roster}.json` | the briefing is empty, stale, or missing peers |
 | Hook errors | `~/.ctxlake/hook-errors.log` | a hook is misbehaving but the session looks fine |
 
 That last one matters more than it looks. **The hook never fails a turn** — on any
@@ -101,11 +101,9 @@ Ordered from least to most destructive. Stop at the first that helps.
 
 1. **Let the cache rebuild.** Delete `~/.ctxlake/cache/` — it is derived, and the daemon
    refetches. This fixes most briefing weirdness and cannot lose anything.
-2. **Release stale leases.** Advisory leases expire on their own, but an explicit release
-   is faster if a crashed agent is holding something you want.
-3. **Reinstall the hooks.** The installer is idempotent and writes a `.bak` first;
+2. **Reinstall the hooks.** The installer is idempotent and writes a `.bak` first;
    uninstall removes exactly what it added.
-4. **Do not delete the spool** unless you accept losing those sessions. It is the only
+3. **Do not delete the spool** unless you accept losing those sessions. It is the only
    copy of anything not yet uploaded.
 
 Nothing here touches the lake. Bronze is append-only, and no troubleshooting step should
@@ -113,18 +111,13 @@ ever be a reason to write to it.
 
 ## When it is not a ctxlake problem
 
-Two symptoms that look like bugs and are not:
-
-- **`412 Precondition Failed` in the daemon log.** That is compare-and-swap working.
-  Someone else won a race and the daemon retries. Concentrated on one key it indicates a
-  genuinely hot object ([scaling.md](scaling.md)); spread across many keys it suggests
-  clock skew.
-- **Two agents edited the same file.** Leases are advisory
-  ([coordination.md](coordination.md)). ctxlake can warn; it cannot revoke a running
-  agent's ability to write to disk. Git is the declared arbiter for code.
+**`412 Precondition Failed` in the daemon log** looks like a bug and is not — that is
+compare-and-swap working. Someone else won a race and the daemon retries. Concentrated
+on one key it indicates a genuinely hot object ([scaling.md](scaling.md)); spread
+across many keys it suggests clock skew.
 
 ## Next steps
 
 - [architecture.md](architecture.md) — the symptom-to-cause table, and every knob
-- [coordination.md](coordination.md) — what leases do and do not promise
+- [coordination.md](coordination.md) — what the roster and intents do and do not promise
 - [security.md](security.md) — redaction rules and what lands in quarantine

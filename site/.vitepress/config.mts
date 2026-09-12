@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
 // The docs live in ../docs as plain Markdown and are read directly on GitHub. This
 // site renders the SAME files — there is no separate copy to drift.
@@ -7,7 +8,8 @@ import { defineConfig } from 'vitepress'
 //   - No frontmatter anywhere, so GitHub shows no stray YAML block.
 //   - Relative links include the `.md` suffix ([storage.md](storage.md)), which is
 //     both the Oxidant docs convention and VitePress's native form.
-export default defineConfig({
+export default withMermaid(
+  defineConfig({
   title: 'ctxlake',
   description:
     'Zero-compute context lake for agent fleets. Keeps Claude Code, Cursor and Hermes agents in sync through object storage alone.',
@@ -48,9 +50,24 @@ export default defineConfig({
   ignoreDeadLinks: [/^(\.\/)?\.\.\//],
 
   markdown: {
-    // Mermaid blocks render on GitHub natively; on the site they stay fenced rather
-    // than silently disappearing. Swap in a mermaid plugin here if that changes.
     lineNumbers: false,
+  },
+
+  // Mermaid renders natively on GitHub but not in VitePress, so ```mermaid fences
+  // were shipping to the site as literal source. withMermaid() adds the renderer;
+  // the theme below keeps diagrams legible against both light and dark pages
+  // without a second palette to maintain.
+  mermaid: {
+    theme: 'base',
+    themeVariables: {
+      fontFamily: 'Geist, Inter, ui-sans-serif, system-ui, sans-serif',
+      primaryColor: '#f5f5f5',
+      primaryTextColor: '#0a0a0a',
+      primaryBorderColor: '#a3a3a3',
+      lineColor: '#737373',
+      secondaryColor: '#e5e5e5',
+      tertiaryColor: '#fafafa',
+    },
   },
 
   themeConfig: {
@@ -125,4 +142,5 @@ export default defineConfig({
       copyright: '© 2026 Oxidant Data',
     },
   },
-})
+  }),
+)

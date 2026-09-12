@@ -71,3 +71,9 @@ tempfile.workspace = true
 # (ctxlake-store/Cargo.toml carries the identical dependency for the same reason —
 # its own `PutModeSpy` test double), so implementing it requires the same macro.
 async-trait = "0.1"
+# `briefing.rs`'s tests build fixture `snapshot.bin` files through
+# `ctxlake_mcp::snapshot::test_support` rather than hand-rolling a second copy of
+# its schema — see that module's doc. Cargo only applies this feature to test
+# builds of this crate (dev-dependencies are excluded from a release build), so
+# it never reaches the real `ctxlake` binary.
+ctxlake-mcp = { path = "../ctxlake-mcp", features = ["test-support"] }

@@ -755,9 +755,11 @@ name = "ctxlake-mcp"
 version = "0.1.0"
 dependencies = [
  "ctxlake-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "time",
 ]
 
 [[package]]

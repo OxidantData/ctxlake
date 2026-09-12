@@ -205,6 +205,30 @@ payoff that justifies the discipline on the rest of this page.
   claim into an agent's context window must go through the two agent-facing functions,
   never `fold`/`list_events` directly; see `claims_visible_to_agents`'s doc for why
   that boundary is enforced by convention there, not by the type system.
+- **The read side** — `crates/ctxlake-mcp/src/{memory,snapshot}.rs` (wave 4).
+  `memory_search`/`memory_timeline` read `<cache_root>/<fleet_id>/snapshot.bin` —
+  the local, byte-for-byte mirror of `ctxlake-maint::snapshot::publish`'s SQLite
+  artifact `ctxlake sync`'s cache leg already produces — and never the object
+  store, never the event log directly (AGENTS.md invariant 1). `memory_search`
+  combines FTS5 lexical matching with brute-force cosine over each claim's
+  256-dim embedding, both filtered to `visible_to_agents = 1` at the SQL level:
+  shadow mode's "reads nothing" guarantee is therefore a property of the query,
+  not a mode flag this crate checks and might get wrong — see `snapshot.rs`'s
+  module doc. `memory_propose` mirrors `ClaimEvent::Proposed`'s exact wire shape
+  (byte-for-byte, without `ctxlake-mcp` depending on `ctxlake-maint` — see
+  `wire.rs`'s doc for why that's a deliberate second definition of the same
+  format, not an oversight) and enforces "no evidence, no claim" at the level of
+  an individual citation, not only "the array is non-empty": a citation missing
+  either `session_id` or `message_id` is rejected before it ever reaches the
+  spool.
+- **The briefing's fleet-context block** —
+  `crates/ctxlake-cli/src/briefing.rs` (wave 4). The third block of a session's
+  briefing, alongside live agents and recent sessions, reads the exact same
+  local snapshot through `ctxlake_mcp::memory::briefing_claims` rather than a
+  separate implementation — one attribution renderer, one sanitizer, one
+  shadow-mode gate, used everywhere a claim reaches a context window. Empty in
+  shadow mode and on a fresh install, for the identical structural reason
+  `memory_search` is.
 
 Two things this wave deliberately does not claim to have solved:
 
@@ -219,6 +243,20 @@ Two things this wave deliberately does not claim to have solved:
   with `independent_count` and is bounded, which is all today's gate logic depends on
   it for. The hypothesis-to-outcome resolver that would make confidence mean "this
   agent's track record" is future work.
+- **`memory_search`'s vector search runs over a stand-in embedding, because
+  nothing anywhere in this codebase computes a real one yet.** Extraction's
+  `Provider` trait (`crates/ctxlake-maint/src/extract.rs`) has no `embed()`
+  method today, so every claim proposed anywhere — by extraction or by
+  `memory_propose` — carries `embedding: None`. Rather than ship no vector
+  search until a future wave adds a real embedder, `ctxlake-mcp::snapshot` uses
+  a deterministic, dependency-free hashing-trick bag-of-words fingerprint as
+  both the query vector and the fallback for any claim with no stored
+  embedding — which, today, is every claim, so the comparison is at least
+  internally consistent. It is a lexical proxy, not a semantic one, and a real
+  embedder landing later will need its own matching query-side embedder before
+  a stored real vector and a hash-derived query vector could be compared
+  meaningfully — see `snapshot.rs`'s module doc for the honest limitation
+  stated once, in code, rather than silently.
 
 ## Anti-goals
 

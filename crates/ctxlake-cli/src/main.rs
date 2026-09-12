@@ -5,6 +5,7 @@
 //! human once and then forgotten, or wired into a runtime's hook config and never
 //! thought about again.
 
+mod briefing;
 mod claim;
 mod claims;
 mod config;

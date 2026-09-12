@@ -8,22 +8,29 @@ get it through this server, and a runtime *with* hooks gets a second, symmetric 
 ask for the same information mid-turn instead of only at fixed lifecycle points.
 
 > **Status: the server is implemented; `ctxlake mcp` is not wired up yet.** The protocol
-> layer, the fleet tools, and `memory_propose` all work today, against the local
+> layer and every tool — fleet and memory alike — work today against the local
 > filesystem, and this crate ships a real `ctxlake-mcp` binary that runs them on real
-> stdin/stdout. What does **not** exist yet is `ctxlake-cli`'s `mcp` subcommand —
-> `crates/ctxlake-cli` is still the Wave 1 scaffold, so there is no `ctxlake mcp` to spawn
-> and no `ctxlake install` to write the config block below into a runtime's settings. If
-> you want to run this server today, point a runtime's MCP config at the `ctxlake-mcp`
-> binary this crate builds directly (`cargo build -p ctxlake-mcp --bin ctxlake-mcp`), or
-> call [`ctxlake_mcp::run_stdio()`](../crates/ctxlake-mcp/src/lib.rs) from your own thin
+> stdin/stdout. What does **not** exist yet is `ctxlake-cli`'s `mcp` subcommand, so
+> there is no `ctxlake mcp` to spawn and no `ctxlake install` to write the config block
+> below into a runtime's settings. If you want to run this server today, point a
+> runtime's MCP config at the `ctxlake-mcp` binary this crate builds directly
+> (`cargo build -p ctxlake-mcp --bin ctxlake-mcp`), or call
+> [`ctxlake_mcp::run_stdio()`](../crates/ctxlake-mcp/src/lib.rs) from your own thin
 > wrapper — both do exactly what `ctxlake mcp` will do once it exists.
 >
-> Separately, `memory_search` and `memory_timeline` are wired up and tested, but read
-> from a local cache file nothing in this codebase writes yet — the daemon that would
-> populate it, and the promotion gate that would give it something to promote, are both
-> later work (Wave 3). Until then both tools say so plainly (`"enabled": false`) rather
-> than returning a fabricated result. See [memory.md](memory.md) for the belief layer
-> they're waiting on.
+> `memory_search`/`memory_timeline` (wave 4) now read the real local claim snapshot —
+> `<cache_root>/<fleet_id>/snapshot.bin`, `ctxlake sync`'s byte-for-byte mirror of
+> `ctxlake-maint::snapshot::publish`'s SQLite artifact — rather than a placeholder
+> cache file with no writer. `"enabled": false` means exactly what it always did: no
+> `ctxlake maint` run has ever published a snapshot for this fleet (the common case on
+> a fresh install, or any install with `[summarize] mode = "none"`/`"agent"`, the
+> documented default). A fleet that *has* run extraction but is sitting in
+> `[summarize] mode = "shadow"` (also a documented default while an operator builds
+> trust in the extracted claims — see [memory.md](memory.md)) instead reads
+> `"enabled": true` with an always-empty `"results"`/`"entries"` array: the snapshot
+> exists and opens fine, every claim in it is simply marked not-agent-visible at the
+> row level. Both are deliberate "reads nothing" outcomes, not bugs to chase down —
+> [memory.md](memory.md) has the full claim model they're built against.
 
 ## Why this process never touches the object store
 
@@ -89,8 +96,8 @@ set them for you.
 | `fleet_release(paths[]?)` | write | Queue a release; omit `paths` for "everything I hold." |
 | `fleet_history(repo?, since?, limit?)` | read | Recent sessions and outcomes from the cache. |
 | `fleet_handoff(summary, status, next?)` | write | Leave a note for whoever picks this up next. |
-| `memory_search(query, scope?, k?)` | read | Promoted claims matching `query`, with attribution. |
-| `memory_propose(claim, type, evidence[])` | write | File a claim **candidate**. Never promotes. |
+| `memory_search(query, scope?, subject?, claim_type?, k?)` | read | Promoted claims matching `query` (FTS5 lexical + brute-force cosine), with attribution. |
+| `memory_propose(claim, type, subject, evidence[])` | write | File a claim **candidate**. Never promotes. |
 | `memory_timeline(subject, since?, limit?)` | read | What this fleet has actually tried, re: `subject`. |
 
 Every *read* tool degrades honestly when its cache file is missing or unparseable: an
@@ -113,21 +120,38 @@ tail the way the length bound's truncation marker makes visible for a single fie
 ### `memory_propose` never writes a promoted claim
 
 This is AGENTS.md invariant 9, enforced structurally, not by convention: there is no
-`memory_write` tool in `tools/list`, `propose()` hard-codes `status: "candidate"` in the
-record it queues regardless of anything the caller sent, and nothing in
-`crates/ctxlake-mcp/` ever constructs a `claims/fleet/*` write — that key is written only
-by the promotion gate inside `ctxlake maint`, a different binary this crate does not even
-depend on. A conformance test asserts the tool list stays free of `memory_write`, and a
-second test asserts a proposed claim's spooled record carries `"candidate"` and never
-`"promoted"`.
+`memory_write` tool in `tools/list`, `propose()` spools a `ClaimEvent::Proposed` whose
+`scope` is hard-coded `"agent"` with no argument on the function's signature that could
+widen it, and nothing in `crates/ctxlake-mcp/` ever constructs a `claims/fleet/*` write —
+that key is written only by the promotion gate inside `ctxlake maint`, a different binary
+this crate does not even depend on. A conformance test asserts the tool list stays free
+of `memory_write`; other tests assert a proposed claim's spooled record is a `proposed`
+event and never contains the word `promoted`, and that its `scope` is never anything but
+`"agent"`.
 
 `propose` also enforces [memory.md](memory.md)'s "no evidence, no claim" rule itself,
-before anything is queued: an empty `evidence` array is refused outright.
+before anything is queued, at the level of a single citation: an empty `evidence` array
+is refused outright, and so is any citation missing a non-empty `session_id` or
+`message_id` — `[{}]` used to pass the old "array is non-empty" check even though it
+cites nothing at all.
+
+The record `propose` spools is byte-for-byte the same shape
+`ctxlake-maint::claims::ClaimEvent::Proposed` serializes to (see
+`crates/ctxlake-mcp/src/wire.rs`) — a deliberate second definition of the same wire
+format, not a shortcut, since this crate cannot depend on `ctxlake-maint` without pulling
+in `object_store`/`tokio`. A future daemon-side drain of `spool/mcp/*.ndjson` into real
+`claims/events/*.json` objects (not yet built anywhere in this codebase) can therefore
+append this record with zero translation.
 
 ### `memory_search`'s attribution shape
 
-When the local claims cache exists (today: never — see the status note above), a result
-renders exactly like [memory.md](memory.md) specifies, never as bare fact:
+`memory_search` reads `<cache_root>/<fleet_id>/snapshot.bin` (see the status note above)
+and combines FTS5 lexical matching with brute-force cosine over each claim's 256-dim
+embedding — `crates/ctxlake-mcp/src/snapshot.rs` has the full contract, including the
+honest limitation that no real embedder exists anywhere in this codebase yet, so the
+"embedding" today is a deterministic, dependency-free lexical hash rather than anything
+semantic. A hit renders exactly like [memory.md](memory.md) specifies, never as bare
+fact:
 
 ```text
 [cc-03, 2026-09-09, 2 independent sessions, conf 0.81]
@@ -136,7 +160,10 @@ renders exactly like [memory.md](memory.md) specifies, never as bare fact:
 
 A contested claim says so inline (`, CONTESTED`), and a claim resting on a single session
 reads as "1 independent session," not silently rounded up to sound more corroborated than
-it is.
+it is. `independent_count` is the only session count ever rendered — there is no
+`evidence_count` field on the type `render()` accepts, so a raw evidence tally (which can
+overcount correlated, non-independent corroboration) can never leak into a rendered
+result by accident.
 
 ## Every field read from the lake is treated as an attack surface
 
@@ -194,6 +221,20 @@ mirroring `ctxlake-hook`'s own spool guard — but where the hook must silently 
 over-cap event (it can never fail the host agent's turn), this server has a real return
 channel: hitting the cap comes back as an ordinary tool-call error the calling agent can
 see and act on.
+
+## The briefing's fleet-context block
+
+`ctxlake-cli`'s SessionStart briefing (`crates/ctxlake-cli/src/briefing.rs`) has a third
+block alongside live agents and recent sessions: promoted claims, via
+`ctxlake_mcp::memory::briefing_claims`. It reuses this crate's own snapshot read and
+attribution renderer rather than a second implementation — same sanitizer, same
+attribution shape, same structural shadow-mode emptiness described above — capped small
+(five lines by default) since a briefing rides in on every session's context window,
+where `memory_search` is the tool to reach for anything more. This is a documented
+divergence from `docs/architecture.md`'s diagram, which describes `ctxlake maint`
+pre-rendering a briefing blob server-side instead; see `briefing.rs`'s own module doc for
+why this wave took the client-side rendering path that was actually buildable within its
+scope.
 
 ## Protocol conformance
 

@@ -14,17 +14,29 @@
 //! synchronously waiting on. There is no `object_store` or `tokio` dependency
 //! anywhere in this crate's `Cargo.toml`, so that boundary cannot be violated by
 //! accident; it would have to be reintroduced as a dependency first, which a
-//! reviewer of that diff would have to explain.
+//! reviewer of that diff would have to explain. `rusqlite` (bundled) and `time`
+//! are the two exceptions — both are local-file/clock utilities with no network or
+//! async-runtime dependency of their own; see `snapshot.rs`'s and `Cargo.toml`'s
+//! comments for why each was added.
 //!
 //! ## Module map
 //! - [`protocol`] — JSON-RPC 2.0 framing: parsing, dispatch, error codes.
 //! - [`tools`] — the `tools/list` catalog and `tools/call` routing.
 //! - [`fleet`] — `fleet_status` / `fleet_claim` / `fleet_release` / `fleet_history`
 //!   / `fleet_handoff`.
-//! - [`memory`] — `memory_search` / `memory_propose` / `memory_timeline`. See its
-//!   module doc for why `memory_propose` is the only one of the three that does
-//!   anything useful today (AGENTS.md invariant 9), and for the honest-empty
-//!   contract the other two hold until the belief layer ships.
+//! - [`memory`] — `memory_search` / `memory_propose` / `memory_timeline`, wired to
+//!   the real claim store (see [`snapshot`]). `memory_propose` is a real spool
+//!   write today, as it always has been (AGENTS.md invariant 9: never a promoted
+//!   claim); the two read tools now answer from the actual local snapshot mirror
+//!   rather than a placeholder cache file, honestly empty whenever that mirror is
+//!   absent or every claim in it is shadow-mode-invisible.
+//! - [`snapshot`] — opens `<cache_root>/<fleet_id>/snapshot.bin` (the local mirror
+//!   of `ctxlake-maint`'s published claim snapshot) and answers FTS5-plus-cosine
+//!   search and the outcome timeline. This is where shadow mode's "reads nothing"
+//!   guarantee actually lives structurally.
+//! - [`wire`] — the exact JSON shape `memory_propose` spools, mirroring
+//!   `ctxlake-maint::claims::ClaimEvent::Proposed` byte-for-byte without this
+//!   crate depending on that crate.
 //! - [`sanitize`] — the render-time cleaner every untrusted field (a peer's claim,
 //!   a peer's handoff note) is routed through before it reaches a tool result.
 //! - [`write_guard`] — the write-time secret scrubber every free-text argument to a
@@ -39,8 +51,10 @@ pub mod memory;
 pub mod paths;
 pub mod protocol;
 pub mod sanitize;
+pub mod snapshot;
 pub mod spool;
 pub mod tools;
+pub mod wire;
 pub mod write_guard;
 
 use std::io::{self, BufRead, Write};

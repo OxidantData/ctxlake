@@ -109,12 +109,24 @@ fn call_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<Value, ToolError> {
         }
         "memory_search" => {
             let query = required_str(args, "query")?;
+            let subject = optional_str(args, "subject")?;
+            let claim_type = optional_str(args, "claim_type")?;
+            let scope = optional_str(args, "scope")?;
             let k = optional_u64(args, "k")?.unwrap_or(10) as usize;
-            Ok(memory::search(&ctx.cache_root, &ctx.fleet_id, query, k))
+            Ok(memory::search(
+                &ctx.cache_root,
+                &ctx.fleet_id,
+                query,
+                subject,
+                claim_type,
+                scope,
+                k,
+            ))
         }
         "memory_propose" => {
             let claim = required_str(args, "claim")?;
             let claim_type = required_str(args, "type")?;
+            let subject = required_str(args, "subject")?;
             let evidence = required_array(args, "evidence")?;
             memory::propose(
                 &ctx.spool_root,
@@ -122,6 +134,7 @@ fn call_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<Value, ToolError> {
                 &ctx.agent_id,
                 claim,
                 claim_type,
+                subject,
                 &evidence,
             )
             .map_err(ToolError::Execution)
@@ -269,11 +282,13 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "memory_search",
-            "description": "Search promoted claims (with attribution: observer, date, independent session count, confidence, and a CONTESTED marker) for the given query. The belief layer is not enabled until the promotion gate ships (Wave 3); until then this honestly returns enabled: false with no fabricated results.",
+            "description": "Search promoted claims from the local snapshot mirror (FTS5 lexical match plus brute-force cosine over each claim's 256-dim embedding), rendered with attribution: observer, date, INDEPENDENT session count (never the raw evidence count), confidence, and a CONTESTED marker when contested. Rendered as a peer's belief to verify, never as bare fact. Honestly returns enabled: false with no fabricated results whenever no snapshot has synced locally yet, or this fleet is in shadow mode (the default) — reading zero claims in that case is deliberate, not a bug.",
             "inputSchema": object_schema(
                 json!({
                     "query": string_prop("Free-text query, matched against claim text and subject"),
-                    "scope": string_prop("agent | repo | fleet (accepted, not yet enforced — no promoted claim exists yet)"),
+                    "scope": string_prop("agent | repo | fleet — exact match filter"),
+                    "subject": string_prop("Exact-match filter on the claim's subject"),
+                    "claim_type": string_prop("environment | convention | outcome | preference | hypothesis — exact match filter"),
                     "k": { "type": "integer", "description": "Maximum results to return (default 10, hard ceiling 200)" },
                 }),
                 &["query"],
@@ -281,14 +296,15 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "memory_propose",
-            "description": "Propose a candidate claim with evidence. This NEVER writes a promoted claim — only the promotion gate can do that, and it doesn't exist yet. A claim with no evidence is rejected outright, per the no-evidence-no-claim rule.",
+            "description": "Propose a candidate claim with a subject and evidence. This NEVER writes a promoted claim, and never writes anything beyond agent scope — only the promotion gate (ctxlake maint) can promote. A claim with no evidence, or an evidence citation missing session_id/message_id, is rejected outright, per the no-evidence-no-claim rule.",
             "inputSchema": object_schema(
                 json!({
                     "claim": string_prop("One proposition — not a paragraph, not two facts joined by \"and\""),
                     "type": string_prop("environment | convention | outcome | preference | hypothesis"),
-                    "evidence": { "type": "array", "description": "At least one citation, e.g. {session_id, message_id}; empty arrays are rejected" },
+                    "subject": string_prop("The entity this is about — a repo, a service, a command"),
+                    "evidence": { "type": "array", "description": "At least one citation, each an object with at least {session_id, message_id}; excerpt_hash/observed_at optional. Empty arrays, or citations missing session_id/message_id, are rejected." },
                 }),
-                &["claim", "type", "evidence"],
+                &["claim", "type", "subject", "evidence"],
             ),
         },
         {
@@ -357,7 +373,7 @@ mod tests {
         let (_dir, ctx) = test_ctx();
         let result = call_tool(
             "memory_propose",
-            &json!({"claim": "x", "type": "convention", "evidence": []}),
+            &json!({"claim": "x", "type": "convention", "subject": "tooling", "evidence": []}),
             &ctx,
         );
         assert!(matches!(result, Err(ToolError::Execution(_))));
@@ -367,7 +383,7 @@ mod tests {
     fn tools_call_wraps_execution_errors_as_error_content_not_protocol_errors() {
         let (_dir, ctx) = test_ctx();
         let result = tools_call(
-            &json!({"name": "memory_propose", "arguments": {"claim": "x", "type": "convention", "evidence": []}}),
+            &json!({"name": "memory_propose", "arguments": {"claim": "x", "type": "convention", "subject": "tooling", "evidence": []}}),
             &ctx,
         )
         .unwrap();
@@ -416,20 +432,30 @@ mod tests {
         assert_eq!(parsed["truncated"], true);
     }
 
-    /// Same regression for `memory_timeline`'s `limit` argument.
+    /// Same regression for `memory_timeline`'s `limit` argument, against a real
+    /// snapshot fixture now that `memory_timeline` reads `snapshot.bin` instead of
+    /// a placeholder `timeline.json`.
     #[test]
     fn memory_timeline_limit_argument_reaches_the_cache_read() {
+        use crate::snapshot::test_support::{write_snapshot, FixtureClaim};
+
         let (dir, ctx) = test_ctx();
-        let fleet_dir = dir.path().join("cache").join("test-fleet");
-        std::fs::create_dir_all(&fleet_dir).unwrap();
-        let entries: Vec<Value> = (0..10)
-            .map(|i| json!({"subject": "x", "at": "2026-09-09", "what": format!("e{i}")}))
+        let path = dir
+            .path()
+            .join("cache")
+            .join("test-fleet")
+            .join("snapshot.bin");
+        let claims: Vec<FixtureClaim> = (0..10)
+            .map(|i| {
+                let id: &'static str = Box::leak(format!("c{i}").into_boxed_str());
+                let at: &'static str =
+                    Box::leak(format!("2026-09-{:02}T00:00:00Z", i + 1).into_boxed_str());
+                let mut c = FixtureClaim::promoted(id, "outcome text", "outcome", "x");
+                c.updated_at = at;
+                c
+            })
             .collect();
-        std::fs::write(
-            fleet_dir.join("timeline.json"),
-            serde_json::to_vec(&entries).unwrap(),
-        )
-        .unwrap();
+        write_snapshot(&path, &claims);
 
         let result = tools_call(
             &json!({"name": "memory_timeline", "arguments": {"subject": "x", "limit": 2}}),

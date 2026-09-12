@@ -269,6 +269,17 @@ struct MaintCmd {
     /// timer is optional.
     #[arg(long)]
     once: bool,
+    /// Delete objects nothing reads any more, then exit.
+    ///
+    /// Narrow on purpose: superseded snapshot blobs older than a day (nothing ever
+    /// removed them, so they accumulate forever), and the pre-fleet-scoping
+    /// `live/agents/*.json` and `live/roster.json`. Sessions, claim events, digests
+    /// and compaction generations are never touched.
+    #[arg(long)]
+    prune: bool,
+    /// With `--prune`: report exactly what would be deleted, and delete nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -441,6 +452,9 @@ async fn run() -> Result<()> {
         }
         Command::Maint(args) => {
             let cfg = load_config(&config_path)?;
+            if args.prune {
+                return maint_cmd::run_prune(&cfg, args.dry_run).await;
+            }
             maint_cmd::run(&cfg, args.once).await
         }
         Command::Claims(args) => {

@@ -212,7 +212,7 @@ mod tests {
         );
 
         // The presence loop should have published this agent's own intent.
-        assert!(intent::read(store.as_ref(), "cc-01")
+        assert!(intent::read(store.as_ref(), "oxidant", "cc-01")
             .await
             .unwrap()
             .is_some());

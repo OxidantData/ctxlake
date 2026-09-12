@@ -107,7 +107,7 @@ pub async fn publish_intent(
     store: &dyn ObjectStore,
     cfg: &PresenceConfig,
 ) -> Result<(), StoreError> {
-    let existing = intent::read(store, &cfg.agent_id).await?;
+    let existing = intent::read(store, &cfg.fleet_id, &cfg.agent_id).await?;
     intent::write(store, &intent_snapshot(cfg, existing.as_ref())).await
 }
 
@@ -153,7 +153,7 @@ impl<J: JitterSource> Presence<J> {
 
         let now = OffsetDateTime::from(clock.now().await?);
         if self.next_roster_build_at.is_none_or(|due| now >= due) {
-            match roster::build(store).await? {
+            match roster::build(store, &cfg.fleet_id).await? {
                 roster::BuildOutcome::Published(_) => {}
                 roster::BuildOutcome::Skipped => {
                     // A concurrent builder's snapshot from the same instant landed
@@ -266,7 +266,10 @@ mod tests {
     async fn publish_intent_writes_a_readable_intent() {
         let store = InMemory::new();
         publish_intent(&store, &cfg()).await.unwrap();
-        let back = intent::read(&store, "cc-01").await.unwrap().unwrap();
+        let back = intent::read(&store, "oxidant", "cc-01")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(back.agent_id, "cc-01");
         assert_eq!(back.branch.as_deref(), Some("wave2/sync"));
     }
@@ -298,7 +301,10 @@ mod tests {
         let mut presence = Presence::new();
         presence.tick(&store, &SystemClock, &cfg()).await.unwrap();
 
-        let back = intent::read(&store, "cc-01").await.unwrap().unwrap();
+        let back = intent::read(&store, "oxidant", "cc-01")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             back.session_id.as_deref(),
             Some("sess-42"),
@@ -327,7 +333,10 @@ mod tests {
         presence.tick(&store, &SystemClock, &cfg()).await.unwrap();
 
         assert!(
-            store.get(&ctxlake_store::layout::roster()).await.is_ok(),
+            store
+                .get(&ctxlake_store::layout::roster("oxidant"))
+                .await
+                .is_ok(),
             "roster.json should have been built on the very first tick"
         );
     }
@@ -347,9 +356,18 @@ mod tests {
         };
         b.tick(&store, &SystemClock, &cfg_b).await.unwrap();
 
-        assert!(intent::read(&store, "cc-01").await.unwrap().is_some());
-        assert!(intent::read(&store, "cc-02").await.unwrap().is_some());
-        assert!(store.get(&ctxlake_store::layout::roster()).await.is_ok());
+        assert!(intent::read(&store, "oxidant", "cc-01")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(intent::read(&store, "oxidant", "cc-02")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get(&ctxlake_store::layout::roster("oxidant"))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -376,7 +394,10 @@ mod tests {
 
         presence.tick(&store, &clock, &cfg()).await.unwrap();
 
-        let roster = store.get(&ctxlake_store::layout::roster()).await.unwrap();
+        let roster = store
+            .get(&ctxlake_store::layout::roster("oxidant"))
+            .await
+            .unwrap();
         let snapshot: roster::RosterSnapshot =
             serde_json::from_slice(&roster.bytes().await.unwrap()).unwrap();
         assert_eq!(
@@ -403,7 +424,10 @@ mod tests {
         clock.advance(ROSTER_BUILD_INTERVAL + Duration::from_secs(1));
         presence.tick(&store, &clock, &cfg()).await.unwrap();
 
-        let roster = store.get(&ctxlake_store::layout::roster()).await.unwrap();
+        let roster = store
+            .get(&ctxlake_store::layout::roster("oxidant"))
+            .await
+            .unwrap();
         let snapshot: roster::RosterSnapshot =
             serde_json::from_slice(&roster.bytes().await.unwrap()).unwrap();
         let mut ids: Vec<_> = snapshot.agents.iter().map(|a| a.agent_id.clone()).collect();

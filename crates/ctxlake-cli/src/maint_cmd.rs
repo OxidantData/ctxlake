@@ -60,6 +60,40 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
 /// channels: `ctxlake maint` writes to stdout for a human, and the sync daemon's
 /// maintenance loop (`sync_cmd.rs`) writes to its log file. Printing here would put
 /// the daemon's cycle reports on a stdout nobody reads.
+/// `ctxlake maint --prune` — remove objects nothing reads any more.
+///
+/// Separate from the chain rather than a step in it. The chain only ever adds, which
+/// is what makes running it from every host at once safe; deleting is different in
+/// kind and should be something an operator asks for, not something that happens on a
+/// five-minute timer they forgot they installed.
+pub(crate) async fn run_prune(cfg: &Config, dry_run: bool) -> Result<()> {
+    let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
+    let store = store_ctx::prefixed_store(&ctx);
+
+    let report = ctxlake_maint::prune::run(store.as_ref(), dry_run)
+        .await
+        .context("pruning the lake")?;
+
+    let verb = if dry_run { "would remove" } else { "removed" };
+    for key in report.snapshots.iter().chain(report.legacy_live.iter()) {
+        println!("  {verb} {key}");
+    }
+    if report.snapshots_within_grace > 0 {
+        println!(
+            "  kept {} superseded snapshot(s) younger than {}h — a reader that just \
+             resolved the pointer may still be fetching one",
+            report.snapshots_within_grace,
+            ctxlake_maint::prune::SNAPSHOT_GRACE.as_secs() / 3600,
+        );
+    }
+    match (report.total(), dry_run) {
+        (0, _) => println!("nothing to prune"),
+        (n, true) => println!("{n} object(s) would be removed — re-run without --dry-run"),
+        (n, false) => println!("{n} object(s) removed"),
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_one_cycle(cfg: &Config) -> Result<String> {
     let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
     let store = store_ctx::prefixed_store(&ctx);

@@ -132,6 +132,11 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
         );
     }
 
+    // What this host called itself before, if anything. Read before the new config is
+    // written, because after that the old identity is unrecoverable — and its presence
+    // record is still sitting in the lake with nobody left to update it.
+    let previous = crate::config::load(config_path).ok();
+
     let agent_id = match args.agent_id {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => default_agent_id(),
@@ -164,6 +169,8 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
         .await
         .with_context(|| format!("store at {} is not reachable", cfg.store))?;
     let _ = ctx.store.delete(&probe_key).await; // best-effort scratch cleanup
+
+    retire_previous_identity(previous.as_ref(), &cfg, &ctx).await;
 
     // `init` used to pre-provision a maintenance lease key here, because a lease
     // object had to exist before anyone could compare-and-swap it. Nothing leases
@@ -242,6 +249,56 @@ fn create_local_store_dir(store_url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove the presence record of the identity this host is replacing.
+///
+/// `ctxlake init --force` with a different `--agent-id` or `--fleet` leaves the old
+/// `live/` object behind, written by nobody from that moment on. Before the roster
+/// learned to expire entries that was permanent: a host renamed at 09:43 was still
+/// being listed as an active agent hours later. Expiry alone would fix the symptom
+/// within `PRESENCE_TTL`, but leaving the object is still wrong — it is a record of an
+/// agent that does not exist, and the host that created it is right here, able to say
+/// so now rather than letting five minutes of wrong output happen first.
+///
+/// Best-effort and never fatal. `init`'s job is producing a working config; failing it
+/// over a tidy-up of the *previous* one would be refusing to fix the thing the user
+/// ran the command to fix.
+async fn retire_previous_identity(
+    previous: Option<&Config>,
+    cfg: &Config,
+    ctx: &store_ctx::StoreCtx,
+) {
+    let Some(prev) = previous else { return };
+    if prev.agent_id == cfg.agent_id && prev.fleet_id == cfg.fleet_id {
+        return;
+    }
+    // Only when the old identity lived in the store we are already connected to.
+    // Reaching into a different bucket would mean a second set of credentials and a
+    // second failure mode, for an object the operator can delete with one CLI call.
+    if prev.store != cfg.store {
+        println!(
+            "  note: the previous identity ({}/{}) was in a different store; its \
+             presence record there is untouched",
+            prev.fleet_id, prev.agent_id
+        );
+        return;
+    }
+
+    let store = store_ctx::prefixed_store(ctx);
+    match ctxlake_store::intent::remove(store.as_ref(), &prev.fleet_id, &prev.agent_id).await {
+        Ok(()) => println!(
+            "  retired the previous identity {}/{} from live/",
+            prev.fleet_id, prev.agent_id
+        ),
+        Err(e) => println!(
+            "  note: could not remove the previous identity {}/{} ({e}); it ages out of \
+             the roster within {} minutes",
+            prev.fleet_id,
+            prev.agent_id,
+            ctxlake_store::roster::PRESENCE_TTL.whole_minutes()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -311,6 +368,128 @@ mod tests {
             !leases.exists(),
             "init must create no lease objects; found {}",
             leases.display()
+        );
+    }
+
+    /// Run `init` against `store_url`, then read back which agent objects exist.
+    async fn agents_in(store_dir: &std::path::Path, fleet: &str) -> Vec<String> {
+        let dir = store_dir
+            .join("live")
+            .join("fleets")
+            .join(fleet)
+            .join("agents");
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return vec![];
+        };
+        let mut names: Vec<String> = rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn renaming_this_host_retires_the_identity_it_replaces() {
+        // Reported from a real lake: a host initialized as one agent, re-initialized
+        // with `--force` under another name, and the first name sat in `live/` being
+        // reported as an active agent for hours afterwards, in a fleet it no longer
+        // belonged to.
+        let store_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("ctxlake.toml");
+        let store_url = format!("file://{}", store_dir.path().display());
+
+        let args = |agent: &'static str, fleet: &'static str, force: bool| InitArgs {
+            store: &store_url,
+            fleet_id: fleet,
+            agent_id: Some(agent),
+            force,
+            llm: None,
+        };
+
+        run(args("old-name", "myteam", false), &config_path)
+            .await
+            .unwrap();
+        // `init` does not publish presence — the daemon does — so stand in for it.
+        let cfg = crate::config::load(&config_path).unwrap();
+        let ctx = store_ctx::connect(&cfg, &cfg.agent_id).unwrap();
+        let store = store_ctx::prefixed_store(&ctx);
+        ctxlake_store::intent::write(
+            store.as_ref(),
+            &ctxlake_store::intent::Intent {
+                agent_id: "old-name".into(),
+                fleet_id: "myteam".into(),
+                runtime: ctxlake_core::Runtime::ClaudeCode,
+                session_id: None,
+                repo: None,
+                branch: None,
+                cwd: None,
+                task: None,
+                paths: vec![],
+                updated_at: time::OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            agents_in(store_dir.path(), "myteam").await,
+            vec!["old-name.json"]
+        );
+
+        run(args("new-name", "myteam", true), &config_path)
+            .await
+            .unwrap();
+        assert!(
+            agents_in(store_dir.path(), "myteam").await.is_empty(),
+            "the replaced identity must not be left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_running_init_unchanged_retires_nothing() {
+        // `init --force` is also how people change a model or a store URL. Deleting
+        // this host's own live record on every such run would blank it from the fleet
+        // until the next heartbeat.
+        let store_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("ctxlake.toml");
+        let store_url = format!("file://{}", store_dir.path().display());
+        let args = |force: bool| InitArgs {
+            store: &store_url,
+            fleet_id: "myteam",
+            agent_id: Some("cc-01"),
+            force,
+            llm: None,
+        };
+
+        run(args(false), &config_path).await.unwrap();
+        let cfg = crate::config::load(&config_path).unwrap();
+        let ctx = store_ctx::connect(&cfg, &cfg.agent_id).unwrap();
+        let store = store_ctx::prefixed_store(&ctx);
+        ctxlake_store::intent::write(
+            store.as_ref(),
+            &ctxlake_store::intent::Intent {
+                agent_id: "cc-01".into(),
+                fleet_id: "myteam".into(),
+                runtime: ctxlake_core::Runtime::ClaudeCode,
+                session_id: None,
+                repo: None,
+                branch: None,
+                cwd: None,
+                task: None,
+                paths: vec![],
+                updated_at: time::OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .unwrap();
+
+        run(args(true), &config_path).await.unwrap();
+        assert_eq!(
+            agents_in(store_dir.path(), "myteam").await,
+            vec!["cc-01.json"],
+            "an unchanged identity must survive its own --force"
         );
     }
 

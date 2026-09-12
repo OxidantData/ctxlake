@@ -588,7 +588,15 @@ mod tests {
         // no lease to release. What still has to be true is that the presence loop ran
         // at all — asserted rather than branched on, so a regression that stops it
         // fails loudly here instead of this whole block silently checking nothing.
-        let intent = store_dir.join("live").join("agents").join("cc-01.json");
+        // Built from `layout::agent_intent`'s scheme rather than hardcoded, so that a
+        // future layout change fails the layout's own tests rather than silently
+        // passing here against a path nothing writes.
+        let intent = store_dir
+            .join("live")
+            .join("fleets")
+            .join("sync-fg-test-fleet")
+            .join("agents")
+            .join("cc-01.json");
         assert!(
             intent.exists(),
             "expected the presence loop to have published this agent's intent to {}",

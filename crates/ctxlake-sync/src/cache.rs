@@ -83,7 +83,7 @@ pub async fn refresh_roster(
     cfg: &CacheConfig,
     state: &mut RefreshState,
 ) -> Result<bool, StoreError> {
-    match ctxlake_store::roster::fetch(store, state.roster_etag.as_deref()).await? {
+    match ctxlake_store::roster::fetch(store, &cfg.fleet_id, state.roster_etag.as_deref()).await? {
         Roster::Unchanged => Ok(false),
         Roster::Fresh { snapshot, etag } => {
             let bytes = serde_json::to_vec_pretty(&snapshot)?;

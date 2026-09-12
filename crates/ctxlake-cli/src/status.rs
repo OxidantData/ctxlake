@@ -20,6 +20,7 @@ use time::OffsetDateTime;
 use crate::claim::decode_reason;
 use crate::config::Config;
 use crate::paths;
+use crate::sanitize::sanitize;
 use crate::store_ctx::{self, full_path};
 
 pub async fn run(cfg: &Config) -> Result<()> {
@@ -78,20 +79,29 @@ fn render_roster(
 
     for agent in &snapshot.agents {
         let entry_age = OffsetDateTime::now_utc() - agent.updated_at;
+        // Every field below is written by some other agent (or that agent's
+        // operator) and read back here — untrusted input per AGENTS.md's house
+        // rule, rendered plainly rather than interpreted, but still sanitized
+        // before it reaches the terminal (see `sanitize`'s own doc for why
+        // "plainly" doesn't mean "unfiltered").
         out.push_str(&format!(
             "\n  {}  {}  {}  {}m\n",
-            agent.agent_id,
-            agent.runtime.as_str(),
-            agent.repo.as_deref().unwrap_or("-"),
+            sanitize(&agent.agent_id),
+            agent.runtime.as_str(), // our own enum's Display, not lake content
+            agent
+                .repo
+                .as_deref()
+                .map(sanitize)
+                .as_deref()
+                .unwrap_or("-"),
             entry_age.whole_minutes().max(0)
         ));
         if !agent.paths.is_empty() {
-            out.push_str(&format!("           touching {}\n", agent.paths.join(", ")));
+            let paths: Vec<String> = agent.paths.iter().map(|p| sanitize(p)).collect();
+            out.push_str(&format!("           touching {}\n", paths.join(", ")));
         }
         if let Some(task) = &agent.task {
-            // Free text written by another agent's operator — untrusted, rendered
-            // plainly rather than interpreted (AGENTS.md house rules).
-            out.push_str(&format!("           \"{task}\"\n"));
+            out.push_str(&format!("           \"{}\"\n", sanitize(task)));
         }
     }
     Ok(out)
@@ -151,8 +161,14 @@ async fn print_live_leases(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// `resource` is decoded from another agent's own `LeaseState.reason` and `holder`/
+/// `note` are that agent's own choices too — all untrusted per AGENTS.md's house
+/// rule, sanitized here rather than trusted because a prior `ctxlake claim` chose
+/// them (see `sanitize`'s own doc).
 fn format_lease_line(resource: &str, holder: &str, note: Option<&str>) -> String {
-    match note {
+    let resource = sanitize(resource);
+    let holder = sanitize(holder);
+    match note.map(sanitize) {
         Some(n) => format!("  {resource}  held by {holder}  \"{n}\""),
         None => format!("  {resource}  held by {holder}"),
     }
@@ -249,5 +265,73 @@ mod tests {
     fn lease_line_omits_the_note_when_there_is_none() {
         let line = format_lease_line("crates/foo/**", "cc-01", None);
         assert_eq!(line, "  crates/foo/**  held by cc-01");
+    }
+
+    #[test]
+    fn lease_line_sanitizes_a_hostile_holder_and_note() {
+        // Regression test: a lease's `holder`/`note` are chosen by whoever holds
+        // it, not by the reader of `status` — AGENTS.md's "sanitize at render
+        // time" rule applies here even though nothing "interprets" the text.
+        let line = format_lease_line(
+            "crates/foo/**",
+            "cc-\x1b[2Jevil",
+            Some("line1\nFAKE: crates/x  held by admin"),
+        );
+        assert!(!line.contains('\x1b'), "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
+    }
+
+    #[test]
+    fn render_roster_sanitizes_hostile_agent_fields_and_bounds_a_huge_paths_entry() {
+        // Reproduces the finding: a `task` carrying an ANSI screen-clear, an
+        // embedded newline, a bidi override (U+202E), and a zero-width space
+        // (U+200B), plus a 200 KB `paths` entry, must never reach the terminal
+        // unfiltered — the sanitizer strips the former and bounds the latter.
+        let huge_path = "x".repeat(200_000);
+        let snapshot = ctxlake_store::roster::RosterSnapshot {
+            generated_at: OffsetDateTime::now_utc(),
+            source: RosterSource::RosterBuild,
+            agents: vec![Intent {
+                agent_id: "cc-01".into(),
+                fleet_id: "myteam".into(),
+                runtime: Runtime::ClaudeCode,
+                session_id: None,
+                repo: Some("github.com/OxidantData/ctxlake".into()),
+                branch: Some("wave2/cli".into()),
+                cwd: None,
+                task: Some("\x1b[2J\x1b[H\nFAKE: crates/x  held by admin\u{202E}\u{200B}".into()),
+                paths: vec![huge_path],
+                updated_at: OffsetDateTime::now_utc(),
+            }],
+        };
+        let text = serde_json::to_string(&snapshot).unwrap();
+        let out = render_roster(
+            "myteam",
+            std::path::Path::new("/x/roster.json"),
+            Some(&text),
+        )
+        .unwrap();
+        assert!(!out.contains('\x1b'), "ANSI escape leaked: {out:?}");
+        assert!(
+            !out.contains('\u{202E}'),
+            "bidi override leaked into the output"
+        );
+        assert!(
+            !out.contains('\u{200B}'),
+            "zero-width space leaked into the output"
+        );
+        // A forged newline inside `task` must not produce a second line that looks
+        // like independent ctxlake output — the injected text may still appear
+        // (sanitize doesn't redact content, only hostile control characters), but
+        // it must never start its own line.
+        assert!(
+            !out.contains("\nFAKE:"),
+            "an embedded newline let untrusted text forge a fake output line: {out:?}"
+        );
+        assert!(
+            out.len() < 10_000,
+            "a 200 KB paths entry must be bounded, got {} bytes",
+            out.len()
+        );
     }
 }

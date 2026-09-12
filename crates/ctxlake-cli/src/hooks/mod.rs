@@ -9,11 +9,13 @@
 //! two `ctxlake install` runs, the second run converges the command line to the new
 //! values instead of leaving a stale entry sitting next to a fresh one.
 //!
-//! Every entry ctxlake adds embeds the literal substring `ctxlake-hook` in its
-//! command string — see [`MARKER`] — which is both how a re-run recognizes its own
-//! prior entry and how `uninstall` removes *exactly* what `install` added and
-//! nothing else, matching the stable-marker approach `docs/runtimes/claude-code.md`
-//! already documents.
+//! Every entry ctxlake adds embeds the literal token `ctxlake-hook` in its command
+//! string — see [`MARKER`] — which is both how a re-run recognizes its own prior
+//! entry and how `uninstall` removes *exactly* what `install` added and nothing
+//! else. [`is_ours`] anchors on more than the bare substring: a foreign tool that
+//! merely mentions `ctxlake-hook` (as an argument value, say) must never be mistaken
+//! for ctxlake's own entry and deleted — see that function's doc for the exact
+//! shape it requires.
 
 pub mod claude_code;
 pub mod cursor;
@@ -137,8 +139,26 @@ pub fn shell_quote(s: &str) -> String {
 }
 
 /// True if `command` is one ctxlake would have written (see [`MARKER`]).
+///
+/// A plain substring search on [`MARKER`] used to match *any* occurrence of the text
+/// `ctxlake-hook` in the line — including as an argument value to some unrelated
+/// tool (`audit-log --tool ctxlake-hook --mode observe`), which made `uninstall`
+/// delete an entry it never wrote. `hook_command` only ever emits one literal
+/// three-token tail: `ctxlake-hook <event> <runtime-arg>`, where the middle token is
+/// free-form (each runtime's own event vocabulary) but the third is always one of
+/// [`Runtime::hook_runtime_arg`]'s three fixed strings. Requiring that exact tail —
+/// a whitespace-delimited token equal to `ctxlake-hook` (or ending `/ctxlake-hook`,
+/// for an absolute-path invocation) followed two tokens later by a real runtime arg
+/// — survives a user's own wrapper (`timeout 5 nice -n 19 env ... ctxlake-hook
+/// PostToolUse claude_code 2>>...`: the tail is untouched) while rejecting a foreign
+/// tool that merely mentions the string, since its next two tokens are never one of
+/// the three runtime args.
 pub fn is_ours(command: &str) -> bool {
-    command.contains(MARKER)
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    tokens.windows(3).any(|w| {
+        (w[0] == MARKER || w[0].ends_with(&format!("/{MARKER}")))
+            && Runtime::ALL.iter().any(|r| r.hook_runtime_arg() == w[2])
+    })
 }
 
 /// What one install/uninstall run did, for `--dry-run` and for human-readable
@@ -277,6 +297,33 @@ pub fn plan_install(
     })
 }
 
+/// A caveat worth printing after a successful [`plan_install`] for `runtime` — `None`
+/// when there's nothing to say. Kept separate from the printing itself (`main.rs`,
+/// which has no unit tests of its own) so the *mapping* from runtime to caveat is
+/// testable.
+///
+/// Hermes is the one entry here: `ctxlake install hermes` writes real, correct
+/// shell-hook commands into `~/.hermes/config.yaml` (per docs/runtimes/hermes.md),
+/// but `ctxlake-hook` itself does not yet normalize a live Hermes payload —
+/// `crates/ctxlake-hook/src/adapters/mod.rs::normalize` rejects `Runtime::Hermes`
+/// outright, and `main.rs`'s own module doc still describes Hermes as the in-process
+/// Python plugin, not a spawned hook. Until that lands, every wired Hermes event
+/// spawns `ctxlake-hook`, which captures nothing and appends one line per call to
+/// `~/.ctxlake/hook-errors.log` — install still succeeds (the config it writes will
+/// be correct the moment `ctxlake-hook` catches up), but running it silently, with
+/// no caveat, would leave an operator believing capture works when it does not.
+pub fn install_caveat(runtime: Runtime) -> Option<&'static str> {
+    match runtime {
+        Runtime::Hermes => Some(
+            "ctxlake-hook does not yet capture live Hermes events (see docs/cli.md) — \
+             this wires the hook commands into ~/.hermes/config.yaml correctly for when \
+             it does, but until then every wired event logs to ~/.ctxlake/hook-errors.log \
+             and captures nothing",
+        ),
+        Runtime::ClaudeCode | Runtime::Cursor => None,
+    }
+}
+
 /// The uninstall counterpart of [`plan_install`] — removes exactly what an install
 /// would have added.
 pub fn plan_uninstall(runtime: Runtime, path: &Path) -> Result<ChangeSet> {
@@ -315,9 +362,20 @@ pub fn detect(runtime: Runtime, path: &Path) -> Result<RuntimeStatus> {
     };
     // A file that exists but fails to parse is reported as "found, not wired" rather
     // than propagating a parse error — `doctor` must finish and report on every
-    // other check even if one runtime's config is currently broken.
-    let ctxlake_wired = text.contains(MARKER);
+    // other check even if one runtime's config is currently broken. `count_entries`
+    // and `count_foreign_entries` both degrade to `0`/`None` on a parse failure, so
+    // `total > foreign` (below) is false either way, which is exactly that fallback.
+    //
+    // `ctxlake_wired` used to be a bare `text.contains(MARKER)` — the same unanchored
+    // substring problem `is_ours` had (a foreign tool merely mentioning the string
+    // would read as "wired"). Deriving it from the same entry-counting logic
+    // `foreign_entries` already uses (itself built on the now-anchored `is_ours`)
+    // keeps both fields honest from one source of truth: if stripping ctxlake's own
+    // entries left fewer entries than the file started with, something ctxlake
+    // actually wrote was there to strip.
+    let total_entries = count_entries_for(runtime, &text);
     let foreign_entries = count_foreign_entries(runtime, &text).unwrap_or(0);
+    let ctxlake_wired = foreign_entries < total_entries;
     Ok(RuntimeStatus {
         config_exists: true,
         ctxlake_wired,
@@ -325,7 +383,15 @@ pub fn detect(runtime: Runtime, path: &Path) -> Result<RuntimeStatus> {
     })
 }
 
-/// Entries left behind after stripping ctxlake's own = entries some other tool put
+fn count_entries_for(runtime: Runtime, text: &str) -> usize {
+    match runtime {
+        Runtime::ClaudeCode => claude_code::count_entries(text),
+        Runtime::Cursor => cursor::count_entries(text),
+        Runtime::Hermes => hermes::count_entries(text),
+    }
+}
+
+/// Entries left behind after stripping ctxlake's own entries some other tool put
 /// there. Reuses each runtime's own (already-tested) `uninstall` as the "what would
 /// be left" computation, rather than a second, parallel bit of shape-parsing logic
 /// that could silently drift from it.
@@ -335,11 +401,7 @@ fn count_foreign_entries(runtime: Runtime, text: &str) -> Option<usize> {
         Runtime::Cursor => cursor::uninstall(Some(text)).ok()?,
         Runtime::Hermes => hermes::uninstall(Some(text)).ok()?,
     };
-    Some(match runtime {
-        Runtime::ClaudeCode => claude_code::count_entries(&stripped),
-        Runtime::Cursor => cursor::count_entries(&stripped),
-        Runtime::Hermes => hermes::count_entries(&stripped),
-    })
+    Some(count_entries_for(runtime, &stripped))
 }
 
 #[cfg(test)]
@@ -375,6 +437,31 @@ mod tests {
     #[test]
     fn a_foreign_command_is_never_marked_ours() {
         assert!(!is_ours("some-other-tool --flag --verbose"));
+    }
+
+    #[test]
+    fn a_foreign_tool_merely_mentioning_the_marker_is_not_ours() {
+        // Regression test: `is_ours` used to be a bare substring search, so any
+        // tool whose own command line happened to mention "ctxlake-hook" anywhere
+        // — even as an argument *value*, never invoked — was indistinguishable from
+        // an entry ctxlake actually wrote. `uninstall` (via `strip_group`/`strip_all`
+        // in each runtime module) then deleted it on the way out.
+        assert!(!is_ours("audit-log --tool ctxlake-hook --mode observe"));
+        // Same failure shape with the marker embedded in a longer, unrelated token.
+        assert!(!is_ours("run-ctxlake-hook-wrapper myscript claude_code"));
+    }
+
+    #[test]
+    fn a_users_own_wrapper_around_our_command_is_still_ours() {
+        // The flip side of the regression above: a human who added a `timeout`,
+        // `nice`, or log-redirection wrapper around ctxlake's own line must still
+        // have it recognized (and cleanly removed by `uninstall`) — anchoring on
+        // the exact `ctxlake-hook <event> <runtime-arg>` tail survives an arbitrary
+        // prefix and suffix around it.
+        assert!(is_ours(
+            "timeout 5 nice -n 19 env CTXLAKE_FLEET_ID=myteam CTXLAKE_AGENT_ID=cc-01 \
+             ctxlake-hook PostToolUse claude_code 2>>/var/log/ctxlake.log"
+        ));
     }
 
     #[test]
@@ -441,5 +528,62 @@ mod tests {
             assert_eq!(r.name().parse::<Runtime>().unwrap(), r);
         }
         assert!("windsurf".parse::<Runtime>().is_err());
+    }
+
+    #[test]
+    fn detect_does_not_report_wired_from_a_foreign_mention_of_the_marker() {
+        // Regression test: `ctxlake_wired` used to be a bare `text.contains(MARKER)`
+        // — the same unanchored check `is_ours` had — so a config ctxlake never
+        // touched, but whose *foreign* entry happens to mention "ctxlake-hook",
+        // would misreport as already wired.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let existing = json::object! {
+            "hooks" => json::object! {
+                "PreToolUse" => json::array![
+                    json::object! {
+                        "hooks" => json::array![
+                            json::object! {
+                                "type" => "command",
+                                "command" => "audit-log --tool ctxlake-hook --mode observe"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        .dump();
+        std::fs::write(&path, &existing).unwrap();
+
+        let status = detect(Runtime::ClaudeCode, &path).unwrap();
+        assert!(status.config_exists);
+        assert!(
+            !status.ctxlake_wired,
+            "a foreign entry merely mentioning the marker must not read as wired"
+        );
+        assert_eq!(
+            status.foreign_entries, 1,
+            "the foreign entry itself must still be counted"
+        );
+    }
+
+    #[test]
+    fn only_hermes_carries_an_install_caveat() {
+        assert!(install_caveat(Runtime::ClaudeCode).is_none());
+        assert!(install_caveat(Runtime::Cursor).is_none());
+        let caveat = install_caveat(Runtime::Hermes).expect("hermes must carry a caveat");
+        assert!(caveat.contains("does not yet capture"), "{caveat}");
+    }
+
+    #[test]
+    fn detect_reports_wired_once_install_actually_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let installed = claude_code::install(None, "myteam", "cc-01").unwrap();
+        std::fs::write(&path, &installed).unwrap();
+
+        let status = detect(Runtime::ClaudeCode, &path).unwrap();
+        assert!(status.ctxlake_wired);
+        assert_eq!(status.foreign_entries, 0);
     }
 }

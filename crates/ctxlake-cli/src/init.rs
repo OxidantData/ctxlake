@@ -87,15 +87,22 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
         .with_context(|| format!("store at {} is not reachable", cfg.store))?;
     let _ = ctx.store.delete(&probe_key).await; // best-effort scratch cleanup
 
-    // The one well-known lease key this crate defines (docs/coordination.md,
-    // docs/storage.md): every *other* lease is keyed by an arbitrary resource string
-    // nobody has typed yet, which is exactly why only this one can be provisioned
-    // up front — see `ctxlake_store::lease::provision`'s doc for why that's a
-    // one-time, pre-contention step and not something `claim` can do lazily here.
+    // The two well-known lease keys this crate provisions up front, single-writer,
+    // before any contender exists — see `ctxlake_store::lease::provision`'s doc for
+    // why that precondition matters. Every *other* lease is keyed by an arbitrary
+    // resource string nobody has typed yet (`claim`), so it cannot be provisioned
+    // here; `claim::ensure_provisioned` instead serializes each one's first-ever
+    // provisioning through the second key below, which is why that key must exist
+    // before any `ctxlake claim` ever runs against this store.
     let maintenance_key = full_path(&ctx, &ctxlake_store::layout::lease_maintenance());
     ctxlake_store::lease::provision(ctx.store.as_ref(), &maintenance_key)
         .await
         .context("provisioning the maintenance lease")?;
+
+    let claim_provision_lock_key = crate::claim::provision_lock_key(&ctx);
+    ctxlake_store::lease::provision(ctx.store.as_ref(), &claim_provision_lock_key)
+        .await
+        .context("provisioning the claim-provisioning lock")?;
 
     config::save(config_path, &cfg)?;
     Ok(cfg)
@@ -134,6 +141,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.holder, None, "provisioned lease must read back free");
+    }
+
+    #[tokio::test]
+    async fn init_also_provisions_the_claim_provisioning_lock() {
+        // Regression guard: `claim::ensure_provisioned` refuses to self-heal this
+        // key (see its own doc on why that would reintroduce the double-hold bug it
+        // exists to fix) — `init` provisioning it is the only thing that ever does,
+        // so a missed call site here means every first-ever `ctxlake claim` on a
+        // fresh store fails with "run `ctxlake init` again" forever.
+        let store_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("ctxlake.toml");
+        let store_url = format!("file://{}", store_dir.path().display());
+
+        let cfg = run(
+            InitArgs {
+                store: &store_url,
+                fleet_id: "myteam",
+                agent_id: Some("cc-01"),
+                force: false,
+            },
+            &config_path,
+        )
+        .await
+        .unwrap();
+
+        let ctx = store_ctx::connect(&cfg, "cc-01").unwrap();
+        let key = crate::claim::provision_lock_key(&ctx);
+        let state = ctxlake_store::lease::read(ctx.store.as_ref(), &key)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.holder, None,
+            "the claim-provisioning lock must be provisioned (and free) by init"
+        );
     }
 
     #[tokio::test]

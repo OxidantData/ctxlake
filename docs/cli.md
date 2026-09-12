@@ -36,12 +36,14 @@ Three things happen, in order, and any failure in the middle leaves nothing behi
    it back, right now. This is deliberately lighter than `doctor`'s full capability
    matrix (below) — `init`'s job is "can we talk to this bucket at all," not "which
    conditional-write primitives does it support."
-2. **Provisioning the one well-known lease key** this crate defines —
-   `live/leases/_maintenance`, the lease `ctxlake maint` contends for. Every *other*
-   lease is keyed by an arbitrary resource string a human hasn't typed yet
-   ([`claim`](#ctxlake-claim), below), which is exactly why only this one can be
-   provisioned up front — see [storage.md](storage.md) for why lease bootstrap for
-   everything else has to happen lazily, on first touch.
+2. **Provisioning the two well-known lease keys** this crate defines up front:
+   `live/leases/_maintenance` (the lease `ctxlake maint` contends for) and
+   `live/leases/_claim_provision` (a lock `ctxlake claim` uses internally to
+   serialize the first-ever provisioning of every *other* lease — see the box
+   below). Every other lease is keyed by an arbitrary resource string a human
+   hasn't typed yet ([`claim`](#ctxlake-claim), below), which is exactly why only
+   these two fixed keys can be provisioned up front; `init` must run — once, before
+   any `ctxlake claim` ever touches this store — for that lock to exist at all.
 3. **Writing `ctxlake.toml`** — see [config.md](config.md) for the full shape.
 
 `--agent-id` is optional. Omitted, it falls back to a sanitized hostname
@@ -98,7 +100,7 @@ runtimes
 
 daemon
   no cache at /Users/you/.local/share/ctxlake/cache/myteam/roster.json yet — daemon not running, or hasn't completed a first refresh
-  spool backlog: 0 file(s), 0 bytes — /Users/you/.local/share/ctxlake/spool/myteam
+  spool backlog: 0 file(s), 0 bytes — /Users/you/.ctxlake/spool
 ```
 
 ### Backend: every primitive is *executed*, never assumed
@@ -144,9 +146,12 @@ Neither of these can be checked by asking a running process (there isn't one yet
 ask, in this wave) — `doctor` instead reports what the filesystem shows: the local
 cache's freshness (`~/.local/share/ctxlake/cache/<fleet_id>/roster.json`'s mtime, if it
 exists at all) and the spool's backlog (file count and total bytes under
-`~/.local/share/ctxlake/spool/<fleet_id>/`). A missing cache or a growing spool are
-reported plainly, in the same language [architecture.md](architecture.md)'s failure-mode
-table uses, rather than guessed at.
+`$CTXLAKE_SPOOL_DIR`, or `~/.ctxlake/spool` if that's unset — the exact root
+`ctxlake-hook` itself appends to, **not** fleet-scoped: the hook has no reliable
+`fleet_id` at capture time, so it partitions by runtime only, and this has to watch
+the same root or it reports an empty spool regardless of what the hook actually
+wrote). A missing cache or a growing spool are reported plainly, in the same language
+[architecture.md](architecture.md)'s failure-mode table uses, rather than guessed at.
 
 ### Exit code
 
@@ -185,11 +190,18 @@ tool via long shell commands with env-var prefixes):
   `agent_id` changes in `ctxlake.toml` between two runs, the second run *replaces*
   ctxlake's own stale entry with a fresh one rather than leaving two behind: install is
   idempotent against a fixed config and self-correcting against a changed one.
-- **`uninstall` removes exactly what `install` added.** Detection is a stable marker —
-  the literal substring `ctxlake-hook` in the command string — the same approach
-  [runtimes/claude-code.md](runtimes/claude-code.md) documents. An event array or
-  `hooks` object that `install` had to create from nothing is removed on the way out
-  too, rather than left behind as an empty, meaningless shell.
+- **`uninstall` removes exactly what `install` added.** Detection is a stable marker,
+  but not a bare substring search: a command line counts as ctxlake's own only when a
+  whitespace-delimited token is exactly `ctxlake-hook` (or ends `/ctxlake-hook`)
+  *and* is followed two tokens later by one of the three real runtime args
+  (`claude_code`, `cursor`, `hermes`) — the exact tail `ctxlake-hook <event>
+  <runtime>` this crate always writes. That survives a user's own wrapper around
+  the line (`timeout 5 nice -n 19 env ... ctxlake-hook PostToolUse claude_code
+  2>>...`) while refusing to touch a foreign tool that merely *mentions*
+  `ctxlake-hook` — as an audit tool's own argument, say — which a bare substring
+  match would have deleted. An event array or `hooks` object that `install` had to
+  create from nothing is removed on the way out too, rather than left behind as an
+  empty, meaningless shell.
 - **A malformed existing file is refused, not guessed at.** If `~/.claude/settings.json`
   isn't valid JSON (or `~/.hermes/config.yaml` isn't valid YAML), `install` and
   `uninstall` both error without writing anything — no `.bak`, no partial merge. Fixing
@@ -203,11 +215,19 @@ tool via long shell commands with env-var prefixes):
   `crates/ctxlake-hook/src/hostinfo.rs`) and every event lands mis-attributed.
 
 `--dry-run` computes the exact change and prints a line-level diff without writing
-anything. The diff is a plain LCS line-diff, not `diff -u` — both JSON files are fully
-re-serialized (2-space indent) rather than surgically patched, so unrelated formatting
-can shift even though every key, value, and ordering of untouched entries is preserved.
-That is the one place "byte-identical" does not apply, and it is disclosed here rather
-than silently: the guarantee is about *entries*, not whitespace.
+anything. The diff is a plain LCS line-diff, not `diff -u`. For the two JSON runtimes,
+the whole file is fully re-serialized (2-space indent) rather than surgically
+patched, so unrelated formatting can shift even though every key, value, and
+ordering of untouched entries is preserved — comments have no place in JSON, so
+there is nothing beyond whitespace this could lose. Hermes' YAML is handled more
+narrowly: only the top-level `hooks:` block is regenerated and spliced back into the
+original text, so a comment, anchor, or alias anywhere *else* in `~/.hermes/config.yaml`
+survives byte-for-byte; a comment or anchor placed *inside* the `hooks:` block itself
+does not, for the same reason a full YAML-aware round trip would be its own project
+(`serde_yaml`, the crate this parses with, has no concept of either once parsed —
+there is no comment or anchor left for a real diff to preserve, whichever way the
+file is written back). In every case the guarantee is about *entries*, not
+whitespace or formatting, and it is disclosed here rather than silently.
 
 `--all` targets every runtime whose config file `doctor` would report as **found**
 (`found, not wired` or `wired`) — a runtime with no config file at all is not touched,
@@ -231,6 +251,20 @@ never wedge a session.
 Each event name is passed as `ctxlake-hook`'s first argument exactly as shown in the
 table above — the runtime's own vocabulary for that event, matching the contract in
 `crates/ctxlake-hook/src/main.rs` (argv[1] event, argv[2] runtime id).
+
+> **Hermes capture does not work yet.** `ctxlake install hermes` writes correct,
+> real shell-hook commands into `~/.hermes/config.yaml`, but `ctxlake-hook` itself
+> does not yet normalize a live Hermes payload — `crates/ctxlake-hook/src/adapters/mod.rs`
+> rejects `Runtime::Hermes` outright, and `main.rs`'s own module doc still describes
+> Hermes as the in-process Python plugin (`adapters/hermes/`), not a process
+> `ctxlake-hook` gets spawned for. Until that lands, every wired Hermes event spawns
+> `ctxlake-hook`, which captures nothing and appends a line to
+> `~/.ctxlake/hook-errors.log`. `install` prints this as a warning rather than
+> refusing to run, since the config it writes is already correct for the moment
+> normalization does land — but until then, do not expect `sessions/` to gain any
+> Hermes data from this.
+
+
 
 ## `ctxlake status`
 
@@ -289,9 +323,17 @@ Error: 1 of 1 resource(s) could not be claimed
 ```
 
 `--ttl` defaults to the fleet-wide 5-minute lease TTL (AGENTS.md's knob table). `--reason`
-is free text, rendered plainly wherever it's shown (a lease's `reason`, like a claim or
-handoff note, is untrusted input from another agent's operator — AGENTS.md's house rule
-on rendering anything read from the lake).
+is free text, rendered plainly wherever it's shown — never interpreted as a template,
+a path, or a command (a lease's `reason`, like a claim or handoff note, is untrusted
+input from another agent's operator — AGENTS.md's house rule on rendering anything
+read from the lake). "Plainly" is not "unfiltered," though: every value another
+agent chose — a lease's `holder`/`reason`, a roster entry's `task`/`paths`/`repo` —
+is passed through a sanitizer before it reaches your terminal, which strips control
+characters (ANSI escapes included — nothing another agent's `--reason` writes can
+clear your screen or repaint a line), the Unicode bidi-override and zero-width
+characters that can visually reorder or hide text, and caps length so one huge value
+cannot flood the output. That sanitizing is the whole reason "plainly" is a safe
+promise to make about text you did not write.
 
 `--exclusive` is the only thing "exclusive" can mean for a primitive that is already
 single-holder by construction (a lease is never held by two agents at once, with or

@@ -12,6 +12,7 @@ mod doctor;
 mod hooks;
 mod init;
 mod paths;
+mod sanitize;
 mod status;
 mod store_ctx;
 
@@ -247,6 +248,11 @@ async fn run_install(
         } else {
             hooks::apply(&plan)?;
             println!("{runtime}: {verb}ed into {}", path.display());
+            if installing {
+                if let Some(caveat) = hooks::install_caveat(runtime) {
+                    eprintln!("{runtime}: warning: {caveat}");
+                }
+            }
         }
     }
     if any_error {

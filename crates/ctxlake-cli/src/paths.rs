@@ -45,10 +45,22 @@ pub fn cache_dir(fleet_id: &str) -> PathBuf {
     data_home().join("ctxlake").join("cache").join(fleet_id)
 }
 
-/// `~/.local/share/ctxlake/spool/<fleet_id>/` — appended to by `ctxlake-hook`,
-/// drained by `ctxlake sync`. `doctor`'s backlog check only ever reads this.
-pub fn spool_dir(fleet_id: &str) -> PathBuf {
-    data_home().join("ctxlake").join("spool").join(fleet_id)
+/// The spool root `ctxlake-hook` actually appends to and `ctxlake sync` drains:
+/// `$CTXLAKE_SPOOL_DIR`, or `~/.ctxlake/spool` if unset — see
+/// `crates/ctxlake-hook/src/spool.rs::spool_root`, which this mirrors exactly.
+///
+/// This is deliberately **not** `$XDG_DATA_HOME`-based or fleet-scoped, unlike
+/// [`cache_dir`] — an earlier version of this function was both, which meant
+/// `doctor`'s backlog check watched a directory nothing ever wrote to and reported
+/// an empty spool forever. The hook can't scope its own writes by fleet because
+/// `fleet_id`/`agent_id` come from the environment and may be unset at capture time
+/// (AGENTS.md: "the spool is partitioned by runtime, not fleet/agent") — a path
+/// built from a value that might not exist cannot reliably be found again later, so
+/// the hook partitions by runtime only, and this must read the exact same root.
+pub fn spool_root() -> PathBuf {
+    std::env::var_os("CTXLAKE_SPOOL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".ctxlake").join("spool"))
 }
 
 /// User-scope Claude Code settings. `ctxlake install` also supports a project-scope
@@ -78,10 +90,29 @@ mod tests {
     }
 
     #[test]
-    fn cache_and_spool_are_scoped_per_fleet() {
+    fn cache_is_scoped_per_fleet() {
         assert_ne!(cache_dir("fleet-a"), cache_dir("fleet-b"));
-        assert_ne!(spool_dir("fleet-a"), spool_dir("fleet-b"));
         assert!(cache_dir("myteam").ends_with("cache/myteam"));
-        assert!(spool_dir("myteam").ends_with("spool/myteam"));
+    }
+
+    #[test]
+    fn spool_root_matches_where_ctxlake_hook_actually_writes() {
+        // Regression test: this used to be `$XDG_DATA_HOME/ctxlake/spool/<fleet_id>`
+        // — a directory `ctxlake-hook` (`crates/ctxlake-hook/src/spool.rs`) never
+        // writes a single byte to, since it has no reliable `fleet_id` to scope by.
+        // The hook's own default is `~/.ctxlake/spool`, with no `.local/share` and
+        // no fleet segment; `doctor`'s backlog check must watch that exact
+        // directory or it reports "0 files" against a real, growing backlog forever.
+        let root = spool_root();
+        assert!(
+            root.ends_with(".ctxlake/spool"),
+            "must match ctxlake-hook::spool::spool_root's default, got: {}",
+            root.display()
+        );
+        assert!(
+            !root.to_string_lossy().contains(".local/share"),
+            "the hook never writes under $XDG_DATA_HOME, got: {}",
+            root.display()
+        );
     }
 }

@@ -234,6 +234,49 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_never_deletes_a_foreign_entry_that_merely_mentions_ctxlake_hook() {
+        // Regression test for the unanchored-substring bug in `is_ours`: a foreign
+        // tool's own command line (never invoking ctxlake-hook, just naming it as an
+        // argument value — a plausible shape for an audit/observability wrapper)
+        // must survive both `install` and `uninstall` untouched.
+        let existing = json::object! {
+            "hooks" => json::object! {
+                "PreToolUse" => json::array![
+                    json::object! {
+                        "hooks" => json::array![
+                            json::object! {
+                                "type" => "command",
+                                "command" => "audit-log --tool ctxlake-hook --mode observe"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        .dump();
+
+        let installed = install(Some(&existing), "myteam", "cc-01").unwrap();
+        let doc = json::parse(&installed).unwrap();
+        assert_eq!(
+            doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "audit-log --tool ctxlake-hook --mode observe",
+            "install must not have stripped the foreign entry: {installed}"
+        );
+
+        let uninstalled = uninstall(Some(&installed)).unwrap();
+        let doc = json::parse(&uninstalled).unwrap();
+        assert_eq!(
+            doc["hooks"]["PreToolUse"].len(),
+            1,
+            "uninstall must leave the foreign group in place: {uninstalled}"
+        );
+        assert_eq!(
+            doc["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "audit-log --tool ctxlake-hook --mode observe"
+        );
+    }
+
+    #[test]
     fn uninstall_drops_an_event_key_it_created_from_nothing() {
         let installed = install(None, "myteam", "cc-01").unwrap();
         let uninstalled = uninstall(Some(&installed)).unwrap();

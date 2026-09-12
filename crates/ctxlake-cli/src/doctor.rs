@@ -260,8 +260,7 @@ pub async fn run(cfg: &Config) -> Result<Report> {
         },
     };
 
-    let spool_dir = paths::spool_dir(&cfg.fleet_id);
-    let spool_backlog = scan_spool(&spool_dir);
+    let spool_backlog = scan_spool(&paths::spool_root());
 
     Ok(Report {
         store_url: cfg.store.clone(),

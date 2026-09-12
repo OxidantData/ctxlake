@@ -46,3 +46,9 @@ serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only: the concurrent-first-claim regression test wraps a real `ObjectStore`
+# to force the exact interleaving `ensure_provisioned` (claim.rs) must survive.
+# `object_store::ObjectStore` is itself defined with `#[async_trait]`
+# (ctxlake-store/Cargo.toml carries the identical dependency for the same reason —
+# its own `PutModeSpy` test double), so implementing it requires the same macro.
+async-trait = "0.1"

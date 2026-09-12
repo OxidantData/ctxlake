@@ -8,10 +8,12 @@ ctxlake init        point at a store, write ctxlake.toml
 ctxlake doctor      the trust-building command — run this before install
 ctxlake install     merge hooks into a runtime, never clobber
 ctxlake uninstall   remove exactly what install added
-ctxlake status      who's active, on what
+ctxlake status      who's active, on what, holding what
+ctxlake claim       acquire a lease on a resource
+ctxlake release     give one back
 ctxlake config      print the resolved config
 ctxlake sync        run (or check, or stop) the daemon
-ctxlake maint       run the maintenance chain — safe from any number of hosts at once
+ctxlake maint       run the maintenance chain under the fleet-wide lease
 ctxlake claims      review candidate / contested / promoted claims
 ctxlake quarantine  stop one agent's claims from promoting
 ```
@@ -29,7 +31,15 @@ ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force]
 
 1. **Verifies the store is reachable** — a real `put`/`get` round trip, not just a URL
    parse.
-2. **Writes `ctxlake.toml`** — see [config.md](config.md) for the full shape.
+2. **Provisions the two well-known lease keys** this crate defines up front:
+   `live/leases/_maintenance` (the lease `ctxlake maint` contends for) and
+   `live/leases/_claim_provision` (a lock `ctxlake claim` uses internally to
+   serialize the first-ever provisioning of every *other* lease). Every other lease
+   is keyed by an arbitrary resource string a human hasn't typed yet
+   ([`claim`](#ctxlake-claim--ctxlake-release), below), which is exactly why only
+   these two fixed keys can be provisioned up front; `init` must run — once, before
+   any `ctxlake claim` ever touches this store — for that lock to exist at all.
+3. **Writes `ctxlake.toml`** — see [config.md](config.md) for the full shape.
 
 ```sh
 $ ctxlake init --store s3://my-bucket/ctxlake --fleet myteam
@@ -51,8 +61,8 @@ To try ctxlake with no cloud account at all:
 ctxlake init --store file:///tmp/ctxlake-demo --fleet local
 ```
 
-Roster and status work unchanged against a local directory. What you lose is a second
-machine's ability to join — see [storage.md](storage.md).
+Leases, roster, and status all work unchanged against a local directory. What you lose
+is a second machine's ability to join — see [storage.md](storage.md).
 
 ## `ctxlake doctor`
 
@@ -93,8 +103,8 @@ cleaned up whether the probe passes or fails — backends genuinely differ (see
 
 | Row | If it fails |
 |---|---|
-| `put-if-absent` | **Expected to fail on MinIO** ([minio/minio#20346](https://github.com/minio/minio/issues/20346)) and changes nothing — roster heartbeats are CAS-only by design and never depend on it. |
-| `compare-and-swap` / `conflict detection` | The roster fan-in cannot work correctly on this backend. Capture (writing sessions) is unaffected. |
+| `put-if-absent` | **Expected to fail on MinIO** ([minio/minio#20346](https://github.com/minio/minio/issues/20346)) and changes nothing — leases and roster heartbeats are CAS-only by design (AGENTS.md invariant 4) and never depend on put-if-absent working. The one place ctxlake *does* reach for put-if-absent — extraction's `claims/extracted/<session_id>` marker — degrades on a failing backend to "re-attempt extraction every run" rather than silently corrupting anything; see [coordination.md](coordination.md). |
+| `compare-and-swap` / `conflict detection` | Leases and the roster fan-in cannot work correctly on this backend. Capture (writing sessions) is unaffected. |
 | `conditional GET` | Roster polling costs a full `GET` every cycle instead of a cheap 304 — works, scales worse ([scaling.md](scaling.md)). |
 | `list` | The roster fan-in and `ctxlake maint` can't do their jobs. |
 
@@ -181,13 +191,78 @@ fleet myteam · 2 agent(s) active · roster 4s old (/Users/you/.ctxlake/cache/my
   cc-01  claude_code  github.com/OxidantData/ctxlake  14m
            touching crates/oxidant-catalog-glue/src/lib.rs
            "migrating the Glue catalog off the CLI shell-out"
+
+leases (live, fetched just now — not cached)
+  crates/oxidant-loom/**  held by cc-01  "splitting the S3 cache out"
 ```
 
-The roster is read from the local cache — the same file `ctxlake sync` refreshes for
-the hook and MCP server to read (invariant 1: no network on that path). `status` prints
-the cache's age and says so explicitly once it's over a minute old. If the cache has
-never been written, `status` says exactly that rather than printing an empty roster
-that looks like "nobody's here."
+Two sections, two different freshness stories, printed as two different stories rather
+than one blended view:
+
+- **The roster is read from the local cache** — the same file `ctxlake sync` refreshes
+  on a poll interval for the hook and MCP server to read (invariant 1: no network on
+  that path). `status` prints the cache's age and says so explicitly once it's over a
+  minute old, rather than implying a live view.
+- **Leases have no cache yet** — nothing publishes a merged `leases.json` the way
+  `roster::build` does for the roster — so this section is a live `LIST` against
+  `live/leases/` right now, labeled `(live, fetched just now — not cached)` so the two
+  sections' staleness is never confused with each other.
+
+If the cache has never been written, `status` says exactly that rather than printing an
+empty roster that looks like "nobody's here."
+
+## `ctxlake claim` / `ctxlake release`
+
+```sh
+ctxlake claim <resource>... [--reason <text>] [--ttl <seconds>] [--exclusive]
+ctxlake release <resource>... | --all
+```
+
+`<resource>` is any string a human would type to describe what they're about to touch —
+a path glob, a package name, a migration id. Each one is hashed independently via
+`ctxlake_core::hash::resource_key(repo, resource)` into its own lease
+(`live/leases/<hash>.json`); the repo half comes from `git remote origin`'s URL when
+available, falling back to the git toplevel path and then the raw working directory, so
+the same string in two different repos never collides.
+
+**A refusal always names the current holder and their reason:**
+
+```text
+$ ctxlake claim 'crates/oxidant-loom/**'
+refused: crates/oxidant-loom/**: held by cc-01 ("splitting the S3 cache out") until 2026-09-12 5:48:31 +00:00:00
+Error: 1 of 1 resource(s) could not be claimed
+```
+
+`--ttl` defaults to the fleet-wide 5-minute lease TTL. `--reason` is free text,
+rendered plainly wherever it's shown — never interpreted as a template, a path, or a
+command (a lease's `reason`, like a claim or handoff note, is untrusted input from
+another agent's operator — AGENTS.md's house rule on rendering anything read from the
+lake). Every value another agent chose — a lease's `holder`/`reason`, a roster entry's
+`task`/`paths`/`repo` — is passed through a sanitizer first, which strips control
+characters (ANSI escapes included), Unicode bidi-override and zero-width characters,
+and caps length, so "plainly" is a safe promise to make about text you did not write.
+
+`--exclusive` changes what happens when you ask for *several* resources in one call.
+Without it, `claim` is best-effort per resource — some may succeed, some may refuse,
+independently. With `--exclusive`, it's all-or-nothing: if any requested resource is
+already held, every lease this call did manage to acquire is released again before it
+exits non-zero.
+
+`ctxlake release <resource>` only releases a lease this agent currently holds — trying
+to release someone else's is refused, not forced:
+
+```text
+$ ctxlake release crates/oxidant-loom/**
+crates/oxidant-loom/**: refused to release — held by cc-01, not cc-02
+```
+
+`ctxlake release --all` releases every lease this agent holds, found by listing
+`live/leases/` and checking each one's holder.
+
+> **Leases are advisory.** They prevent two agents spending twenty minutes on the same
+> problem, which is the expensive failure. They are not a lock: git remains the
+> arbiter for code, and anything irreversible needs its own idempotency key. See
+> [coordination.md](coordination.md) for exactly what is and is not guaranteed.
 
 ## `ctxlake config`
 
@@ -231,15 +306,39 @@ ctxlake maint             # loop forever, one cycle every 5 minutes
 ctxlake maint --once      # run one cycle and exit — what cron/systemd should call
 ```
 
-Compacts small Parquet files, runs the claims promotion gate, and publishes
-`snapshot/`. **Safe to schedule on every host in the fleet, or none at all** — there is
-no lock to acquire and no primary host to designate, because every step is idempotent
-by content: compaction's output directory is named by a hash of its input session set,
-extraction claims each session with a create-if-absent marker, and the snapshot
-publish is content-addressed. See [coordination.md](coordination.md) for why. If two
-runs happen to overlap, the cost is redundant work, never corrupted output. If nobody
-ever runs it, capture and coordination keep working exactly as before — the lake just
-stays as fresh as the last pass.
+Runs under the fleet-wide maintenance lease (`live/leases/_maintenance`, provisioned
+once by `ctxlake init`): acquire it, run the maintenance chain, release it. **Exits 0
+quietly when another host already holds the lease** — this is what makes a cron entry
+or systemd timer *optional*, not required:
+
+```text
+$ ctxlake maint --once
+maintenance lease held by cc-01 — nothing to do
+```
+
+Point a timer at every host in the fleet, or none at all, and nothing breaks either
+way. If nothing has `ctxlake sync` or `ctxlake maint` running anywhere, the fleet simply
+runs with an empty belief layer and no compaction — coordination (leases, roster,
+status) is entirely unaffected, since it never depended on maintenance in the first
+place. The lease is belt-and-braces, not the only thing keeping two hosts from
+corrupting each other's output: compaction's output directory is named by a hash of
+its input session set, extraction claims each session with a create-if-absent marker,
+and the snapshot publish is content-addressed — see [coordination.md](coordination.md)
+for exactly what that buys on top of the lease.
+
+> **Honest about today's chain.** `ctxlake-cli`'s `run_chain` does not call into
+> `ctxlake-maint`'s compaction/extraction/promotion-gate/snapshot chain yet, even
+> though that chain itself exists and has its own test suite — wiring the subcommand
+> up is a one-line change once it's ready, not a redesign. Until then, `ctxlake maint`
+> does the part that matters most to get right first — the lease coordination, so at
+> most one host is ever "doing maintenance" at a time — and says so plainly rather
+> than pretending to run a chain it doesn't yet call:
+>
+> ```text
+> $ ctxlake maint --once
+> maintenance lease acquired, but ctxlake-maint has no chain to run yet
+> (compaction/extraction/gates/snapshot — see docs/summarization.md); releasing the lease
+> ```
 
 ## `ctxlake claims`
 
@@ -289,5 +388,5 @@ a known key.
 - [config.md](config.md) — the full `ctxlake.toml` reference
 - [getting-started.md](getting-started.md) — the same commands, in the order a first
   run actually uses them
-- [coordination.md](coordination.md) — roster and intents, and what they promise
+- [coordination.md](coordination.md) — roster, intents, and leases, and what they promise
 - [storage.md](storage.md) — the capability matrix `doctor` executes

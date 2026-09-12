@@ -36,6 +36,15 @@ Override the on-disk root with `CTXLAKE_SPOOL_DIR` / `CTXLAKE_CACHE_DIR`. Cache 
 are scoped per fleet (`<cache_root>/<fleet_id>/`), since one host can run agents in
 more than one fleet.
 
+One consequence worth being explicit about, because it's easy to expect otherwise:
+**`fleet_claim` cannot tell you that you now hold a lease.** Holding a lease is a fact
+about the object store's `live/leases/` key (see [coordination.md](coordination.md)),
+and this process never reads or writes that key directly. What it *can* honestly say
+is "this request is queued for `ctxlake sync` to apply" — so that's exactly what every
+write-shaped tool's result says. Leases are advisory even when the full round trip
+happens (AGENTS.md invariant 5); a tool that can't even complete the round trip has to
+be more careful about its claims, not less.
+
 ## Wiring it up
 
 The eventual shape is each runtime's own MCP config pointing at the `ctxlake` binary:
@@ -57,7 +66,9 @@ point `"command"` at the `ctxlake-mcp` binary instead, and set `CTXLAKE_FLEET_ID
 
 | Tool | Shape | What it does |
 |---|---|---|
-| `fleet_status()` | read | Who's active and what they're touching, as of the last cache refresh. |
+| `fleet_status()` | read | Who's active and what they hold, as of the last cache refresh. |
+| `fleet_claim(paths[], reason, ttl_secs?)` | write | Queue an advisory-lease request. |
+| `fleet_release(paths[]?)` | write | Queue a release; omit `paths` for "everything I hold." |
 | `fleet_history(repo?, since?, limit?)` | read | Recent sessions and outcomes from the cache. |
 | `fleet_handoff(summary, status, next?)` | write | Leave a note for whoever picks this up next. |
 | `memory_search(query, scope?, subject?, claim_type?, k?)` | read | Promoted claims matching `query`, with attribution. |
@@ -163,5 +174,6 @@ line on the real binary's stdout is exactly one valid JSON-RPC frame.
 
 - [memory.md](memory.md) — the claim model `memory_search`/`memory_propose` are built
   against, and the belief layer they're waiting on
-- [coordination.md](coordination.md) — what the roster and intents actually promise
+- [coordination.md](coordination.md) — what the roster, intents, and leases actually
+  promise
 - [architecture.md](architecture.md) — this process's place in the full component map

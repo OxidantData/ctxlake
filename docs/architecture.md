@@ -13,11 +13,11 @@ Every process that touches ctxlake data, what it reads, and what it writes:
 |---|---|---|---|---|
 | `ctxlake-hook` | A binary invoked once per hook event by the runtime (Claude Code, Cursor, Hermes). Exits after one event. | The event payload on stdin; the local **cache** (for injection) | The local **spool** (append one NDJSON line) | **Never.** A hook that opens a socket is a bug — invariant 1. |
 | `ctxlake sync` | The daemon. Long-running, one per host, started by `ctxlake install` or run under a supervisor as `ctxlake sync --foreground`. | The local **spool**; the object **store** | The object **store** (bronze appends, `live/` CAS updates); the local **cache** | Yes — the only process on this list that is. |
-| `ctxlake maint` | A subcommand run periodically (cron, systemd timer, or manually). Compacts small Parquet files, runs the claims promotion gate, publishes `snapshot/`. Safe to run from every host at once — see [coordination.md](coordination.md). | `sessions/`, `claims/events/` | `sessions/` (compacted files), `claims/fleet/`, `snapshot/` | Yes. |
-| `ctxlake-mcp` | The MCP tool server, run as `ctxlake mcp`, a **stdio child process** spawned by the coding agent. One instance per session. | The local **cache** only | Local **spool** (for `memory_propose` and similar write-shaped tool calls) | Never — same discipline as the hook, for the same reason. |
+| `ctxlake maint` | A subcommand run periodically (cron, systemd timer, or manually). Acquires the fleet-wide maintenance lease, then runs whatever of the compaction/extraction/promotion-gate/snapshot chain has shipped so far — see the callout below the diagram for exactly how much that is today. Safe to run from every host at once regardless — see [coordination.md](coordination.md). | `sessions/`, `claims/events/`, `live/leases/` | `sessions/` (compacted files), `claims/fleet/`, `snapshot/` | Yes. |
+| `ctxlake-mcp` | The MCP tool server, run as `ctxlake mcp`, a **stdio child process** spawned by the coding agent. One instance per session. | The local **cache** only | Local **spool** (for `memory_propose`, `fleet_claim`/`fleet_release`, and similar write-shaped tool calls) | Never — same discipline as the hook, for the same reason. |
 | Local **spool** | `~/.ctxlake/spool/<runtime>/<session_id>.ndjson` | — | Appended to by `ctxlake-hook` and `ctxlake-mcp`; drained by `ctxlake sync` | n/a |
 | Local **cache** | `~/.ctxlake/cache/<fleet_id>/{briefing,roster}.json` | — | Refreshed by `ctxlake sync`'s store→cache leg; read by `ctxlake-hook` and `ctxlake-mcp` | n/a |
-| `live/` | Bucket prefix, control plane | Everyone (roster checks) | `ctxlake sync` (CAS, on behalf of its own host's agent) | — |
+| `live/` | Bucket prefix, control plane | Everyone (roster/lease checks) | `ctxlake sync` and `ctxlake claim`/`ctxlake maint` (CAS) | — |
 | `sessions/`, `claims/events/` | Bucket prefix, data plane | `ctxlake maint`, any query engine | `ctxlake sync` (single-writer append, one writer per key) | — |
 | `snapshot/` | Bucket prefix, serving plane | Every `ctxlake sync` (store→cache leg) | `ctxlake maint` only | — |
 | `claims/fleet/` | Bucket prefix | Every `ctxlake sync` (store→cache leg) | `ctxlake maint`'s promotion gate **only** — invariant 9 | — |
@@ -95,18 +95,51 @@ network, by the same invariant that governs writes.
 ```mermaid
 flowchart LR
     Cron["cron / systemd timer\n(any host, any number of hosts)"] -->|invokes| Maint["ctxlake maint"]
+    Maint -->|"CAS acquire"| Lease["live/leases/_maintenance"]
+    Lease -->|held| Maint
     Maint -->|"1. compact"| Sessions["sessions/compacted/gen=<hash>/\nmany small files -> fewer larger files"]
     Maint -->|"2. run promotion gate"| Claims["claims/events/* -> claims/fleet/*\n(invariant 9: only the gate writes here)"]
     Maint -->|"3. publish"| Snapshot["snapshot/\ncontent-addressed blob + CAS pointer swap"]
+    Maint -->|release| Lease
 ```
 
-Every host in a fleet can run `ctxlake maint` on its own timer, or none can, and nothing
-breaks either way — there is no lock to acquire first. Compaction's output directory is
-named by a hash of its input session set, so two hosts compacting the same sessions
-write the same bytes to the same place; extraction claims each session with a
-create-if-absent marker before working on it, so at most one host's attempt succeeds;
-the snapshot publish is a content-addressed blob followed by a CAS pointer swap. See
-[coordination.md](coordination.md) for why none of this needs mutual exclusion.
+> **Honest about today's chain.** `ctxlake maint`'s coordination half — acquire
+> `live/leases/_maintenance`, exit 0 quietly if another host already holds it, release
+> when done — is wired up and real. The `ctxlake-cli` binary does not yet call into
+> `ctxlake-maint`'s actual compaction/extraction/gate/publish chain, though that chain
+> itself exists and is exercised directly by `ctxlake-maint`'s own test suite; wiring
+> the CLI subcommand to call it is a one-line change once it's ready, not a redesign.
+> See [cli.md](cli.md#ctxlake-maint) for exactly what running the command prints today.
+
+Every host in a fleet can run `ctxlake maint` on its own timer, or none can, and
+nothing breaks either way. The maintenance lease keeps at most one host actually
+running the chain at a time, which is enough by itself — but every step the chain
+runs is *also* idempotent by content: compaction's output directory is named by a
+hash of its input session set, so two hosts compacting the same sessions write the
+same bytes to the same place; extraction claims each session with a create-if-absent
+marker before working on it, so at most one host's attempt succeeds; the snapshot
+publish is a content-addressed blob followed by a CAS pointer swap. See
+[coordination.md](coordination.md) for what that buys on top of the lease, and the one
+place (the compaction marker) it doesn't fully replace it yet.
+
+## Lease state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Free: lazily created on first claim\n(unconditional PUT, not put-if-absent — storage.md)
+    Free --> Held: CAS PutMode::Update(version)\ncontents: {status: held, owner, expires_at}
+    Held --> Held: renew before expiry\nCAS from the version last read
+    Held --> Free: explicit release\nCAS write back to free
+    Held --> Expired: now (store's Date header) > expires_at
+    Expired --> Held: any agent may CAS-acquire\n(advisory — no fencing check on the old holder)
+```
+
+Every arrow *after* bootstrap is the same primitive: a CAS write against a version you
+just read. The `[*] --> Free` arrow is the one exception — an unconditional `PUT`, not
+a CAS write, because there is nothing yet to hold a version to compare against (see
+[storage.md](storage.md) for why that's still safe). This is the same state machine
+whether the lease is `ctxlake maint`'s own `_maintenance` key or a resource a human
+named with `ctxlake claim` (see [cli.md](cli.md)).
 
 ## Where does my data actually go — a worked trace
 
@@ -133,10 +166,10 @@ You run an `Edit` on `crates/foo/src/lib.rs` in a Claude Code session. Fleet is
 7. The daemon also updates `cc-01`'s own roster entry at
    `s3://my-bucket/ctxlake/live/agents/cc-01.json` — a `PutMode::Update(version)` CAS
    write reflecting the last-active path.
-8. Later, `ctxlake maint` runs on some host in the fleet: compacts small session files,
-   runs the promotion gate over `claims/events/`, and republishes the briefing — a new
-   blob at `snapshot/briefing/<content-hash>.json`, then a CAS swap of
-   `snapshot/briefing/current.json` to point at it.
+8. Later, `ctxlake maint` runs on some host in the fleet, wins the maintenance lease,
+   compacts small session files, runs the promotion gate over `claims/events/`, and
+   republishes the briefing — a new blob at `snapshot/briefing/<content-hash>.json`,
+   then a CAS swap of `snapshot/briefing/current.json` to point at it.
 9. Back on your laptop, `ctxlake sync`'s store→cache leg notices the pointer changed
    (a conditional GET), fetches the new blob, and writes
    `~/.ctxlake/cache/<fleet_id>/briefing.json`.
@@ -155,7 +188,8 @@ either agent's hook process ever making a network call.
 | Local spool keeps growing | `ctxlake status` for the daemon; `ctxlake doctor` for store connectivity; spool directory size | A spool line is only removed after its store write is *confirmed*. A crashed daemon, a network partition, or a store outage all present as unbounded spool growth. |
 | Hook adds noticeable latency to a tool call | Manually time `ctxlake-hook` against a captured payload; check whether the tool's output is unusually large | Budget is 5ms p99. Slowness is almost always a huge tool-output payload interacting with `MAX_SCAN_BYTES`, a full local disk, or — as an actual bug — network I/O that snuck into the hook path. |
 | `412 Precondition Failed` storms in the sync log | Are the failures concentrated on one key, or spread across many? | A 412 is CAS working as designed — the daemon retries with backoff. Concentrated on one key points at a genuinely hot object ([scaling.md](scaling.md)); spread across many points at clock skew or a retry loop missing its backoff. |
-| Claims never promote to fleet scope | Is `ctxlake maint` actually scheduled and running? Compare `claims/events/` (pending) against `claims/fleet/` (promoted) | Only the gate, inside `ctxlake maint`, ever writes `claims/fleet/` (invariant 9). A missing cron entry and a genuinely unmet promotion rule (independence gate, an unresolved contradiction) look identical from outside — check the maint log before assuming a bug. |
+| Claims never promote to fleet scope | Is `ctxlake maint` actually scheduled and running? Did it win the maintenance lease? Compare `claims/events/` (pending) against `claims/fleet/` (promoted) | Only the gate, inside `ctxlake maint`, ever writes `claims/fleet/` (invariant 9). A missing cron entry, a maint process losing the lease race, and a genuinely unmet promotion rule (independence gate, an unresolved contradiction) all look identical from outside — check the maint log before assuming a bug. |
+| Two agents edited the same file | This is a git problem, not a ctxlake problem | Leases are advisory (invariant 5) — ctxlake can warn, it cannot revoke a running agent's ability to write to disk. Git is the declared arbiter for code. |
 | `ctxlake doctor` reports a backend failing CAS | Which primitive failed — put-if-absent or `If-Match`/`ifGenerationMatch` — and against which backend | Backends genuinely differ ([storage.md](storage.md)). MinIO rejecting `If-None-Match: *` is permanent vendor behavior, not a transient fault. |
 | `quarantine/` growing fast | Which `rules_fired` values dominate in recent entries | A flood of one rule (commonly `high_entropy_run`) usually means a false-positive source — a build emitting long hashes or minified output — not an actual leak. |
 
@@ -168,14 +202,20 @@ either agent's hook process ever making a network call.
 | `ENTROPY_MIN_LEN` / `ENTROPY_THRESHOLD` (redact.rs) | 32 chars / 4.5 bits/char | Too low false-positives on ordinary long identifiers (git SHAs, ULIDs); too high misses real base64/hex secrets. |
 | Roster heartbeat TTL | 5 minutes | How long a peer with no fresh heartbeat still shows as active. Too short: a working agent can look gone after a scheduling hiccup. Too long: a crashed agent lingers on the roster. |
 | Roster heartbeat renewal interval | 60s (1/5 of TTL) | The 5:1 ratio means one missed renewal cycle doesn't drop a live peer. Renewing more often directly costs money: PUTs price at 12.5x a GET ([scaling.md](scaling.md)). |
+| Lease TTL (`ctxlake claim`) | 5 minutes | Too short: an actively-working agent can appear expired after a scheduling hiccup, and get "acquired out from under it" (advisory, so this is a false-warning cost, not data loss). Too long: a genuinely crashed agent's lease looks held for longer than useful. |
+| Maintenance lease TTL (`ctxlake maint`) | 300s, independent of the resource-lease TTL above | Governs a human- or cron-triggered chain run, which may legitimately take longer than a short heartbeat interval to finish (`crates/ctxlake-cli/src/maint_cmd.rs`). |
 | Roster/live poll interval | 5s | Lower = fresher peer visibility, at O(N)–O(N²) request cost depending on discovery strategy ([scaling.md](scaling.md)). Higher = a peer that just joined stays invisible longer. |
 | Cache refresh interval (store→cache leg) | 5–15s | The staleness floor for everything an agent's hook or MCP tools ever see. Nothing waits for a fresher read, so this number *is* the freshness guarantee. |
 | Spool flush / batch trigger | time- or size-based (e.g. 2s or N events) | Larger batches mean fewer, larger store writes at the cost of more unconfirmed data sitting in the local spool if the daemon crashes. |
-| Maintenance schedule (`ctxlake maint`) | operator-configured cron/systemd timer | Too infrequent: claims sit unpromoted, briefings go stale, small files accumulate. Too frequent: more LIST/PUT traffic once a run finds nothing new to do — never contention, since runs don't coordinate. |
-| Agent id stability | operator-assigned, must be stable across restarts | Reusing one `agent_id` from two different hosts makes them share a roster entry — CAS still prevents lost writes, but "who is doing what" becomes wrong. |
+| Maintenance schedule (`ctxlake maint`) | operator-configured cron/systemd timer | Too infrequent: claims sit unpromoted, briefings go stale, small files accumulate. Too frequent: maintenance-lease contention across hosts, and more LIST/PUT traffic for no benefit once a run finds nothing new to do. |
+| Agent id stability | operator-assigned, must be stable across restarts | Reusing the same `agent_id` from two different physical hosts makes them share one roster entry and one lease identity — CAS still prevents lost writes, but the human-facing "who is doing what" picture becomes wrong. |
 
 ## What ctxlake does NOT guarantee
 
+- **Leases are advisory, and the fencing-token limit is real.** No backend here can
+  reject a write from a process whose lease already expired — a stalled agent can wake
+  up and write anyway. For code, git is the arbiter. For an irreversible external
+  action, the target system needs its own idempotency key; ctxlake cannot supply one.
 - **Snapshots are stale by construction.** A briefing or roster view is only as fresh
   as the last completed cache refresh on your host. Under a network partition or a
   dead daemon, that can be minutes old, and nothing blocks work to wait for freshness.
@@ -199,6 +239,6 @@ either agent's hook process ever making a network call.
 
 - [scaling.md](scaling.md) — the cost arithmetic behind the poll-interval defaults
   above, and the ~50-agent ceiling
-- [storage.md](storage.md) — the CAS capability matrix this all depends on
+- [storage.md](storage.md) — the CAS capability matrix the lease state machine depends on
 - [security.md](security.md) — redaction, quarantine, and the IAM policy shape
-- [coordination.md](coordination.md) — roster and intents from the user's side
+- [coordination.md](coordination.md) — roster, intents, and leases from the user's side

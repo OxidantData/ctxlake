@@ -25,11 +25,14 @@ other's guarantees.
 
 ### Control — `live/`
 
-Roster entries and declared intents (see [coordination.md](coordination.md)): small
-JSON objects, one per agent, each with a short useful lifetime. The pattern is
-**compare-and-swap only**: read the object and its version, then write with
+Roster entries, declared intents, and leases (see [coordination.md](coordination.md)):
+small JSON objects, one per agent or resource, each with a short useful lifetime. The
+pattern is **compare-and-swap only**: read the object and its version, then write with
 `PutMode::Update(version)`. A write that raced loses with `412 Precondition Failed` and
 retries against the new version — nobody's update is silently lost, and nobody blocks.
+A lease object always exists once it's been touched once; what changes is its
+*contents* (`status: held` vs `status: free`), never its presence — the reason leases
+work at all on every backend ctxlake supports (see [storage.md](storage.md)).
 
 ### Data — `sessions/` and `claims/events/`
 
@@ -69,21 +72,25 @@ Picking the pattern per plane is what makes "no cross-key atomicity, no database
 survivable: every individual operation is single-object-atomic, and no operation in
 this design was ever specified to need more than one object.
 
-## Concurrent maintenance needs no coordination
+## Maintenance is idempotent by content, on top of its own lease
 
-`ctxlake maint` compacts, extracts, and publishes. Every one of those is idempotent by
-content, so many hosts can run it at once with nothing to arbitrate:
+`ctxlake maint` takes a lease on itself (`live/leases/_maintenance`) before compacting,
+extracting, or publishing, so at most one host is "doing maintenance" at a time. That
+lease is belt-and-braces, though, not the only thing preventing corruption — every step
+underneath it is also idempotent by content:
 
 - Compaction writes into `sessions/compacted/gen=<hash-of-the-sealed-session-set>/` —
   two hosts compacting the same sessions compute the same hash and write the same
   bytes to the same place.
 - Extraction claims `claims/extracted/<session_id>` with `PutMode::Create` before
   doing work — exactly one host wins that create, and losing costs nothing but a
-  wasted attempt.
+  wasted attempt (except on MinIO, where `Create` fails outright rather than only on
+  conflict — see [coordination.md](coordination.md)).
 - The snapshot publish is the content-addressed pattern above, applied to the belief
   layer.
 
-Nothing here coordinates, because nothing needs to.
+See [coordination.md](coordination.md) for the one place this still isn't quite free
+of the lease: the compaction marker is a plain overwrite, not CAS.
 
 ## The envelope: one schema across three runtimes
 
@@ -107,6 +114,6 @@ the spool, on every code path including `ctxlake import`. See
 
 ## Next steps
 
-- [coordination.md](coordination.md) — roster and intents in the control plane
+- [coordination.md](coordination.md) — roster, intents, and leases in the control plane
 - [storage.md](storage.md) — why CAS is the only primitive that works on every backend
 - [architecture.md](architecture.md) — every process and file, traced end to end

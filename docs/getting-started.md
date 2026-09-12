@@ -49,8 +49,8 @@ ctxlake init --store s3://my-bucket/ctxlake --fleet myteam
 ```
 
 `--fleet` is the boundary of who sees whom. Everyone sharing a fleet sees each other's
-sessions and roster entries, so it should map to a team genuinely collaborating, not to
-an entire company.
+sessions and leases, so it should map to a team genuinely collaborating, not to an
+entire company.
 
 To try it locally first, with no cloud account at all:
 
@@ -58,8 +58,8 @@ To try it locally first, with no cloud account at all:
 ctxlake init --store file://~/ctxlake-demo --fleet local
 ```
 
-Roster and briefings work against a local directory. What you lose is a second machine
-joining — use this to evaluate, not to run a real fleet.
+Everything works against a local directory — leases, roster, briefings. What you lose
+is a second machine joining — use this to evaluate, not to run a real fleet.
 
 ## 3. Check your backend
 
@@ -130,33 +130,59 @@ ctxlake status
 fleet myteam · 2 agents active · roster 4s old
 
   cc-01    claude_code  oxidant/Oxidant  kan-112   14m
+           holds crates/oxidant-catalog-glue/**
            "migrating the Glue catalog off the CLI shell-out"
 
   cur-02   cursor       oxidant/Oxidant  main       3m
+           no leases
            "writing tests for oxidant-pipelines expectations"
 ```
 
 Start a new agent session in that repo and it opens with the same information already
-in context — who is working, and what happened here recently.
+in context — who is working, what they hold, and what happened here recently.
+
+## 8. Claim something before you work on it
+
+```sh
+ctxlake claim 'crates/oxidant-loom/**' --reason "splitting the S3 cache out"
+```
+
+Now other agents see that claim in their briefing, and a pre-edit check warns them
+before they touch those paths.
+
+> **Leases are advisory.** They prevent two agents spending twenty minutes on the same
+> problem, which is the expensive failure. They are not a lock: git remains the
+> arbiter for code, and anything irreversible needs its own idempotency key. See
+> [coordination.md](coordination.md) for exactly what is and is not guaranteed.
+
+Release when you are done — or just end the session, which releases everything it
+held:
+
+```sh
+ctxlake release --all
+```
 
 ## What happens next
 
-The `ctxlake sync` from step 6 needs to keep running somewhere for anything above to
-reach the lake.
+The `ctxlake sync` you started in step 6 ships your spooled sessions to the lake and
+refreshes the local cache your hooks read — that part needs to actually be running
+somewhere, on at least one host, or nothing above step 6 reaches the lake.
 
 Maintenance is different. `ctxlake maint` performs every batch job there is —
 compaction, Tier 0 digests, snapshot building, and (once you configure a model) claim
-extraction and the promotion gates. **Nothing runs it for you**, and nothing needs to
-coordinate it either — it's safe to point a cron entry or systemd timer at it on one
-host or on all of them, since every step is idempotent by content
-([coordination.md](coordination.md)).
+extraction and the promotion gates. **Nothing runs it for you.** It takes the
+fleet-wide maintenance lease, does one pass, and exits.
 
 ```sh
 ctxlake maint --once
 ```
 
-If nobody ever runs it, capture keeps working; the lake just stays as fresh as the
-last pass.
+Point a cron entry or systemd timer at it, on one host or on all of them — whichever
+wins the lease does the work and the rest exit 0 immediately. Every step it runs is
+also idempotent by content ([coordination.md](coordination.md)), so even a genuinely
+concurrent run costs redundant work, not corrupted output. If nobody ever runs it,
+capture and coordination keep working exactly as before; the lake just stays as fresh
+as the last pass.
 
 ### Memories, when you want them
 
@@ -175,7 +201,7 @@ see it.
 
 ## Next steps
 
-- [cli.md](cli.md) — every command and flag
+- [cli.md](cli.md) — every command and flag, including `ctxlake sync`/`maint`/`claims`
 - [adopting.md](adopting.md) — how this fits alongside what you already run
 - [concepts.md](concepts.md) — the three planes, and why each exists
 - [architecture.md](architecture.md) — every component, for when you need to debug one

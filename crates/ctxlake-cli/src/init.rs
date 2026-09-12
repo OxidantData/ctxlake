@@ -74,6 +74,16 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
     // parses. This is deliberately lighter than `doctor`'s full CAS matrix: init's
     // job is "can we talk to this bucket at all," not "which conditional-write
     // primitives does it support."
+    // A `file://` store has to exist before object_store will open it, and `init` is
+    // the one command whose job is making a store usable — failing here because a
+    // directory the user just named does not exist yet is a first-run papercut on the
+    // very first command they type. getting-started.md documents exactly this form
+    // (`--store file:///tmp/ctxlake-demo`), so the docs promised something that failed.
+    //
+    // Only for `file://`: an S3 bucket that does not exist is a real error a user must
+    // resolve deliberately, and silently creating cloud resources is not `init`'s call.
+    create_local_store_dir(&cfg.store)?;
+
     let ctx = store_ctx::connect(&cfg, &cfg.agent_id).context("building store connection")?;
     let probe_key = full_path(
         &ctx,
@@ -106,6 +116,25 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
 
     config::save(config_path, &cfg)?;
     Ok(cfg)
+}
+
+/// Create the backing directory for a `file://` store, if that is what this is.
+///
+/// A no-op for every other scheme — see the call site for why cloud buckets are
+/// deliberately not created here.
+fn create_local_store_dir(store_url: &str) -> anyhow::Result<()> {
+    let Ok(url) = url::Url::parse(store_url) else {
+        return Ok(()); // Not our error to report; `connect` gives a better message.
+    };
+    if url.scheme() != "file" {
+        return Ok(());
+    }
+    let Ok(path) = url.to_file_path() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("creating local store directory {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -259,9 +288,16 @@ mod tests {
         // `{:#}` prints the whole `anyhow` context chain, not just the outermost
         // message — `connect()`'s own "connecting to <url>" context sits one layer
         // in from `run()`'s "building store connection" wrapper.
+        //
+        // A `file://` store under an unreachable path now fails at directory creation
+        // instead, one step earlier and with a more specific message. That is the same
+        // condition reported better, so it counts: what this test guards is that an
+        // unusable store is reported AND nothing is written, not which layer noticed.
         let full = format!("{err:#}");
         assert!(
-            full.contains("not reachable") || full.contains("connecting"),
+            full.contains("not reachable")
+                || full.contains("connecting")
+                || full.contains("creating local store directory"),
             "got: {full}"
         );
         assert!(

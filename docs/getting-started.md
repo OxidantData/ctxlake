@@ -210,28 +210,37 @@ The `ctxlake sync` you started in step 6 ships your spooled sessions to the lake
 refreshes the local cache your hooks read — that part needs to actually be running
 somewhere, on at least one host, or nothing above step 6 reaches the lake.
 
-Maintenance is different: `ctxlake maint` (compaction, digests, and — once configured —
-claim extraction) is **optional**, and — as of this release — the compaction/
-extraction/promotion-gate/snapshot chain it is meant to run doesn't exist yet
-(`ctxlake-maint` ships its own chain in a later wave; see
-[cli.md](cli.md#ctxlake-maint)'s own "Honest about today's chain" note). Point a cron
-entry or systemd timer at it on every host, on one host, or on none — whichever host's
-`ctxlake maint` acquires the fleet-wide maintenance lease finds there is no chain to
-run yet and releases it, every other one exits immediately without contending, and
-either way coordination (leases, roster, `ctxlake status`) keeps working exactly the
-same. Right now you get no compaction and no belief layer regardless of whether
-anything runs `ctxlake maint` — that changes only once the chain lands.
+Maintenance is different. `ctxlake maint` performs every batch job there is —
+compaction, Tier 0 digests, snapshot building, and (once you configure a model) claim
+extraction and the promotion gates. **Nothing runs it for you.** It takes the fleet-wide
+maintenance lease, does one pass, and exits.
 
-**Tier 1** is docs/summarization.md's designed default — the agent that just did the
-work writes its own one-line "here's what I did and what's next" note, no LLM key
-required — but as of this release nothing yet calls it: the hook adapter that would
-prompt an agent for its handoff at turn-end hasn't been wired to do so. `ctxlake
-doctor`'s `tier 1 nudges fired: 0 session(s)` line reflects that honestly today, not a
-bug in your install. The belief layer — durable claims extracted *across* sessions — is
-a separate, optional Tier 2 that needs an LLM configured; once `ctxlake-maint`'s chain
-exists, review what it produces with `ctxlake claims --status candidate --explain`, and
-reach for `ctxlake quarantine <agent_id>` if one agent's claims start looking wrong.
-See [summarization.md](summarization.md).
+```sh
+ctxlake maint --once
+```
+
+Point a cron entry or systemd timer at it, on one host or on all of them — whichever wins
+the lease does the work and the rest exit 0 immediately, so there is no primary host to
+designate and nothing to coordinate. If nobody ever runs it, capture and coordination
+keep working exactly as before; the lake just stays as fresh as the last pass.
+
+### Memories, when you want them
+
+Nothing above needs a model. Session history, briefings, digests and friction signals are
+derived arithmetically — they cost nothing and cannot be wrong.
+
+Durable *memories* — claims extracted across sessions and shared with the fleet — are the
+one part that does need one, and they stay invisible to agents until you deliberately turn
+them on. The five-step walkthrough is at the top of
+[summarization.md](summarization.md): run maintenance on a timer, point it at a model,
+read what it extracts with `ctxlake claims --status candidate --explain`, and only then
+let agents see it.
+
+> **Tier 1 is not wired yet.** The design has the agent that just did the work write its
+> own handoff note at turn end — no key needed. The renderer and the nudge exist, but no
+> hook fires them today, so `ctxlake doctor` reporting `tier 1 nudges fired: 0` is
+> accurate rather than a fault in your install. Tier 0 digests and Tier 2 extraction both
+> work.
 
 ## Next steps
 

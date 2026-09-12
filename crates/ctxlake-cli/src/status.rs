@@ -9,7 +9,8 @@
 //! here that needed a holder to protect it. Nothing this command shows depends on
 //! the object store at all any more, only the local roster cache written by
 //! `ctxlake sync`'s store-to-cache leg — see [`render_roster`] for the read path
-//! and its staleness story.
+//! and its staleness story, and [`render_status`] for the outer function `run`
+//! actually prints.
 
 use std::time::SystemTime;
 
@@ -22,26 +23,30 @@ use crate::paths;
 use crate::sanitize::sanitize;
 
 pub async fn run(cfg: &Config) -> Result<()> {
-    print_roster(cfg)
+    let rendered = render_status(cfg)?;
+    print!("{rendered}");
+    Ok(())
 }
 
-fn print_roster(cfg: &Config) -> Result<()> {
+/// The I/O half of [`run`]: reads the roster cache and renders it, without
+/// printing. Split out from `run` so a test can assert on the exact text `run`
+/// would print instead of capturing stdout — see
+/// `status_run_never_mentions_leases_and_does_not_touch_a_bare_store`.
+fn render_status(cfg: &Config) -> Result<String> {
     let cache_path = paths::cache_dir(&cfg.fleet_id).join("roster.json");
     let text = match std::fs::read_to_string(&cache_path) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("reading {}", cache_path.display())),
     };
-    let rendered = render_roster(&cfg.fleet_id, &cache_path, text.as_deref())
-        .with_context(|| format!("parsing {}", cache_path.display()))?;
-    print!("{rendered}");
-    Ok(())
+    render_roster(&cfg.fleet_id, &cache_path, text.as_deref())
+        .with_context(|| format!("parsing {}", cache_path.display()))
 }
 
-/// The pure half of [`print_roster`]: given the cache file's content (or `None` for
-/// "never written"), produce the exact text to print. Split out so it's testable
-/// without writing into a real `$XDG_DATA_HOME` — the only I/O in this module that
-/// isn't itself the object store.
+/// The pure half of [`render_status`]: given the cache file's content (or `None`
+/// for "never written"), produce the exact text to print. Split out so it's
+/// testable without writing into a real `$XDG_DATA_HOME` — the only I/O in this
+/// module that isn't itself the object store.
 fn render_roster(
     fleet_id: &str,
     cache_path: &std::path::Path,
@@ -236,24 +241,34 @@ mod tests {
 
     /// Regression for the lease removal: `status` used to fetch `live/leases/`
     /// live from the object store on every run, in addition to the roster cache
-    /// read above. `run` must render cleanly — no "lease" text anywhere in the
-    /// output, no live store round trip at all — against a store that has never
-    /// had a `live/leases/` prefix, or any `live/` prefix, written to it.
+    /// read above. `render_status` (what `run` prints, verbatim — see its own
+    /// doc) must render cleanly, and it must do so from a `Config` whose `store`
+    /// isn't even a parseable URL.
+    ///
+    /// That's deliberate, not incidental: `store_ctx::connect` calls `Url::parse`
+    /// on `cfg.store` before anything else, so if this function ever grew a call
+    /// to it back (to fetch `live/leases/`, say), `connect` would fail immediately
+    /// and this `.unwrap()` would panic — a re-added live fetch cannot pass this
+    /// test no matter what it does with the result, unlike a bare directory's file
+    /// count, which stays 0 whether or not a list against a never-written prefix
+    /// happened (see the review finding this replaced). A previous version of this
+    /// test used a real `file://` tempdir and asserted exactly that file count;
+    /// it passed even with a live lease fetch reinstated.
     #[tokio::test]
     async fn status_run_never_mentions_leases_and_does_not_touch_a_bare_store() {
-        let store_dir = tempfile::tempdir().unwrap();
-        let cfg = Config::new(
-            format!("file://{}", store_dir.path().display()),
-            "status-test-fleet-no-leases",
-            "cc-01",
-        );
+        // Fleet id deliberately doesn't contain the substring "lease" anywhere —
+        // it's echoed verbatim into the output below, and a fleet id like
+        // "...-no-leases" would make the assertion pass by accident.
+        let cfg = Config::new("not-a-valid-store-url", "status-test-fleet-alice", "cc-01");
+        // `run` is the public entry point (what `main.rs` actually calls) — assert
+        // it succeeds and prints via the exact same rendering `render_status`
+        // returns, then check the content on that returned string rather than on
+        // stdout, which tests in this binary don't capture.
         run(&cfg).await.unwrap();
-        // The store directory itself must still be exactly as bare as it was —
-        // `run` never opened a connection to it, let alone listed `live/leases/`.
-        assert_eq!(
-            std::fs::read_dir(store_dir.path()).unwrap().count(),
-            0,
-            "status must not touch the object store at all any more"
+        let out = render_status(&cfg).unwrap();
+        assert!(
+            !out.to_lowercase().contains("lease"),
+            "status output must never mention leases: {out}"
         );
     }
 

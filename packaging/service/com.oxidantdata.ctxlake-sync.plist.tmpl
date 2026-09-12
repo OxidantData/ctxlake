@@ -4,7 +4,7 @@
 
   Rendered by `ctxlake sync install` into
   ~/Library/LaunchAgents/com.oxidantdata.ctxlake-sync.plist.
-  Placeholders: {{EXEC}} {{HOME}} {{FLEET_ID}} {{AGENT_ID}} {{LOG_DIR}}
+  Placeholders: {{EXEC}} {{CONFIG}} {{HOME}} {{LOG_DIR}}
 
   A LaunchAgent, not a LaunchDaemon: agents run as the logged-in user, which is whose
   spool and credentials this needs. A daemon runs as root and would reach neither.
@@ -17,16 +17,24 @@
   <key>ProgramArguments</key>
   <array>
     <string>{{EXEC}}</string>
+    <!-- Explicit: a launchd job does not inherit the shell's idea of where
+         ctxlake.toml lives. -->
+    <string>--config</string>
+    <string>{{CONFIG}}</string>
     <string>sync</string>
     <string>run</string>
     <!-- launchd owns supervision, so the daemon must not fork away from it. -->
     <string>--foreground</string>
   </array>
 
+  <!-- Pinned, not inherited. launchd supplies its own $HOME from the user record,
+       which is not necessarily the one `ctxlake sync install` ran under — and every
+       local path ctxlake uses (the spool the hook writes, the cache the briefing is
+       read from, the pidfile) hangs off it. A daemon resolving a different $HOME
+       drains a spool nothing is filling, and reports itself as not running. -->
   <key>EnvironmentVariables</key>
   <dict>
-    <key>CTXLAKE_FLEET_ID</key><string>{{FLEET_ID}}</string>
-    <key>CTXLAKE_AGENT_ID</key><string>{{AGENT_ID}}</string>
+    <key>HOME</key><string>{{HOME}}</string>
   </dict>
 
   <key>WorkingDirectory</key>

@@ -225,15 +225,50 @@ pub fn strip_injected_context(text: &str) -> String {
 /// with no text, say) are skipped rather than emitting an empty line.
 pub fn build_fenced_transcript(envelopes: &[Envelope]) -> String {
     let mut out = String::new();
+    // Name the session the citations are supposed to carry. Without this the model
+    // is asked for a `session_id` it was never shown, so it supplies the only
+    // id-shaped string in front of it — the first line's event id — and every claim
+    // is then dropped as an unresolvable citation. Observed against a live model,
+    // which produced four good claims and cited all four to an event id.
+    if let Some(session_id) = envelopes.first().map(|e| e.session_id.as_str()) {
+        out.push_str(&format!("session_id: {session_id}\n"));
+    }
     for e in envelopes {
-        let Some(content) = &e.content else { continue };
-        let cleaned = strip_injected_context(content);
-        let cleaned = cleaned.trim();
-        if cleaned.is_empty() {
-            continue;
-        }
         let id = e.message_id.as_deref().unwrap_or(&e.event_id);
-        out.push_str(&format!("[{id}] {cleaned}\n"));
+
+        if let Some(content) = &e.content {
+            let cleaned = strip_injected_context(content);
+            let cleaned = cleaned.trim();
+            if !cleaned.is_empty() {
+                out.push_str(&format!("[{id}] {cleaned}\n"));
+            }
+        }
+
+        // Tool calls are the evidence. This function used to render `content` only,
+        // and on a real Claude Code session `content` is set for the user's prompt
+        // and nothing else — every command, exit code and output lives on `tool`. So
+        // extraction was shown the question and never the work, and a live run
+        // returned zero claims from a session that plainly contained one.
+        //
+        // Every unit test in this module missed it because they build envelopes with
+        // `content` set directly; only a transcript captured through the real hook
+        // has this shape.
+        if let Some(t) = &e.tool {
+            let mut line = format!("[{id}] tool:{}", t.name);
+            if let Some(input) = t.input.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                line.push_str(&format!(" input={input}"));
+            }
+            if let Some(code) = t.exit_code {
+                line.push_str(&format!(" exit={code}"));
+            }
+            if let Some(result) = t.result.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                // One line per call: a multi-line result would break the `[id] …`
+                // framing the citation instructions depend on.
+                line.push_str(&format!(" result={}", result.replace('\n', " ⏎ ")));
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
     }
     out
 }
@@ -515,6 +550,15 @@ fn chat_completions_body(req: &CompletionRequest) -> serde_json::Value {
             {"role": "system", "content": req.system_prompt},
             {"role": "user", "content": req.user_prompt},
         ],
+        // Without this the model is free to answer in prose, and it does: a live
+        // OpenRouter call returned a ```json fence around the object. `json_object`
+        // is the widely-supported form (OpenAI, OpenRouter, and most compatible
+        // gateways); a gateway that ignores an unknown field is no worse off than
+        // before, which is why this is safe to send unconditionally.
+        //
+        // It is a belt, not a replacement for the braces: `unwrap_json_payload`
+        // still runs, because "supported" and "obeyed" are different claims.
+        "response_format": {"type": "json_object"},
     })
 }
 
@@ -872,9 +916,38 @@ struct RawExtraction {
 /// candidates. A malformed response is an [`ExtractError`], not a bad memory
 /// silently stored — docs/memory.md's "structured output" rule.
 pub fn parse_claims_response(raw: &str) -> Result<Vec<RawClaim>, ExtractError> {
-    let parsed: RawExtraction = serde_json::from_str(raw.trim())
+    let candidate = unwrap_json_payload(raw);
+    let parsed: RawExtraction = serde_json::from_str(candidate)
         .map_err(|e| ExtractError::MalformedResponse(e.to_string()))?;
     Ok(parsed.claims)
+}
+
+/// Pull the JSON object out of a response that may have been dressed up.
+///
+/// Found against a live endpoint, not a fixture: asked for nothing but JSON and given
+/// a `response_format`, `anthropic/claude-haiku-4.5` through OpenRouter still returned
+/// ```` ```json\n{"claims":[]}\n``` ````. Every recorded fixture in this module's test
+/// suite carries a clean object because each was built from the provider's *documented*
+/// response schema, so none of them could ever have caught this — the wrapper is a
+/// property of the model, not of the API contract.
+///
+/// Deliberately not a general "find some JSON in this text" search: it strips a fenced
+/// block if the whole response is one, and otherwise takes the span from the first `{`
+/// to the last `}`. Anything looser starts salvaging JSON out of prose that was never
+/// meant to be a result, which is how a refusal turns into a claim.
+fn unwrap_json_payload(raw: &str) -> &str {
+    let t = raw.trim();
+    // ```json … ``` or ``` … ```
+    if let Some(rest) = t.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        if let Some(body) = rest.trim_start_matches(['\r', '\n']).strip_suffix("```") {
+            return body.trim();
+        }
+    }
+    match (t.find('{'), t.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &t[a..=b],
+        _ => t,
+    }
 }
 
 /// What a `(session_id, message_id)` citation resolves to, once verified against
@@ -975,11 +1048,29 @@ pub fn claim_from_raw(
         .evidence
         .iter()
         .filter_map(|c| {
-            resolvable
-                .get(&(c.session_id.clone(), c.message_id.clone()))
-                .map(|resolved| Evidence {
+            // Exact match first: a model that echoed the session id correctly is
+            // taken at its word.
+            if let Some(resolved) = resolvable.get(&(c.session_id.clone(), c.message_id.clone())) {
+                return Some(Evidence {
                     session_id: c.session_id.clone(),
                     message_id: c.message_id.clone(),
+                    excerpt_hash: resolved.excerpt_hash.clone(),
+                    observed_at: resolved.observed_at.clone(),
+                });
+            }
+            // Otherwise fall back to the message id alone. `resolvable` is built from
+            // exactly one session's envelopes (extraction is per-session), so this
+            // cannot pull evidence in from somewhere else — and the message id is the
+            // half that actually verifies anything. The session id is ours to know,
+            // not the model's to determine, so a wrong guess at it must not discard
+            // real, citable evidence. Whatever the model said is discarded in favour
+            // of the session the envelope actually belongs to.
+            resolvable
+                .iter()
+                .find(|((_, mid), _)| *mid == c.message_id)
+                .map(|((sid, mid), resolved)| Evidence {
+                    session_id: sid.clone(),
+                    message_id: mid.clone(),
                     excerpt_hash: resolved.excerpt_hash.clone(),
                     observed_at: resolved.observed_at.clone(),
                 })
@@ -1041,6 +1132,23 @@ pub struct SessionTranscript {
 /// `ctxlake doctor`'s put-if-absent probe is what surfaces this ahead of time. See
 /// `mark_extracted_if_new_under_real_concurrency_exactly_one_host_wins` below for
 /// proof that racing callers never both win.
+/// Give back the claim on a session whose extraction failed, so a later run retries it.
+///
+/// Best-effort and deliberately silent: this runs on an error path that is already
+/// returning a more useful error to the caller, and a failure to clean up costs one
+/// session's claims, not correctness. The next run simply finds the marker and skips —
+/// the same outcome as before this existed.
+async fn release_extraction_marker(store: &dyn ObjectStore, session_id: &str) {
+    let key = ctxlake_store::layout::claims_extracted(session_id);
+    if let Err(e) = store.delete(&key).await {
+        tracing::warn!(
+            session_id,
+            error = %e,
+            "could not release the extraction marker; this session will not be retried"
+        );
+    }
+}
+
 pub async fn mark_extracted_if_new(
     store: &dyn ObjectStore,
     session_id: &str,
@@ -1220,8 +1328,30 @@ pub async fn extract_session(
         user_prompt: transcript_text,
         model: batch_cfg.model.clone(),
     };
-    let raw_response = provider.complete(&request).await?;
-    let raw_claims = parse_claims_response(&raw_response)?;
+    // The marker above was written *before* this call, so that two hosts cannot both
+    // pay for the same session. But a marker that is never released turns a transient
+    // provider failure — a 500, a rate limit, a dropped connection — into permanent,
+    // silent loss: the session is marked done, produces no claims, and is never
+    // retried. Found by a live run whose first attempt failed and whose second
+    // reported "0 session(s) extracted" with nothing wrong.
+    //
+    // So: release it on the way out of any failure, and let the next run try again.
+    // Re-extraction is safe (claim ids are reused for matching claims — see
+    // `find_existing_claim_id`), whereas losing a session's claims is not.
+    let raw_response = match provider.complete(&request).await {
+        Ok(r) => r,
+        Err(e) => {
+            release_extraction_marker(store, &session.session_id).await;
+            return Err(e);
+        }
+    };
+    let raw_claims = match parse_claims_response(&raw_response) {
+        Ok(c) => c,
+        Err(e) => {
+            release_extraction_marker(store, &session.session_id).await;
+            return Err(e);
+        }
+    };
     let resolvable = build_resolvable_index(&session.envelopes);
     let observed_at = session
         .envelopes
@@ -1707,6 +1837,167 @@ mod tests {
     fn parse_claims_response_rejects_malformed_json_as_a_parse_error() {
         let err = parse_claims_response("not json at all").unwrap_err();
         assert!(matches!(err, ExtractError::MalformedResponse(_)));
+    }
+
+    #[test]
+    fn a_citation_with_the_wrong_session_id_still_resolves_by_message_id() {
+        // A live model, asked for a session_id the transcript never showed it, cited
+        // the first line's event id for all four claims — and all four were dropped.
+        // The message id is the half that verifies anything; the session id is ours.
+        let envelopes = vec![env_with("real-session", "t1", "cargo test failed", 0)];
+        let resolvable = build_resolvable_index(&envelopes);
+        let raw = RawClaim {
+            claim: "CI sets RUSTFLAGS=-D warnings".to_string(),
+            claim_type: "environment".to_string(),
+            subject: "ci".to_string(),
+            evidence: vec![RawCitation {
+                session_id: "01SOMETHING-THE-MODEL-GUESSED".to_string(),
+                message_id: "t1".to_string(),
+            }],
+        };
+        let claim = claim_from_raw(
+            raw,
+            "cc-01",
+            "2026-09-11T00:00:00Z",
+            &resolvable,
+            &BTreeMap::new(),
+        )
+        .expect("a resolvable message id must survive a wrong session id");
+        assert_eq!(
+            claim.evidence[0].session_id, "real-session",
+            "the envelope's own session must win over the model's guess"
+        );
+    }
+
+    #[test]
+    fn a_fabricated_message_id_is_still_rejected() {
+        // The fallback must not become "accept anything": the message id is the
+        // anti-hallucination check, and softening it would let a model invent
+        // evidence for a claim nothing in the session supports.
+        let envelopes = vec![env_with("real-session", "t1", "cargo test failed", 0)];
+        let resolvable = build_resolvable_index(&envelopes);
+        let raw = RawClaim {
+            claim: "something nobody observed".to_string(),
+            claim_type: "environment".to_string(),
+            subject: "ci".to_string(),
+            evidence: vec![RawCitation {
+                session_id: "real-session".to_string(),
+                message_id: "m-does-not-exist".to_string(),
+            }],
+        };
+        assert!(
+            claim_from_raw(
+                raw,
+                "cc-01",
+                "2026-09-11T00:00:00Z",
+                &resolvable,
+                &BTreeMap::new()
+            )
+            .is_none(),
+            "an unresolvable message id must still drop the claim"
+        );
+    }
+
+    #[test]
+    fn the_transcript_names_the_session_it_is_asking_about() {
+        let t = build_fenced_transcript(&[env_with("sess-abc", "m1", "hello", 0)]);
+        assert!(
+            t.starts_with("session_id: sess-abc\n"),
+            "the model cannot cite an id it was never shown: {t:?}"
+        );
+    }
+
+    #[test]
+    fn the_transcript_carries_tool_calls_not_just_prompts() {
+        // The bug this guards is the one a live run found: on a real Claude Code
+        // session `content` is populated for the user's prompt and nothing else, so
+        // rendering `content` alone showed the model the question and hid every
+        // command, exit code and output — the entire evidentiary basis for a claim.
+        let mut prompt = env_with("s1", "m1", "why does CI fail but not my laptop", 0);
+        prompt.tool = None;
+
+        let mut call = env_with("s1", "t1", "", 1);
+        call.content = None;
+        call.tool = Some(ctxlake_core::envelope::ToolCall {
+            name: "Bash".to_string(),
+            input: Some("cargo test --workspace".to_string()),
+            input_hash: String::new(),
+            result: Some(
+                "error: unused variable `x`\nnote: `-D warnings` was supplied".to_string(),
+            ),
+            exit_code: Some(1),
+            duration_ms: None,
+            paths: vec![],
+        });
+
+        let t = build_fenced_transcript(&[prompt, call]);
+        assert!(
+            t.contains("why does CI fail"),
+            "the prompt must survive: {t}"
+        );
+        assert!(t.contains("tool:Bash"), "the tool name must appear: {t}");
+        assert!(
+            t.contains("cargo test --workspace"),
+            "the command must appear: {t}"
+        );
+        assert!(t.contains("exit=1"), "the exit code must appear: {t}");
+        assert!(t.contains("-D warnings"), "the output must appear: {t}");
+        assert_eq!(
+            t.lines().count(),
+            3,
+            "the session header plus one line per event, so the [id] citation \
+             framing holds: {t:?}"
+        );
+        assert!(
+            t.contains("[t1]"),
+            "the tool line must carry a citable id: {t}"
+        );
+    }
+
+    #[test]
+    fn a_fenced_json_response_is_read_rather_than_rejected() {
+        // Captured from a live OpenRouter call to anthropic/claude-haiku-4.5, asked
+        // for JSON and given a response_format. Every fixture in this file was built
+        // from a documented API schema and so carries a clean object; the fence is a
+        // property of the model, which is why only a real call surfaced it.
+        let raw = "```json\n{\"claims\":[{\"claim\":\"x\",\"claim_type\":\"environment\",\"subject\":\"y\",\"evidence\":[{\"session_id\":\"s1\",\"message_id\":\"m1\"}]}]}\n```";
+        let claims = parse_claims_response(raw).expect("a fenced payload must parse");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].subject, "y");
+    }
+
+    #[test]
+    fn an_unfenced_response_with_a_preamble_still_parses() {
+        let raw = "Here is the JSON you asked for:\n{\"claims\":[]}";
+        assert!(parse_claims_response(raw).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prose_with_no_json_at_all_is_still_a_parse_error() {
+        // The unwrapping must not become "find something that looks like JSON in any
+        // text", or a model's refusal gets salvaged into a claim.
+        for raw in [
+            "I could not find anything durable in this session.",
+            "```json\nnot json at all\n```",
+            "",
+        ] {
+            assert!(
+                parse_claims_response(raw).is_err(),
+                "must not invent a result from {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_openai_compatible_body_asks_for_json_back() {
+        // Without this the model answers in prose and every extraction fails at the
+        // parse step — which is exactly what a live OpenRouter run did.
+        let body = chat_completions_body(&CompletionRequest {
+            system_prompt: "s".into(),
+            user_prompt: "u".into(),
+            model: "m".into(),
+        });
+        assert_eq!(body["response_format"]["type"], "json_object");
     }
 
     #[test]
@@ -2394,6 +2685,64 @@ mod tests {
     // "independently" re-observes the same fact. If extraction minted a fresh
     // claim_id for B (as it used to), the gate would have nothing to discount and
     // would promote a convention on one real observation wearing two reporters.
+
+    /// Fails the first call, succeeds on every one after — a transient provider
+    /// error, which is the common case this test exists for (a 500, a rate limit, a
+    /// dropped connection), not a permanent misconfiguration.
+    struct FlakyProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        session_id: &'static str,
+    }
+    impl Provider for FlakyProvider {
+        fn complete<'a>(
+            &'a self,
+            _req: &'a CompletionRequest,
+        ) -> futures::future::BoxFuture<'a, Result<String, ExtractError>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sid = self.session_id;
+            Box::pin(async move {
+                if n == 0 {
+                    Err(ExtractError::Provider("503 upstream unavailable".into()))
+                } else {
+                    Ok(format!(
+                        r#"{{"claims":[{{"claim":"CI sets RUSTFLAGS=-D warnings","claim_type":"environment","subject":"ci","evidence":[{{"session_id":"{sid}","message_id":"m1"}}]}}]}}"#
+                    ))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_provider_failure_does_not_discard_the_session_forever() {
+        // The marker is written before the provider call so two hosts cannot both pay
+        // for the same session. Nothing used to release it on failure, so one 503
+        // meant that session was marked extracted, produced no claims, and was never
+        // retried — silently, with the next run cheerfully reporting "0 session(s)
+        // extracted". Found by a live run, not by a fixture.
+        let store = object_store::memory::InMemory::new();
+        seal_one_session(&store, "2026-09-11", "flaky-1").await;
+        let cfg = shadow_cfg();
+        let provider = FlakyProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            session_id: "flaky-1",
+        };
+
+        let first = run(&store, "oxidant", &cfg, &provider).await;
+        assert!(
+            first.is_err(),
+            "the first pass must surface the provider error"
+        );
+        assert!(
+            !is_already_extracted(&store, "flaky-1").await.unwrap(),
+            "a failed extraction must release its marker, or the session is lost"
+        );
+
+        let second = run(&store, "oxidant", &cfg, &provider)
+            .await
+            .expect("the retry must succeed");
+        assert_eq!(second.sessions_processed, 1, "the session must be retried");
+        assert_eq!(second.claims_proposed, 1);
+    }
 
     /// Always emits the same claim, citing whatever session it's told to (a real
     /// provider wouldn't need telling — the transcript IS the session — but this

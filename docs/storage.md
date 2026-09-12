@@ -125,14 +125,28 @@ a house rule against blurring them.
 path as MinIO in `crates/ctxlake-store/src/backend.rs` — there is no `r2://` scheme and
 no R2-specific branch, by design. `build()` sets `S3ConditionalPut::ETagMatch`
 unconditionally for that scheme regardless of which S3-compatible endpoint you point it
-at, so R2 gets exactly the treatment MinIO does with no extra code to keep in sync. That
-much — construction succeeding, and the same conditional-put mode being requested for an
-R2-shaped endpoint as for a MinIO-shaped one — is asserted by
-`r2_endpoint_builds_with_the_same_etag_conditional_put_as_minio` and
-`describe_recognizes_r2_from_the_endpoint_hostname` in `backend.rs`'s test module,
-**verified by running those tests**, not by reasoning about the code. What is **not**
-verified: an actual write against a real R2 bucket in this environment. R2's own
-documented footgun stands as written above — a bucket created in the wrong
+at, so R2 gets exactly the treatment MinIO does with no extra code to keep in sync.
+
+That splits into two separate claims, each pinned to its own test, because
+`object_store`'s `AmazonS3` client exposes no public accessor for the conditional-put
+mode it ends up using — only its *builder* does, via `get_config_value`, and only
+before `.build()` discards that state. Construction succeeding for an R2-shaped
+endpoint, with no special-casing keyed off recognizing it as R2, is asserted by
+`r2_endpoint_builds_with_the_same_etag_conditional_put_as_minio`. That the conditional-
+put mode itself is `ETagMatch` for both a MinIO- and an R2-shaped endpoint — and stays
+`ETagMatch` even against a hostile `AWS_CONDITIONAL_PUT=disabled` in the operator's own
+environment — is asserted by `s3_builder_forces_etag_conditional_put_for_minio_and_r2_alike`
+and `s3_builder_overrides_a_hostile_aws_conditional_put_env_var`, both of which
+introspect `s3_builder` (the piece `build()`'s `s3`/`s3a` branch was factored into
+expressly so this is checkable at all) rather than inferring the mode from `build()`
+merely not erroring. All four are **verified by running those tests**, not by reasoning
+about the code — an earlier version of this paragraph cited only the first pair for
+the *mode* claim, which those two tests never actually checked: deleting
+`.with_conditional_put(ETagMatch)` from `s3_builder` outright left every test in this
+file passing, since `ETagMatch` is `object_store`'s own default and nothing exercised
+the one case (a hostile env var) where the explicit call is what saves you. What is
+still **not** verified: an actual write against a real R2 bucket in this environment.
+R2's own documented footgun stands as written above — a bucket created in the wrong
 conditional-write mode returns success codes for a write whose condition silently did
 not apply — and nothing in this repo has exercised that failure mode against a live R2
 account. `doctor`'s cas-update/cas-conflict-detection probes are what would actually

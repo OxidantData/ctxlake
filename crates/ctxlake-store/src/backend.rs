@@ -54,6 +54,45 @@ pub struct BackendOptions {
     pub virtual_hosted_style_request: bool,
 }
 
+/// Assemble the `AmazonS3Builder` for an `s3`/`s3a` URL — factored out of [`build`]
+/// so a test can inspect the builder's resolved config (`get_config_value`, which
+/// `object_store` exposes on the *builder*, not on the `AmazonS3` client `build()`
+/// returns) before `.build()` throws that state away. Without this split, the
+/// claim that MinIO and R2 both get `S3ConditionalPut::ETagMatch` was asserted only
+/// by "`build()` didn't error" — true even with the `.with_conditional_put(..)`
+/// call deleted outright, since `ETagMatch` is `object_store`'s own `#[default]`.
+///
+/// `.with_conditional_put(S3ConditionalPut::ETagMatch)` is placed *after*
+/// `from_env()` deliberately: `from_env()` reads `AWS_CONDITIONAL_PUT` into this
+/// same field, so without the explicit call here, an operator's own environment
+/// (not `ctxlake.toml` — nothing here sets this var, but nothing stops one being
+/// set for an unrelated reason) could carry `AWS_CONDITIONAL_PUT=disabled` and
+/// silently reintroduce the wildcard `If-None-Match: *` semantics AGENTS.md
+/// invariant 4 rules out. The explicit call wins that fight unconditionally.
+fn s3_builder(bucket: &str, opts: &BackendOptions) -> AmazonS3Builder {
+    let mut builder = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_conditional_put(S3ConditionalPut::ETagMatch);
+    if let Some(v) = &opts.endpoint {
+        builder = builder.with_endpoint(v);
+    }
+    if let Some(v) = &opts.region {
+        builder = builder.with_region(v);
+    }
+    if let Some(v) = &opts.access_key_id {
+        builder = builder.with_access_key_id(v);
+    }
+    if let Some(v) = &opts.secret_access_key {
+        builder = builder.with_secret_access_key(v);
+    }
+    if let Some(v) = &opts.session_token {
+        builder = builder.with_token(v);
+    }
+    builder
+        .with_allow_http(opts.allow_http)
+        .with_virtual_hosted_style_request(opts.virtual_hosted_style_request)
+}
+
 /// Build the store addressed by `url`, returning it alongside the [`Path`] `url`
 /// pointed at within that store (the part after the bucket/container).
 pub fn build(url: &Url, opts: &BackendOptions) -> Result<(Arc<dyn ObjectStore>, Path), StoreError> {
@@ -84,28 +123,7 @@ pub fn build(url: &Url, opts: &BackendOptions) -> Result<(Arc<dyn ObjectStore>, 
             let bucket = url.host_str().ok_or_else(|| {
                 StoreError::Config(format!("s3 url {url} is missing a bucket (host)"))
             })?;
-            let mut builder = AmazonS3Builder::from_env()
-                .with_bucket_name(bucket)
-                .with_conditional_put(S3ConditionalPut::ETagMatch);
-            if let Some(v) = &opts.endpoint {
-                builder = builder.with_endpoint(v);
-            }
-            if let Some(v) = &opts.region {
-                builder = builder.with_region(v);
-            }
-            if let Some(v) = &opts.access_key_id {
-                builder = builder.with_access_key_id(v);
-            }
-            if let Some(v) = &opts.secret_access_key {
-                builder = builder.with_secret_access_key(v);
-            }
-            if let Some(v) = &opts.session_token {
-                builder = builder.with_token(v);
-            }
-            builder = builder
-                .with_allow_http(opts.allow_http)
-                .with_virtual_hosted_style_request(opts.virtual_hosted_style_request);
-            let store = builder.build()?;
+            let store = s3_builder(bucket, opts).build()?;
             Ok((Arc::new(store), Path::from(url.path())))
         }
         "gs" => {
@@ -176,9 +194,27 @@ const GCS_GENERATION_PRECONDITIONS: &str = "CAS uses generation preconditions \
      source, not against a live bucket in this environment (see docs/storage.md)";
 
 /// `opts.endpoint`, falling back to the same environment variables
-/// [`AmazonS3Builder::from_env`] itself recognizes for an S3 endpoint override
-/// (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `ENDPOINT_URL`, `ENDPOINT` — see
-/// `object_store`'s `aws/builder.rs` `FromStr` impl for `ConfigKey`).
+/// [`AmazonS3Builder::from_env`] itself recognizes for an S3 endpoint override —
+/// mirroring both which keys it reads and the precedence [`AmazonS3Builder::build`]
+/// applies between them, not just the key names.
+///
+/// Two things about `from_env` are easy to get wrong here, and this function
+/// exists to get them right:
+///
+/// 1. `from_env` filters to vars whose name starts with the literal `AWS_`
+///    *before* parsing the rest as a config key (`object_store`'s
+///    `aws/builder.rs::from_env`) — so bare `ENDPOINT_URL`/`ENDPOINT` (no
+///    `AWS_` prefix) are names `from_env` never even looks at, even though
+///    they parse to a valid `ConfigKey` on their own. A bystander env var
+///    with either of those bare names (common — lots of unrelated tools set
+///    `ENDPOINT`) must NOT be mistaken for an S3 endpoint override here.
+/// 2. `AWS_ENDPOINT_URL_S3` maps to a *separate* field (`s3_endpoint`) from
+///    `AWS_ENDPOINT_URL`/`AWS_ENDPOINT` (`endpoint`), and `build()` resolves
+///    them as `s3_endpoint.or(endpoint)` — so `AWS_ENDPOINT_URL_S3` wins
+///    whenever it's set, even over an `opts.endpoint` passed to
+///    `with_endpoint()`, because `with_endpoint()` only ever touches the
+///    `endpoint` field. That precedence has to be mirrored here in the same
+///    order, not folded into the same `or_else` chain as `opts.endpoint`.
 ///
 /// [`describe`] needs this because `ctxlake-cli`'s `store_ctx::connect` calls
 /// [`build`] with a bare `BackendOptions::default()` today — nothing in
@@ -188,15 +224,16 @@ const GCS_GENERATION_PRECONDITIONS: &str = "CAS uses generation preconditions \
 /// with the same options `connect` actually uses, which defeats the point of
 /// telling MinIO and R2 apart from real S3 at all.
 fn resolve_s3_endpoint(opts: &BackendOptions) -> Option<String> {
+    // `AWS_ENDPOINT_URL_S3` lands in `s3_endpoint`, which `build()` prefers
+    // unconditionally (`s3_endpoint.or(endpoint)`) — it beats even an
+    // explicit `opts.endpoint`, so it has to be checked first and alone here.
+    if let Ok(v) = std::env::var("AWS_ENDPOINT_URL_S3") {
+        return Some(v);
+    }
     opts.endpoint.clone().or_else(|| {
-        [
-            "AWS_ENDPOINT_URL",
-            "AWS_ENDPOINT",
-            "ENDPOINT_URL",
-            "ENDPOINT",
-        ]
-        .into_iter()
-        .find_map(|k| std::env::var(k).ok())
+        ["AWS_ENDPOINT_URL", "AWS_ENDPOINT"]
+            .into_iter()
+            .find_map(|k| std::env::var(k).ok())
     })
 }
 
@@ -313,12 +350,14 @@ mod tests {
         }
     }
 
-    const S3_ENDPOINT_ENV_KEYS: [&str; 4] = [
-        "AWS_ENDPOINT_URL",
-        "AWS_ENDPOINT",
-        "ENDPOINT_URL",
-        "ENDPOINT",
-    ];
+    // Bare `ENDPOINT`/`ENDPOINT_URL` are deliberately NOT in this list: they are
+    // not `AWS_`-prefixed, so `AmazonS3Builder::from_env()` never reads them
+    // (see `resolve_s3_endpoint`'s doc comment) and `describe` must not either.
+    // They stay here only as `NON_AWS_ENDPOINT_ENV_KEYS` so tests can still
+    // clear a developer's ambient `ENDPOINT` before asserting the negative.
+    const S3_ENDPOINT_ENV_KEYS: [&str; 3] =
+        ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_ENDPOINT_URL_S3"];
+    const NON_AWS_ENDPOINT_ENV_KEYS: [&str; 2] = ["ENDPOINT_URL", "ENDPOINT"];
 
     /// Every `describe()` test below that doesn't itself mean to test the env
     /// fallback still runs under this: a developer's own shell (`ENDPOINT` is
@@ -328,6 +367,7 @@ mod tests {
     fn clear_s3_endpoint_env() -> Vec<EnvVarGuard> {
         S3_ENDPOINT_ENV_KEYS
             .iter()
+            .chain(NON_AWS_ENDPOINT_ENV_KEYS.iter())
             .map(|k| EnvVarGuard::clear(k))
             .collect()
     }
@@ -388,11 +428,12 @@ mod tests {
         };
         let (store, path) = build(&url, &opts).unwrap();
         assert_eq!(path.as_ref(), "ctxlake");
-        // We can't introspect the private `conditional_put` field from here, but a
-        // constructed `AmazonS3` store implies `with_conditional_put` didn't panic
-        // and `build()` accepted it — the meaningful assertion (that acquire() only
-        // ever issues `PutMode::Update`, so this setting is exercised on every
-        // lease-file test) lives in lease.rs.
+        // `build()`'s success alone doesn't distinguish ETagMatch from any other
+        // mode — object_store's `AmazonS3` client has no public accessor for it
+        // either, so this can only ever show "construction didn't error". The
+        // actual conditional-put mode is asserted below, on the builder, in
+        // `s3_builder_forces_etag_conditional_put_for_minio_and_r2_alike` and
+        // `s3_builder_overrides_a_hostile_aws_conditional_put_env_var`.
         let _ = store;
     }
 
@@ -404,12 +445,9 @@ mod tests {
         // that claim stays checked: an R2-shaped endpoint (the real
         // `<account_id>.r2.cloudflarestorage.com` hostname pattern) must build
         // exactly as readily as a MinIO endpoint does, with no separate code path
-        // to fall out of sync. As with the MinIO test above, `conditional_put` is
-        // private to `object_store`'s `AmazonS3`, so what's assertable here is
-        // that construction succeeds unconditionally (never gated behind
-        // recognizing the endpoint as "R2") — the wildcard-vs-ETagMatch lesson
-        // (AGENTS.md invariant 4) applies to R2 identically because it is the
-        // identical code path, not a parallel one that could drift.
+        // to fall out of sync. This only asserts construction succeeds — see
+        // `s3_builder_forces_etag_conditional_put_for_minio_and_r2_alike` below for
+        // the actual conditional-put-mode assertion.
         let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
         let opts = BackendOptions {
             endpoint: Some("https://abc123.r2.cloudflarestorage.com".into()),
@@ -419,6 +457,62 @@ mod tests {
         let (store, path) = build(&url, &opts).unwrap();
         assert_eq!(path.as_ref(), "ctxlake");
         let _ = store;
+    }
+
+    #[test]
+    fn s3_builder_forces_etag_conditional_put_for_minio_and_r2_alike() {
+        // Regression: docs/storage.md used to claim the conditional-put mode
+        // itself was "verified by running" the two tests above — it wasn't; both
+        // only ever checked that `build()` returned `Ok`, which stays true even
+        // with `.with_conditional_put(ETagMatch)` deleted outright (ETagMatch is
+        // `object_store`'s own `#[default]`). `get_config_value` is the one place
+        // `object_store` actually exposes this — on the *builder*, not on the
+        // built client — which is why `build` was split out into `s3_builder`.
+        use object_store::aws::AmazonS3ConfigKey;
+        for endpoint in [
+            "http://localhost:9000",
+            "https://abc123.r2.cloudflarestorage.com",
+        ] {
+            let opts = BackendOptions {
+                endpoint: Some(endpoint.into()),
+                ..Default::default()
+            };
+            let value =
+                s3_builder("my-bucket", &opts).get_config_value(&AmazonS3ConfigKey::ConditionalPut);
+            assert_eq!(
+                value.as_deref(),
+                Some("etag"),
+                "endpoint {endpoint} must build with ETagMatch conditional-put, got {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s3_builder_overrides_a_hostile_aws_conditional_put_env_var() {
+        // Regression: `AmazonS3Builder::from_env()` reads `AWS_CONDITIONAL_PUT`
+        // into the exact same field `.with_conditional_put()` sets. Nothing in
+        // ctxlake sets that var, but nothing stops an operator's shell from
+        // carrying it for an unrelated reason — this is the case the explicit
+        // `.with_conditional_put(ETagMatch)` call in `s3_builder` (placed *after*
+        // `from_env()`) exists to defend against: without it, `AWS_CONDITIONAL_
+        // PUT=disabled` in the environment would silently reintroduce the
+        // wildcard `If-None-Match: *` semantics AGENTS.md invariant 4 forbids.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+        let _env = EnvVarGuard::set("AWS_CONDITIONAL_PUT", "disabled");
+
+        use object_store::aws::AmazonS3ConfigKey;
+        let opts = BackendOptions {
+            endpoint: Some("http://localhost:9000".into()),
+            ..Default::default()
+        };
+        let value =
+            s3_builder("my-bucket", &opts).get_config_value(&AmazonS3ConfigKey::ConditionalPut);
+        assert_eq!(
+            value.as_deref(),
+            Some("etag"),
+            "an env-supplied AWS_CONDITIONAL_PUT=disabled must not survive s3_builder, got {value:?}"
+        );
     }
 
     #[test]
@@ -536,6 +630,56 @@ mod tests {
         assert_eq!(
             info.kind, "s3-compatible (Cloudflare R2)",
             "an explicit endpoint in BackendOptions must win over the ambient environment"
+        );
+    }
+
+    #[test]
+    fn describe_ignores_bare_endpoint_env_vars_that_from_env_never_reads() {
+        // Regression: `AmazonS3Builder::from_env()` filters to `AWS_`-prefixed
+        // names *before* parsing the rest as a config key, so bare `ENDPOINT`/
+        // `ENDPOINT_URL` (no prefix) are never read by the builder `build()`
+        // actually uses, even though the same strings parse to a valid
+        // `ConfigKey` on their own. If `describe` read them anyway, an operator
+        // pointed at real AWS S3 whose shell happens to export an unrelated
+        // `ENDPOINT` (common — e.g. many dev tools set this) would be told
+        // they're on MinIO and shown a caveat for a backend they aren't using.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+        let _env1 = EnvVarGuard::set("ENDPOINT", "http://minio.internal:9000");
+        let _env2 = EnvVarGuard::set("ENDPOINT_URL", "http://minio.internal:9000");
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let info = describe(&url, &BackendOptions::default());
+        assert_eq!(
+            info.kind, "AWS S3",
+            "bare ENDPOINT/ENDPOINT_URL are not read by AmazonS3Builder::from_env() \
+             and must not be read by describe() either — got {info:?}"
+        );
+    }
+
+    #[test]
+    fn describe_prefers_aws_endpoint_url_s3_even_over_an_explicit_opts_endpoint() {
+        // Regression: object_store's `AmazonS3Builder::build()` resolves the
+        // endpoint as `self.s3_endpoint.or(self.endpoint)` — `AWS_ENDPOINT_URL_S3`
+        // (which lands in `s3_endpoint`) wins unconditionally, even over an
+        // explicit `opts.endpoint` passed through `with_endpoint()` (which only
+        // ever sets `self.endpoint`, never `self.s3_endpoint`). `describe` has
+        // to mirror that precedence or it labels a bucket by an endpoint that
+        // `build()` will not actually connect to.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+        let _env = EnvVarGuard::set("AWS_ENDPOINT_URL_S3", "http://minio.internal:9000");
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let opts = BackendOptions {
+            endpoint: Some("https://abc123.r2.cloudflarestorage.com".into()),
+            ..Default::default()
+        };
+        let info = describe(&url, &opts);
+        assert_eq!(
+            info.kind, "s3-compatible (MinIO)",
+            "AWS_ENDPOINT_URL_S3 must win over opts.endpoint, matching \
+             AmazonS3Builder::build()'s s3_endpoint.or(endpoint) precedence — got {info:?}"
         );
     }
 

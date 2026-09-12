@@ -31,6 +31,13 @@ That last one earns its place. A line like *"abandoned after 4 failed `cargo tes
 oxidant-connect` runs"* is pure arithmetic over tool-call exit codes. It is often the
 most useful line in a briefing, it costs nothing, and it is never wrong.
 
+`ctxlake maint`'s digest step writes one `digest.json` per sealed session, next to its
+segments in `sessions/` — see [layout.md](layout.md) — computed purely by re-reading
+that session's own already-captured envelopes; nothing here calls a model. Exit codes
+are read from `tool.exit_code` regardless of which runtime produced the envelope, so
+the same friction detection applies identically to Claude Code, Cursor, and Hermes
+sessions.
+
 ## Tier 1 — the agent summarizes itself. The default.
 
 **The cheapest summarizer is the agent that just did the work.** It is still running,

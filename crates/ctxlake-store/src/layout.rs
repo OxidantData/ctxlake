@@ -105,6 +105,78 @@ pub fn claims_events_prefix() -> Path {
     Path::from("claims").join("events")
 }
 
+/// The Tier 0 structural digest for one sealed session — see `docs/summarization.md`.
+/// Colocated under the same session directory as its segments and `_SEALED` marker
+/// (rather than a separate top-level prefix) because it is derived from, and only
+/// ever meaningful alongside, that one session's own data; a reader who has found
+/// `_SEALED` already knows exactly where to look for the digest next to it.
+///
+/// Single-writer, like the rest of this directory: only `ctxlake maint`'s digest
+/// step ever writes this key, and it is safe to overwrite in place (recomputing a
+/// digest from the same sealed segments is pure arithmetic and always reproduces the
+/// same bytes) — see `ctxlake_maint::digest`.
+pub fn session_digest(
+    date: &str,
+    fleet: &str,
+    runtime: Runtime,
+    agent: &str,
+    session_id: &str,
+) -> Path {
+    session_dir(date, fleet, runtime, agent, session_id).join("digest.json")
+}
+
+/// One output file of a compaction run over a `(date, fleet)` partition — see
+/// `ctxlake_maint::compact`. Deliberately a *sibling* prefix to `sessions/dt=.../`
+/// rather than a rewrite of it in place: bronze (the per-session `seg-*.parquet`
+/// files under [`session_segment`]) is immutable — compaction only ever *adds* a
+/// derived, queryable artifact, it never deletes or overwrites the small files it
+/// was built from. `part` is zero-padded for the same reason `session_segment`'s
+/// `seg` is: plain lexicographic listing must already be numeric order.
+///
+/// `generation` (the compaction run's `sessions_hash` — the content hash of the
+/// exact sealed-session set it folded in, stripped of its `sha256:` prefix so it's
+/// a clean path segment) puts every run's output under its own directory, rather
+/// than the fixed `part-000000.parquet`, `part-000001.parquet`, ... every prior
+/// version of this function produced regardless of which run wrote them. A review
+/// caught what that fixed naming actually meant: a second compaction run PUTs over
+/// the *same* keys the first run's output — and any reader — is still using, with
+/// no cross-key atomicity protecting a concurrent `LIST` across the two PUTs, so a
+/// reader could see some parts from the old generation and some from the new one,
+/// duplicated or missing rows, undetectable from the data. Two different sealed-
+/// session sets now always land in two different `gen=` directories, so a
+/// recompaction can never touch a byte a previous, still-being-read generation
+/// wrote — it can only ever add a new one, the same "add, never rewrite" discipline
+/// bronze itself already has. [`sessions_compaction_marker`] is the pointer that
+/// says which `gen=` is current; a reader must follow it rather than listing this
+/// prefix directly, the same way [`snapshot_latest`] is the pointer for
+/// `snapshot/`. Old generations are never deleted (deleting one a lagging reader
+/// might still be mid-read of would reintroduce the exact race this exists to
+/// avoid), so a partition recompacted often accumulates old generations' storage —
+/// a known, documented cost (`docs/layout.md`), not a silent one.
+pub fn sessions_compacted_part(date: &str, fleet: &str, generation: &str, part: u32) -> Path {
+    Path::from("sessions")
+        .join("compacted")
+        .join(format!("dt={date}"))
+        .join(format!("fleet={fleet}"))
+        .join(format!("gen={generation}"))
+        .join(format!("part-{part:06}.parquet"))
+}
+
+/// Records exactly which sealed sessions a `(date, fleet)` compaction run folded in,
+/// so a second run over an unchanged partition can recognize that and skip rewriting
+/// — see `ctxlake_maint::compact`'s idempotency contract. Single-writer, CAS-free:
+/// like [`roster`], any prior content this overwrites is itself fully disposable
+/// (the marker is fully recomputed from a fresh listing every run, never
+/// accumulated), so there is no "don't clobber a concurrent writer's progress" state
+/// to protect with a CAS read-modify-write here.
+pub fn sessions_compaction_marker(date: &str, fleet: &str) -> Path {
+    Path::from("sessions")
+        .join("compacted")
+        .join(format!("dt={date}"))
+        .join(format!("fleet={fleet}"))
+        .join("_COMPACTED")
+}
+
 /// One claim proposal (`memory_propose`, never `memory_write` — AGENTS.md invariant
 /// 9). `ulid` is expected to already be a ULID string, which is why it is not itself
 /// escaped further here beyond the standard segment encoding every dynamic value
@@ -235,6 +307,42 @@ mod tests {
         );
         assert_eq!(snapshot_latest().as_ref(), "snapshot/latest.json");
         assert_eq!(quarantine_prefix().as_ref(), "quarantine");
+        assert_eq!(
+            session_digest("2026-09-11", "oxidant", Runtime::ClaudeCode, "cc-01", "sess-1")
+                .as_ref(),
+            "sessions/dt=2026-09-11/fleet=oxidant/runtime=claude_code/agent=cc-01/session=sess-1/digest.json"
+        );
+        assert_eq!(
+            sessions_compacted_part("2026-09-11", "oxidant", "deadbeef", 2).as_ref(),
+            "sessions/compacted/dt=2026-09-11/fleet=oxidant/gen=deadbeef/part-000002.parquet"
+        );
+        assert_eq!(
+            sessions_compaction_marker("2026-09-11", "oxidant").as_ref(),
+            "sessions/compacted/dt=2026-09-11/fleet=oxidant/_COMPACTED"
+        );
+    }
+
+    #[test]
+    fn compacted_output_lives_outside_the_bronze_session_directory() {
+        // Compaction must never be able to address a key inside a session's own
+        // seg-*.parquet directory — that would make "compaction" and "the single
+        // writer still appending this session" two writers on one key (AGENTS.md
+        // invariant 3), instead of the sibling-prefix, add-only relationship the
+        // module doc for `sessions_compacted_part` describes.
+        let session_key = session_segment(
+            "2026-09-11",
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            "sess-1",
+            0,
+        );
+        let compacted_key = sessions_compacted_part("2026-09-11", "oxidant", "deadbeef", 0);
+        assert!(
+            !compacted_key.as_ref().starts_with("sessions/dt="),
+            "compacted output must not land under the bronze dt= partition: {compacted_key}"
+        );
+        assert_ne!(session_key, compacted_key);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # systemd user unit for the ctxlake sync daemon.
 #
 # Rendered by `ctxlake sync install` into ~/.config/systemd/user/ctxlake-sync.service.
-# Placeholders: {{EXEC}} {{CONFIG}} {{HOME}}
+# Placeholders: {{EXEC}} {{CONFIG}} {{HOME}} {{PATH}}
 #
 # A USER unit, not a system one: the daemon reads this user's spool and writes with
 # this user's store credentials. A system unit would run as root and reach neither.
@@ -33,6 +33,14 @@ WorkingDirectory={{HOME}}
 # spool nobody is filling. systemd already sets this correctly for a user unit;
 # recording it here is what makes the unit say which home it was installed for.
 Environment="HOME={{HOME}}"
+# Pinned for the same reason, and for a failure that is much harder to see. A systemd
+# user unit gets a minimal PATH that contains none of the directories a person
+# installs tools into, so `[summarize.batch] provider = "claude-cli"` (or "ollama",
+# or anything else that shells out) passes `ctxlake doctor` in your shell and then
+# cannot find the binary here. This is the PATH `ctxlake sync install` itself ran
+# with, so the check and the daemon resolve the same binary — which is the only thing
+# that makes a green pre-install check mean anything.
+Environment="PATH={{PATH}}"
 
 # on-failure, not always: `ctxlake sync stop` exits 0 and must stay stopped.
 Restart=on-failure

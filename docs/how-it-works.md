@@ -1,6 +1,7 @@
 # How it works
 
-Three things move data, and only one of them is automatic.
+Three things move data. One runs inside your agent; the other two run inside a single
+background process you install once.
 
 <svg viewBox="0 0 720 236" role="img" aria-label="Hooks write to a local spool; the sync daemon ships it to object storage and refreshes a local cache; the hook reads that cache. Maintenance derives digests and memories." style="width:100%;height:auto">
   <defs>
@@ -44,7 +45,7 @@ Three things move data, and only one of them is automatic.
 
   <rect class="b" x="586" y="102" width="126" height="52"/>
   <text x="602" y="124" class="t">maint</text>
-  <text x="602" y="140" class="s">you schedule</text>
+  <text x="602" y="140" class="s">in the daemon</text>
 
   <path class="l" d="M73 82 V122"/>
   <text x="80" y="108" class="s">hook · 5ms</text>
@@ -82,7 +83,7 @@ thing safe without coordination.
 |---|---|---|---|
 | `live/` | who is active now | compare-and-swap | each agent, to its own key |
 | `sessions/` | what happened | append-only, never rewritten | each agent, once per record |
-| `snapshot/` | what is believed | immutable publish + pointer swap | `ctxlake maint` |
+| `snapshot/` | what is believed | immutable publish + pointer swap | the maintenance chain |
 
 Getting `live/` wrong for five seconds is a stale presence indicator. Getting
 `sessions/` wrong loses history permanently. They cannot share a write discipline
@@ -119,7 +120,7 @@ Each adapter normalises into one envelope, and everything downstream reads only 
 
 > Every field name was captured from a live run rather than taken from documentation.
 > Three of the three runtimes turned out to send something other than what their docs
-> describe, and every mismatch failed *silently* — see [runtimes.md](runtimes.md).
+> describe, and every mismatch failed *silently* — see [Runtimes](runtimes.md).
 
 ## Redaction happens before anything is written
 
@@ -209,6 +210,6 @@ old `cat .env` is already sitting.
 
 ## Next steps
 
-- [getting-started.md](getting-started.md) — install and first briefing
-- [runtimes.md](runtimes.md) — per-runtime behaviour and honest gaps
-- [architecture.md](architecture.md) — every component, for when you are debugging one
+- [Getting started](getting-started.md) — install and first briefing
+- [Runtimes](runtimes.md) — per-runtime behaviour and honest gaps
+- [Architecture](architecture.md) — every component, for when you are debugging one

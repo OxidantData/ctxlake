@@ -120,6 +120,26 @@ pub fn sync_log_file(fleet_id: &str) -> PathBuf {
         .join(format!("{fleet_id}.log"))
 }
 
+/// The optional file the daemon reads credentials from: `<config_home>/ctxlake/env`.
+///
+/// **This exists because a supervised daemon does not inherit your shell.** You
+/// `export OPENROUTER_API_KEY=...`, `ctxlake doctor` calls the provider and reports
+/// green, and then the launchd job or systemd user unit runs with no such variable —
+/// Tier 2 fails on every cycle forever, for a reason that never appears in the check
+/// that was supposed to catch it.
+///
+/// The two obvious fixes are both wrong. Writing the key into `ctxlake.toml` breaks
+/// AGENTS.md invariant 10 (the config holds the *name* of an env var, never a value),
+/// and writing it into the unit file is the same mistake in a file that is
+/// world-readable by default on both platforms. A separate file, required to be
+/// owner-only, is the one place a secret can live that neither of those touches — and
+/// it works identically under systemd and launchd, which is more than can be said for
+/// `EnvironmentFile=` (systemd only) or `launchctl setenv` (global to the whole login
+/// session).
+pub fn env_file() -> PathBuf {
+    config_home().join("ctxlake").join("env")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

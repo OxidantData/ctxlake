@@ -1,7 +1,7 @@
 # Architecture — the operator's map
 
 For the moment something is wrong at 2am and you need to know which process to look at
-and which file to read. [how-it-works.md](how-it-works.md) is the concept overview; this
+and which file to read. [How it works](how-it-works.md) is the concept overview; this
 is the map.
 
 ## Component inventory
@@ -87,8 +87,9 @@ flowchart LR
     Maint -->|"3. publish"| Snapshot["snapshot/\ncontent-addressed blob + CAS pointer swap"]
 ```
 
-Every host can run this on its own timer, or none can. There is no lock to acquire — see
-[how-it-works.md](how-it-works.md).
+The sync daemon runs this every 5 minutes, and `ctxlake maint` runs it by hand. Any
+number of hosts can do either at once, and none has to. There is no lock to acquire — see
+[How it works](how-it-works.md).
 
 ## A worked trace
 
@@ -166,7 +167,7 @@ duckdb -c "SELECT runtime, event_type, count(*) FROM 's3://bucket/ctxlake/sessio
 | Hook adds noticeable latency | Time `ctxlake-hook` against a captured payload; check for an unusually large tool output | Budget is 5ms p99. Almost always a huge payload meeting `MAX_SCAN_BYTES`, a full disk, or — as a real bug — network I/O in the hook path |
 | `412 Precondition Failed` storms | Whether failures concentrate on one key or spread across many | A 412 is CAS working. Concentrated means a genuinely hot object; spread means clock skew or a retry loop missing its backoff |
 | Claims never promote | `ctxlake sync status`, then compare `claims/events/` against `claims/fleet/` | Only the gate writes `claims/fleet/`. A daemon that is not running and an unmet promotion rule look identical from outside |
-| `doctor` reports a backend failing CAS | Which primitive failed, against which backend | Backends genuinely differ ([storage.md](storage.md)). MinIO rejecting `If-None-Match: *` is permanent vendor behaviour, not a transient fault |
+| `doctor` reports a backend failing CAS | Which primitive failed, against which backend | Backends genuinely differ ([Storage](storage.md)). MinIO rejecting `If-None-Match: *` is permanent vendor behaviour, not a transient fault |
 | `quarantine/` growing fast | Which `rules_fired` values dominate | A flood of one rule (commonly `high_entropy_run`) usually means a false-positive source — a build emitting long hashes — not a leak |
 
 ## Resetting safely
@@ -191,10 +192,10 @@ write to it.
 | `ENTROPY_MIN_LEN` / `ENTROPY_THRESHOLD` | 32 chars / 4.5 bits per char | Too low false-positives on git SHAs and ULIDs; too high misses real base64/hex secrets |
 | Roster heartbeat TTL | 5 minutes | How long a peer with no fresh heartbeat still shows as active |
 | Heartbeat renewal interval | 60s (1/5 of TTL) | The 5:1 ratio means one missed cycle does not drop a live peer. Renewing more often costs money: PUTs are 12.5x a GET |
-| Roster/live poll interval | 5s | Lower = fresher peers at `O(N)`–`O(N²)` request cost ([storage.md](storage.md)). Higher = a new peer stays invisible longer |
+| Roster/live poll interval | 5s | Lower = fresher peers at `O(N)`–`O(N²)` request cost ([Storage](storage.md)). Higher = a new peer stays invisible longer |
 | Cache refresh interval | 5–15s | The staleness floor for everything an agent ever sees. Nothing waits for a fresher read, so this number *is* the freshness guarantee |
 | Spool flush / batch trigger | time- or size-based (e.g. 2s or N events) | Larger batches mean fewer, larger writes, at the cost of more unconfirmed data in the spool if the daemon crashes |
-| Maintenance schedule | operator-configured | Too infrequent: stale briefings, unpromoted claims, small files. Too frequent: more LIST/PUT traffic finding nothing to do — never contention |
+| Maintenance schedule | every 5 min, in the sync daemon | Too infrequent: stale briefings, unpromoted claims, small files. Too frequent: more LIST/PUT traffic finding nothing to do — never contention |
 | Agent id stability | operator-assigned | Reusing one `agent_id` from two hosts makes them share a roster entry. CAS still prevents lost writes, but "who is doing what" becomes wrong |
 
 ## What ctxlake does NOT guarantee
@@ -212,11 +213,11 @@ write to it.
   and a compromised host with valid store credentials can write around the hook entirely.
 - **There is an honest ceiling of roughly 50 concurrently active agents.** Past that, CAS
   contention and request volume against `live/` make plain object storage impractical at
-  these polling intervals — see [storage.md](storage.md). The documented path is moving
+  these polling intervals — see [Storage](storage.md). The documented path is moving
   `live/` to DynamoDB or Redis while `sessions/` and `snapshot/` stay exactly as they are.
 
 ## Next steps
 
-- [storage.md](storage.md) — the CAS matrix and the cost arithmetic behind these defaults
-- [security.md](security.md) — redaction, quarantine, and the IAM policy shape
-- [reference.md](reference.md) — every command and flag named above
+- [Storage](storage.md) — the CAS matrix and the cost arithmetic behind these defaults
+- [Security](security.md) — redaction, quarantine, and the IAM policy shape
+- [Reference](reference.md) — every command and flag named above

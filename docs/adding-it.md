@@ -21,7 +21,7 @@ own entries, and leaves everything else byte-for-byte intact.
 All three runtimes are MCP clients, so `ctxlake install` also adds one stdio server
 entry. No service to stand up, no port, no auth — the server runs as a child process of
 the agent. Where a runtime cannot inject context automatically, MCP is the fallback: the
-agent calls `fleet_status()` itself. See [reference.md](reference.md#mcp-tools).
+agent calls `fleet_status()` itself. See [Reference](reference.md#mcp-tools).
 
 ## Day one
 
@@ -98,7 +98,7 @@ redaction** as live capture.
 > likeliest place an un-redacted secret already sits — a `cat .env` from six months ago,
 > a `printenv`, a curl that echoed its own headers. Every imported event passes the same
 > literal-marker matching, entropy heuristic and path denylist, and anything that trips a
-> rule is quarantined rather than stored. See [security.md](security.md).
+> rule is quarantined rather than stored. See [Security](security.md).
 
 ## Your conventions seed the belief layer
 
@@ -124,12 +124,12 @@ sessions is stored once.
   do not block until you ask them to.
 - **It does not route your traffic anywhere.** Hooks write to a local spool; a daemon
   moves that to your own bucket.
-- **It does not require an LLM.** See [memory.md](memory.md).
+- **It does not require an LLM.** See [Memory](memory.md).
 - **It does not need every machine onboarded at once.** An agent without ctxlake is
   invisible to the roster; the others still coordinate. Value scales with coverage.
 
 ## Next steps
 
-- [getting-started.md](getting-started.md) — the install itself
-- [runtimes.md](runtimes.md) — per-runtime behaviour and honest gaps
-- [security.md](security.md) — redaction rules, quarantine, and the threat model
+- [Getting started](getting-started.md) — the install itself
+- [Runtimes](runtimes.md) — per-runtime behaviour and honest gaps
+- [Security](security.md) — redaction rules, quarantine, and the threat model

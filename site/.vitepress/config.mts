@@ -6,8 +6,10 @@ import { withMermaid } from 'vitepress-plugin-mermaid'
 //
 // Two house conventions make that work without rewriting anything:
 //   - No frontmatter anywhere, so GitHub shows no stray YAML block.
-//   - Relative links include the `.md` suffix ([storage.md](storage.md)), which is
-//     both the Oxidant docs convention and VitePress's native form.
+//   - Relative link TARGETS include the `.md` suffix ([Storage](storage.md)), which is
+//     both the Oxidant docs convention and VitePress's native form. The link *text* is
+//     the page's title, not its filename — `[storage.md](storage.md)` reads naturally
+//     on GitHub and like a leaked implementation detail on a docs site.
 export default withMermaid(
   defineConfig({
   title: 'ctxlake',
@@ -101,7 +103,7 @@ export default withMermaid(
       {
         text: 'Reference',
         items: [
-          { text: 'Reference', link: '/reference' },
+          { text: 'CLI and config', link: '/reference' },
           { text: 'Architecture', link: '/architecture' },
           { text: 'Security', link: '/security' },
         ],

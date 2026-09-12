@@ -98,7 +98,7 @@ credential leaks.
 
 **In scope:** accidental secret capture from normal tool use, via the redactor; a claim
 asserting something false or manipulative, via the promotion gate's independence and
-contradiction checks ([memory.md](memory.md)); unauthorized writes to `claims/fleet/` or
+contradiction checks ([Memory](memory.md)); unauthorized writes to `claims/fleet/` or
 compacted `sessions/`, via IAM scoping rather than application logic.
 
 **Out of scope, said plainly:** a host with valid store credentials that writes directly
@@ -109,6 +109,6 @@ partially. There is no fallback capture path.
 
 ## Next steps
 
-- [architecture.md](architecture.md) — "what ctxlake does not guarantee", the fuller list
-- [storage.md](storage.md) — where quarantined content and promoted claims live
-- [memory.md](memory.md) — attribution on read, and the quarantine kill switch
+- [Architecture](architecture.md) — "what ctxlake does not guarantee", the fuller list
+- [Storage](storage.md) — where quarantined content and promoted claims live
+- [Memory](memory.md) — attribution on read, and the quarantine kill switch

@@ -55,6 +55,13 @@ futures.workspace = true
 # uses it directly, and `bundled` keeps the read-only/URI open flags this importer
 # depends on independent of whatever libsqlite3 the host happens to ship.
 rusqlite.workspace = true
+# `ctxlake update` fetches the release archive and SHA256SUMS from GitHub, and hashes
+# what it downloaded before installing it. Both are already resolved in this binary's
+# tree via ctxlake-maint (reqwest for the Tier 2 providers) and ctxlake-core (sha2 for
+# content hashing); named here because this crate now uses them directly. Never linked
+# into ctxlake-hook, whose tree CI's `hook-deps` job governs separately.
+reqwest.workspace = true
+sha2.workspace = true
 # `object_store::path::Path` percent-encodes a dynamic segment on write
 # (`PathPart`'s `join`/`child`) but exposes no public way to decode one back —
 # `Path::filename()`/`Path::parts()` both return the raw, still-encoded segment.

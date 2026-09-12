@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+The daemon did not run on either machine it was installed on. All four causes were
+the same mistake, made in four places: **a supervised service does not inherit your
+shell**, and every check that was supposed to catch that ran inside one.
+
+### The daemon crash-looped, and nothing said why
+
+`provider = "claude-cli"` resolves in the terminal that runs `ctxlake sync install` and
+not under launchd, whose `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin`. The daemon treated
+an unbuildable Tier 2 provider as fatal, so it exited 1 before starting a single loop,
+the supervisor restarted it, and it exited 1 again — fourteen times on macOS. `ctxlake
+sync status` reported `spawn scheduled` / `activating` and `not running`, which is a
+description rather than a diagnosis.
+
+Four changes, each independently mutation-tested:
+
+- **The unit pins its `PATH`**, taken from the process that installed it, so the
+  pre-install check and the daemon resolve the same binaries. It already pinned `HOME`
+  for exactly this reason; `PATH` was the same lesson, unlearned.
+- **An unreachable model no longer stops the daemon.** Capture shipping, cache refresh
+  and presence have nothing to do with a model, and taking all three down because an
+  *optional* summarizer is unavailable inverts their importance — in the one mode where
+  the user can least see why. It now warns, starts everything, and rebuilds the provider
+  on each maintenance cycle, so a key that comes back heals without a restart.
+- **`ctxlake sync status` prints why**, tailing the daemon's own output when a service
+  is installed and nothing is running. The reason was always in a file; nothing said the
+  file existed.
+- **The unit names a stable binary path.** `exec_path` canonicalized, which on Homebrew
+  pins `/opt/homebrew/Cellar/ctxlake/<version>/bin/ctxlake` — a directory `brew upgrade`
+  deletes. Every upgrade would have broken the service permanently.
+
+### Provider keys never reached the daemon either
+
+The same hole, one level up: `export OPENROUTER_API_KEY=...` is invisible to launchd and
+to a systemd user unit, so `doctor` reported green in a terminal and Tier 2 failed on
+every cycle. The key cannot go in `ctxlake.toml` (which holds only the *name* of a
+variable) or in the unit file (world-readable on both platforms).
+
+`~/.config/ctxlake/env` is the third place: loaded by every `ctxlake` process at startup,
+**refused unless it is mode 600**, and never overriding a variable that is already set.
+`ctxlake doctor` now checks whether the daemon will see the key rather than whether this
+shell does, and prints the two commands that fix it.
+
+### `ctxlake update`
+
+One command on every platform, replacing a table of four platform-specific incantations.
+It infers how this copy was installed from where the binary lives: Homebrew and cargo
+installs are handed back to the tool that owns them — writing into a Cellar desynchronizes
+brew's manifest — and anything else is downloaded, **verified against `SHA256SUMS`**, and
+replaced by rename rather than in place, because `ctxlake-hook` is executing in live agent
+sessions while the update runs. The sync daemon is restarted afterwards, since a running
+one holds the old binary open. `--check` reports and changes nothing.
+
+### Docs
+
+Per-platform tabs for install, store backend, model provider and daemon setup, so each
+page shows one path instead of all of them. The daemon section is rewritten in plainer
+language, an "If the daemon is not running" section covers the failures above, and the
+stale claim that maintenance needs a cron entry is gone — it has run inside the daemon
+since v0.1.4. Link text is now page titles rather than filenames.
+
+Two new regression checks, both of which found a real defect on their first run: one
+asserts the service templates pin what the docs promise they pin, the other that every
+command in the reference exists and every command that exists is in the reference
+(`ctxlake briefing` was undocumented).
+
 ## v0.1.5
 
 Fixes for everything the first real installs turned up. If you are on v0.1.4,

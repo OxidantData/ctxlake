@@ -1,0 +1,13 @@
+{
+  "_comment": "docs/runtimes/hermes.md's event table lists this as a synonym for on_session_end too, not a fresh-session marker (unlike the retired Python plugin's guess) — both collapse onto EventType::SessionEnd.",
+  "event": "on_session_reset",
+  "payload": {
+    "hook_event_name": "on_session_reset",
+    "session_id": "hs-1"
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "session_end",
+    "session_id": "hs-1"
+  }
+}

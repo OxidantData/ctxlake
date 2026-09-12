@@ -1,0 +1,18 @@
+{
+  "event": "pre_tool_call",
+  "payload": {
+    "hook_event_name": "pre_tool_call",
+    "session_id": "hs-1",
+    "tool_name": "terminal",
+    "tool_input": { "command": "cargo test" },
+    "cwd": "/repo",
+    "extra": { "tool_call_id": "tc-1", "task_id": "task-1" }
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "tool_call",
+    "message_id": "tc-1",
+    "turn_id": "task-1",
+    "tool": { "name": "terminal" }
+  }
+}

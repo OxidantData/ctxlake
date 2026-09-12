@@ -767,6 +767,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctxlake-sync"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "ctxlake-core",
+ "ctxlake-store",
+ "futures",
+ "object_store",
+ "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

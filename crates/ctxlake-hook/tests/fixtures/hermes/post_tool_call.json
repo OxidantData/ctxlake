@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "The regression this fixture pins: Hermes nests `result` and `duration_ms` under",
+    "`extra`, never at the top level (docs/runtimes/hermes.md). `result` and",
+    "`duration_ms` below are DECOYS at the top level with values an adapter reading",
+    "the wrong place would pick up; the real values only live under `extra`. If",
+    "`adapters::hermes::build_tool_call` ever regresses to reading the top level, this",
+    "fixture's `expect` block fails loudly instead of silently under-testing."
+  ],
+  "event": "post_tool_call",
+  "payload": {
+    "hook_event_name": "post_tool_call",
+    "session_id": "hs-1",
+    "tool_name": "terminal",
+    "tool_input": { "command": "cargo test" },
+    "cwd": "/repo",
+    "result": "WRONG: this is the top-level decoy, must not be read",
+    "duration_ms": 999999,
+    "extra": {
+      "tool_call_id": "tc-1",
+      "task_id": "task-1",
+      "result": "cargo test passed",
+      "duration_ms": 1089
+    }
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "tool_call",
+    "tool": {
+      "name": "terminal",
+      "result": "cargo test passed",
+      "duration_ms": 1089
+    }
+  }
+}

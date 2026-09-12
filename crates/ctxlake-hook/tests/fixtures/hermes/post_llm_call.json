@@ -1,0 +1,14 @@
+{
+  "event": "post_llm_call",
+  "payload": {
+    "hook_event_name": "post_llm_call",
+    "session_id": "hs-1",
+    "cwd": "/repo"
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "assistant",
+    "role": "assistant",
+    "session_id": "hs-1"
+  }
+}

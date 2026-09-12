@@ -11,18 +11,10 @@ second spool writer, and so no chance of the two drifting apart.
 > **Verification basis:** every capability, field name and semantic below was read from
 > Hermes's own source — `agent/shell_hooks.py`, `hermes_cli/plugins.py` (`VALID_HOOKS`),
 > and `website/docs/user-guide/features/hooks.md`. This is the best-grounded of the three
-> pages on *what Hermes does*.
->
-> What is **not** yet true: ctxlake currently ships a Python-plugin adapter
-> (`adapters/hermes/`) rather than the shell hooks described here. Shell hooks are the
-> intended mechanism, for the reason in the next section, and the plugin is slated for
-> removal. Until that lands, the config shown below is the target, not what
-> `ctxlake install hermes` writes.
-
-> **Verified against Hermes's own source**, not inferred: `agent/shell_hooks.py`,
-> `hermes_cli/plugins.py` (`VALID_HOOKS`), and `website/docs/user-guide/features/hooks.md`.
-> Field names, payload shape, blocking semantics, and the config schema below are read
-> from the implementation.
+> pages on *what Hermes does*, and, now that the Python-plugin adapter is gone, also the
+> one runtime page where prose and code fully agree: `adapters::hermes` (in
+> `crates/ctxlake-hook`) normalizes exactly the shell-hook payload described below,
+> through the same binary every other runtime uses.
 
 ## Two mechanisms, and why we use the shell one
 

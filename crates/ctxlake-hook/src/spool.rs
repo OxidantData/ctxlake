@@ -31,12 +31,12 @@
 //! `ctxlake-hook` is spawned fresh per event (see `main.rs`): whatever monotonicity
 //! `Envelope::new`'s ULID generation offers is scoped to a single call in a single
 //! process, so it buys nothing across two events from the same session — each is a
-//! different process with its own generator state. For Claude Code and Cursor, the
-//! only ordering this design actually gets is *append order*: the order in which
-//! processes reach [`append_event_at`] for a given session's file, not `event_id`'s
-//! sort order. Hermes is the exception — it runs in-process and mints consecutive ids
-//! from one generator (`adapters/hermes/_ulid.py`), so its ids are meaningfully
-//! ordered on their own.
+//! different process with its own generator state. Claude Code, Cursor, and Hermes
+//! all spawn this same binary once per event now (Hermes stopped running in-process
+//! once its Python plugin was retired for `adapters::hermes` — see that module's
+//! doc), so the only ordering this design gets for any of the three is *append
+//! order*: the order in which processes reach [`append_event_at`] for a given
+//! session's file, not `event_id`'s sort order.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;

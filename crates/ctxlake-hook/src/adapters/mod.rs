@@ -1,15 +1,15 @@
 //! Runtime adapters: normalize a hook's native event into a [`ctxlake_core::Envelope`].
 //!
-//! Hermes has no adapter here — it is an in-process Python plugin (`adapters/hermes/`
-//! at the repo root) that writes to the same spool directly, because spawning this
-//! binary once per LLM call would itself blow the latency budget it exists to protect.
-//! `Runtime::Hermes` still exists on the [`ctxlake_core::Runtime`] enum for the
-//! *import* path (`ctxlake import`, a later wave), which is why [`parse_runtime`]
-//! recognizes the string without this module ever normalizing a live Hermes payload.
+//! Hermes reaches this binary through shell hooks, a wire contract deliberately
+//! Claude Code-compatible (`docs/runtimes/hermes.md`) — it no longer runs an
+//! in-process Python plugin (`adapters/hermes/`, deleted: a hand-ported second
+//! redactor with no shared source was the exact silent-divergence risk AGENTS.md
+//! invariant 7 exists to rule out). See [`hermes`] for the payload shape.
 
 pub mod claude_code;
 pub mod common;
 pub mod cursor;
+pub mod hermes;
 
 use ctxlake_core::{Envelope, Runtime};
 
@@ -36,6 +36,7 @@ pub fn parse_runtime(s: &str) -> Runtime {
 pub fn response_for(runtime: &str, event: &str) -> String {
     match runtime {
         "cursor" => cursor::response_for(event),
+        "hermes" => hermes::response_for(event),
         _ => claude_code::response_for(event),
     }
 }
@@ -53,11 +54,12 @@ pub fn normalize(runtime: Runtime, event: &str, raw: &str) -> Result<Envelope, S
     match runtime {
         Runtime::ClaudeCode => claude_code::normalize(event, &value),
         Runtime::Cursor => cursor::normalize(event, &value),
-        Runtime::Hermes | Runtime::Other => Err(format!(
-            "ctxlake-hook does not normalize {} live (Hermes writes its own spool lines; \
-             an unrecognized runtime has no adapter to normalize against)",
-            runtime.as_str()
-        )),
+        Runtime::Hermes => hermes::normalize(event, &value),
+        Runtime::Other => Err(
+            "ctxlake-hook does not normalize an unrecognized runtime live (no adapter to \
+             normalize against)"
+                .to_string(),
+        ),
     }
 }
 
@@ -91,8 +93,26 @@ mod tests {
     }
 
     #[test]
-    fn normalize_refuses_hermes_and_other_rather_than_guessing() {
-        assert!(normalize(Runtime::Hermes, "pre_tool_call", "{}").is_err());
+    fn normalize_refuses_an_unrecognized_runtime_rather_than_guessing() {
         assert!(normalize(Runtime::Other, "whatever", "{}").is_err());
+    }
+
+    #[test]
+    fn normalize_routes_hermes_to_its_own_adapter() {
+        // Regression: Hermes used to have no adapter at all (an in-process Python
+        // plugin instead); this pins that it now normalizes live, through this
+        // module's own dispatch, rather than being silently refused again.
+        let env = normalize(
+            Runtime::Hermes,
+            "on_session_start",
+            r#"{"session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(env.runtime, Runtime::Hermes);
+    }
+
+    #[test]
+    fn response_for_routes_hermes_to_its_own_adapter() {
+        assert_eq!(response_for("hermes", "pre_tool_call"), "{}");
     }
 }

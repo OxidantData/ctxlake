@@ -1,0 +1,14 @@
+{
+  "event": "pre_llm_call",
+  "payload": {
+    "hook_event_name": "pre_llm_call",
+    "session_id": "hs-1",
+    "cwd": "/repo"
+  },
+  "expect": {
+    "runtime": "hermes",
+    "event_type": "prompt",
+    "role": "user",
+    "session_id": "hs-1"
+  }
+}

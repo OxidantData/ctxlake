@@ -8,11 +8,16 @@ That matters more than it sounds. It means ctxlake uses **the same `ctxlake-hook
 on Hermes that it uses everywhere else — no Python plugin, no second redactor, no
 second spool writer, and so no chance of the two drifting apart.
 
-> **Status: not yet implemented.** Everything below describes Hermes's real, verified
-> capabilities — but ctxlake does not talk to Hermes yet.
-> `crates/ctxlake-hook/src/main.rs` still prints "not yet implemented" and exits. Treat
-> this page as the contract the adapter is being built against, not as a description of
-> working software.
+> **Verification basis:** every capability, field name and semantic below was read from
+> Hermes's own source — `agent/shell_hooks.py`, `hermes_cli/plugins.py` (`VALID_HOOKS`),
+> and `website/docs/user-guide/features/hooks.md`. This is the best-grounded of the three
+> pages on *what Hermes does*.
+>
+> What is **not** yet true: ctxlake currently ships a Python-plugin adapter
+> (`adapters/hermes/`) rather than the shell hooks described here. Shell hooks are the
+> intended mechanism, for the reason in the next section, and the plugin is slated for
+> removal. Until that lands, the config shown below is the target, not what
+> `ctxlake install hermes` writes.
 
 > **Verified against Hermes's own source**, not inferred: `agent/shell_hooks.py`,
 > `hermes_cli/plugins.py` (`VALID_HOOKS`), and `website/docs/user-guide/features/hooks.md`.

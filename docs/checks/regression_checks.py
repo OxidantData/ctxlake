@@ -206,55 +206,66 @@ def check_lease_bootstrap_honesty() -> None:
 # stay documented.
 # ---------------------------------------------------------------------------
 
-FALSE_VERIFICATION_PHRASES = {
-    "claude-code.md": [
-        "every row in this doc is verified against a real install",
-        "this is the reference implementation",
-    ],
-    "hermes.md": [
-        "implemented and verified",
-        "verified against a live install",
-        "capture-complete\" is a real, verified claim",
-    ],
-}
-
-REQUIRED_HONESTY_PHRASES = {
-    "claude-code.md": ["not yet implemented", "crates/ctxlake-hook/src/main.rs"],
-    "hermes.md": ["not yet implemented", "crates/ctxlake-hook/src/main.rs"],
-}
-
 
 def check_runtime_verification_honesty() -> None:
-    # Guard the premise itself: if ctxlake-hook ever stops being a stub, this
-    # whole finding is moot and these docs may legitimately claim
-    # verification again — fail loudly rather than silently going stale.
+    """Each runtime page must state the basis for its claims, and that basis differs.
+
+    This check was originally written when ctxlake-hook was a stub and every runtime
+    page overclaimed. The hook is implemented now, so the failure mode inverted: the
+    pages must no longer say "not yet implemented", and must instead be specific about
+    HOW each runtime was verified, because the three were verified very differently:
+
+      claude-code  adapter implemented; fixtures written from the documented field
+                   list, not captured from a live run
+      cursor       adapter implemented, but a live capture proved four fields wrong;
+                   the page must disclose that until the adapter is corrected
+      hermes       capabilities read from Hermes's own source; the adapter exists but
+                   uses the Python-plugin mechanism rather than shell hooks
+
+    Conflating those is the dishonesty worth guarding against now.
+    """
     hook_path = ROOT / "crates" / "ctxlake-hook" / "src" / "main.rs"
     hook_src = hook_path.read_text(encoding="utf-8")
-    if "not yet implemented" not in hook_src:
-        fail(
-            "crates/ctxlake-hook/src/main.rs no longer says 'not yet "
-            "implemented' — the runtime docs' honesty caveats in "
-            "docs/runtimes/ were written assuming it's still a scaffold; "
-            "re-review whether they can now claim real verification"
-        )
+    is_stub = "not yet implemented" in hook_src
 
-    for name, phrases in FALSE_VERIFICATION_PHRASES.items():
-        text = norm(read(f"runtimes/{name}")).lower()
-        for phrase in phrases:
-            if norm(phrase).lower() in text:
-                fail(
-                    f"runtimes/{name}: contains the overclaim {phrase!r} — "
-                    f"nothing in {hook_path.relative_to(ROOT)} or "
-                    f"adapters/ is implemented yet (finding 2)"
-                )
-    for name, phrases in REQUIRED_HONESTY_PHRASES.items():
+    for name in ("claude-code.md", "cursor.md", "hermes.md"):
         text = read(f"runtimes/{name}")
-        for phrase in phrases:
-            if phrase not in text:
-                fail(
-                    f"runtimes/{name}: missing the honest not-yet-"
-                    f"implemented status pointing at {phrase!r}"
-                )
+        low = norm(text).lower()
+
+        if is_stub:
+            # Back to a scaffold: every page must say so again.
+            if "not yet implemented" not in text:
+                fail(f"runtimes/{name}: hook is a stub again but the page does not say so")
+            continue
+
+        # The hook is implemented, so a stale scaffold caveat is now the wrong claim.
+        if "status: not yet implemented" in low:
+            fail(
+                f"runtimes/{name}: still carries a 'not yet implemented' status, but "
+                f"{hook_path.relative_to(ROOT)} is implemented — the caveat is now the "
+                f"inaccurate statement"
+            )
+
+        # Every page must name its verification basis explicitly.
+        if "verification basis" not in low:
+            fail(
+                f"runtimes/{name}: missing an explicit 'Verification basis' line. The "
+                f"three runtimes were verified by different means and the page has to "
+                f"say which applies to it."
+            )
+
+    # Cursor's known-wrong fields must stay disclosed while they are still wrong.
+    cursor_rs = ROOT / "crates" / "ctxlake-hook" / "src" / "adapters" / "cursor.rs"
+    if cursor_rs.exists():
+        src = cursor_rs.read_text(encoding="utf-8")
+        corrected = "workspace_roots" in src and "exitCode" in src
+        disclosed = "workspace_roots" in read("runtimes/cursor.md")
+        if not corrected and not disclosed:
+            fail(
+                "runtimes/cursor.md: the adapter still reads neither workspace_roots nor "
+                "tool_output.exitCode, so Cursor events carry no cwd and no exit code. "
+                "Until the adapter is fixed the page must disclose that."
+            )
 
 
 def main() -> int:

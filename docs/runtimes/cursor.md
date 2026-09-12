@@ -1,5 +1,11 @@
 # Cursor — hooks.json v1, event mapping, import fidelity
 
+> **Verification basis:** the adapter is implemented, and payloads were **captured from a
+> real `cursor-agent` run** (see `crates/ctxlake-hook/tests/fixtures/cursor-verified/`).
+> That capture proved four of the originally inferred fields wrong, and **the adapter has
+> not yet been corrected** — so Cursor capture is currently incomplete in specific, known
+> ways. They are listed under "Known gaps" below rather than left for you to discover.
+
 Cursor Agent CLI is near-parity with Claude Code: capture, injection, blocking, and MCP
 are all supported through the same shape of mechanism. "Near," not "full," because two
 things genuinely differ — session-boundary detection and import fidelity — and both
@@ -96,6 +102,29 @@ The practical effect: backfilled Cursor history in `sessions/` has real prompts 
 real timing, but no reconstructed tool-call detail. Live capture going forward, through
 the hook mapping above, has no such gap — this limitation is specific to backfilling
 history that already existed before `ctxlake install` ran.
+
+## Known gaps
+
+A live `cursor-agent` capture (fixtures in
+`crates/ctxlake-hook/tests/fixtures/cursor-verified/`) showed the adapter reading four
+fields that Cursor does not send in the shape assumed. Until it is corrected, Cursor
+capture is lossy in these specific ways:
+
+| What the adapter reads | What Cursor actually sends | Consequence today |
+|---|---|---|
+| `cwd` | present but often **empty**; the real path is `workspace_roots[0]` | Cursor events land with no working directory, so no repo attribution |
+| `tool_output` as a string | an object: `{"output": "...", "exitCode": N}` | the whole object is stringified into the result field |
+| `duration_ms` | `duration`, a float in milliseconds | duration is always absent |
+| — (no exit-code source) | nested at `tool_output.exitCode` | **every Cursor tool call records no exit code** |
+
+The last row is the one that matters. Friction detection — "abandoned after 4 failed
+`cargo test` runs" — is built entirely on exit codes, so it currently works on Claude Code
+and is silently blind on Cursor. That asymmetry is exactly the kind of thing a capability
+table would otherwise hide behind a row of ticks.
+
+One further field is deliberately dropped rather than mapped: **every Cursor payload
+carries `user_email`**. Stored verbatim it would publish each operator's address to
+everyone else in the fleet. The envelope has no field for it and should not gain one.
 
 ## Next steps
 

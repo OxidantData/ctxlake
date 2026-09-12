@@ -1,5 +1,11 @@
 # Claude Code — hook mapping, injection, blocking, coexistence
 
+> **Verification basis:** the adapter is implemented and covered by golden fixtures for
+> every event. Those fixtures were written from Claude Code's documented hook field list,
+> not captured from a live session — so the mapping is tested for self-consistency, not
+> against observed payloads. Claude Code remains the most thoroughly specified of the
+> three, and is the one whose documented contract we have leaned on hardest.
+
 Claude Code is the reference runtime: every other runtime's doc measures itself against
 this one. **Nothing below is implemented yet** — `ctxlake-hook` is still the Wave 1
 scaffold (`crates/ctxlake-hook/src/main.rs` prints "not yet implemented" and exits 0) —

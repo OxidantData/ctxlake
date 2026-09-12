@@ -1,0 +1,23 @@
+{
+  "conversation_id": "7bb420db-3307-42db-bdbf-f6737b7394c8",
+  "cursor_version": "2026.08.25-3e8eec8",
+  "cwd": "",
+  "duration": 1089.021,
+  "generation_id": "7bb420db-3307-42db-bdbf-f6737b7394c8",
+  "hook_event_name": "postToolUse",
+  "model": "default",
+  "session_id": "7bb420db-3307-42db-bdbf-f6737b7394c8",
+  "tool_input": {
+    "command": "wc -l data.txt",
+    "cwd": "",
+    "timeout": 30000
+  },
+  "tool_name": "Shell",
+  "tool_output": "{\"output\":\"       2 data.txt\\n\",\"exitCode\":0}",
+  "tool_use_id": "c4742e0d-d9a8-4704-90d9-50e85ba45def",
+  "transcript_path": "/home/alice/.cursor/projects/private-tmp-claude-501-Users-vamsi-projects-oxidandata-31ace0a6-1ce6-4039-8ec4-9d18d645c4d8-scratchpad-cursor-probe/agent-transcripts/7bb420db-3307-42db-bdbf-f6737b7394c8/7bb420db-3307-42db-bdbf-f6737b7394c8.jsonl",
+  "user_email": "operator@example.com",
+  "workspace_roots": [
+    "/tmp/-Users-vamsi-projects-oxidandata/31ace0a6-1ce6-4039-8ec4-9d18d645c4d8/scratchpad/cursor-probe"
+  ]
+}

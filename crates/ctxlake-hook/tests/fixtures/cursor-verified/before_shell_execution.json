@@ -1,0 +1,16 @@
+{
+  "command": "wc -l data.txt",
+  "conversation_id": "7bb420db-3307-42db-bdbf-f6737b7394c8",
+  "cursor_version": "2026.08.25-3e8eec8",
+  "cwd": "",
+  "generation_id": "7bb420db-3307-42db-bdbf-f6737b7394c8",
+  "hook_event_name": "beforeShellExecution",
+  "model": "default",
+  "sandbox": false,
+  "session_id": "7bb420db-3307-42db-bdbf-f6737b7394c8",
+  "transcript_path": "/home/alice/.cursor/projects/private-tmp-claude-501-Users-vamsi-projects-oxidandata-31ace0a6-1ce6-4039-8ec4-9d18d645c4d8-scratchpad-cursor-probe/agent-transcripts/7bb420db-3307-42db-bdbf-f6737b7394c8/7bb420db-3307-42db-bdbf-f6737b7394c8.jsonl",
+  "user_email": "operator@example.com",
+  "workspace_roots": [
+    "/tmp/-Users-vamsi-projects-oxidandata/31ace0a6-1ce6-4039-8ec4-9d18d645c4d8/scratchpad/cursor-probe"
+  ]
+}

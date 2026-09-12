@@ -77,7 +77,7 @@ export default withMermaid(
     nav: [
       { text: 'Get started', link: '/getting-started' },
       { text: 'Architecture', link: '/architecture' },
-      { text: 'Scaling', link: '/scaling' },
+      { text: 'Reference', link: '/reference' },
       { text: 'Oxidant', link: 'https://oxidantdata.com' },
     ],
 
@@ -86,44 +86,24 @@ export default withMermaid(
         text: 'Start here',
         items: [
           { text: 'Getting started', link: '/getting-started' },
-          { text: 'Adopting it', link: '/adopting' },
-          { text: 'Importing history', link: '/import' },
-          { text: 'Concepts', link: '/concepts' },
+          { text: 'How it works', link: '/how-it-works' },
+          { text: 'Adding it', link: '/adding-it' },
         ],
       },
       {
         text: 'Using it',
         items: [
-          { text: 'Coordination', link: '/coordination' },
-          { text: 'Summarization', link: '/summarization' },
           { text: 'Memory', link: '/memory' },
-          { text: 'MCP tools', link: '/mcp' },
-        ],
-      },
-      {
-        text: 'Runtimes',
-        items: [
-          { text: 'Claude Code', link: '/runtimes/claude-code' },
-          { text: 'Cursor', link: '/runtimes/cursor' },
-          { text: 'Hermes', link: '/runtimes/hermes' },
-        ],
-      },
-      {
-        text: 'Operating it',
-        items: [
-          { text: 'Storage backends', link: '/storage' },
-          { text: 'Bucket layout', link: '/layout' },
-          { text: 'Scaling limits', link: '/scaling' },
-          { text: 'Security', link: '/security' },
-          { text: 'Troubleshooting', link: '/troubleshooting' },
+          { text: 'Runtimes', link: '/runtimes' },
+          { text: 'Storage', link: '/storage' },
         ],
       },
       {
         text: 'Reference',
         items: [
-          { text: 'CLI', link: '/cli' },
-          { text: 'Configuration', link: '/config' },
+          { text: 'Reference', link: '/reference' },
           { text: 'Architecture', link: '/architecture' },
+          { text: 'Security', link: '/security' },
         ],
       },
     ],

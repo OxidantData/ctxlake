@@ -23,6 +23,14 @@ from pathlib import Path
 DOCS = Path(__file__).resolve().parent.parent
 ROOT = DOCS.parent
 
+# The pages these checks guard were consolidated: docs/scaling.md folded into
+# docs/storage.md, and docs/runtimes/{claude-code,cursor,hermes}.md into one
+# docs/runtimes.md with a `## <runtime>` section each. Only the addressing below
+# moved — every assertion further down is unchanged and still made per runtime.
+SCALING_PAGE = "storage.md"
+RUNTIMES_PAGE = "runtimes.md"
+RUNTIME_SECTIONS = ("Claude Code", "Cursor", "Hermes")
+
 failures: list[str] = []
 
 
@@ -44,8 +52,28 @@ def money(s: str) -> float:
     return float(s.replace("$", "").replace(",", ""))
 
 
+def runtime_section(heading: str) -> str:
+    """Slice one runtime's `## <heading>` section out of the merged runtimes page.
+
+    Each runtime used to own a file; they now own a section. This exists purely so the
+    per-runtime assertions below keep being made per runtime rather than against the
+    whole page, where one runtime's honest wording could satisfy a check for another's.
+    """
+    text = read(RUNTIMES_PAGE)
+    match = re.search(
+        rf"^## {re.escape(heading)}\s*$(.*?)(?=^## |\Z)", text, re.M | re.S
+    )
+    if match is None:
+        fail(
+            f"{RUNTIMES_PAGE}: no '## {heading}' section — page shape changed, "
+            f"update this check"
+        )
+        return ""
+    return match.group(1)
+
+
 # ---------------------------------------------------------------------------
-# Findings 3 & 4: docs/scaling.md's O(N^2) vs fan-in cost tables.
+# Findings 3 & 4: the O(N^2) vs fan-in cost tables (now in docs/storage.md).
 #
 # The review's complaint was precise: the printed totals didn't equal the sum
 # of their own displayed addends (finding 3), and the fan-in formula silently
@@ -76,7 +104,7 @@ def fanin_cost(n: int) -> float:
 
 
 def check_scaling_arithmetic() -> None:
-    scaling = read("scaling.md")
+    scaling = read(SCALING_PAGE)
 
     naive_row = re.compile(
         r"\|\s*(\d+) agents\s*\|[^|]*\|[^|]*\|\s*"
@@ -85,7 +113,7 @@ def check_scaling_arithmetic() -> None:
     naive_rows = naive_row.findall(scaling)
     if len(naive_rows) != 3:
         fail(
-            f"scaling.md: expected 3 naive-discovery table rows, found "
+            f"{SCALING_PAGE}: expected 3 naive-discovery table rows, found "
             f"{len(naive_rows)} — table shape changed, update this check"
         )
     for n_str, a, b, total_str in naive_rows:
@@ -102,13 +130,13 @@ def check_scaling_arithmetic() -> None:
         # rounding artifact, not the finding-3 defect, which was 3-35x larger.
         if abs(printed_total - round(addend_sum, 2)) > 0.015:
             fail(
-                f"scaling.md naive row N={n}: printed total ${printed_total} "
+                f"{SCALING_PAGE} naive row N={n}: printed total ${printed_total} "
                 f"!= sum of its own addends ${a} + ${b} = ${addend_sum:.2f} "
                 f"(this is exactly the finding-3 defect)"
             )
         if abs(printed_total - round(recomputed, 2)) > 0.005:
             fail(
-                f"scaling.md naive row N={n}: printed total ${printed_total} "
+                f"{SCALING_PAGE} naive row N={n}: printed total ${printed_total} "
                 f"!= independently recomputed ${recomputed:.4f} from "
                 f"{CYCLES_PER_DAY} cycles/day at the page's own prices"
             )
@@ -120,7 +148,7 @@ def check_scaling_arithmetic() -> None:
     fanin_rows = fanin_row.findall(scaling)
     if len(fanin_rows) != 3:
         fail(
-            f"scaling.md: expected 3 fan-in table rows, found "
+            f"{SCALING_PAGE}: expected 3 fan-in table rows, found "
             f"{len(fanin_rows)} — table shape changed, update this check"
         )
     for n_str, total_str in fanin_rows:
@@ -131,7 +159,7 @@ def check_scaling_arithmetic() -> None:
         # snapshot PUT entirely, undercounting cost by up to 55%.
         if abs(printed_total - round(recomputed, 2)) > 0.005:
             fail(
-                f"scaling.md fan-in row N={n}: printed total ${printed_total} "
+                f"{SCALING_PAGE} fan-in row N={n}: printed total ${printed_total} "
                 f"!= independently recomputed ${recomputed:.4f}, which "
                 f"includes the once-per-cycle merged-snapshot PUT the prose "
                 f"says happens (this is exactly the finding-4 defect if the "
@@ -144,13 +172,13 @@ def check_scaling_arithmetic() -> None:
         r"\*\*(~?)(\d+)x cheaper at 50 agents\*\*", scaling
     )
     if not multiplier_match:
-        fail("scaling.md: could not find the 'Nx cheaper at 50 agents' claim")
+        fail(f"{SCALING_PAGE}: could not find the 'Nx cheaper at 50 agents' claim")
     else:
         claimed = int(multiplier_match.group(2))
         true_ratio = naive_cost(50) / fanin_cost(50)
         if abs(claimed - true_ratio) > 2:
             fail(
-                f"scaling.md: claims {claimed}x cheaper at 50 agents, but "
+                f"{SCALING_PAGE}: claims {claimed}x cheaper at 50 agents, but "
                 f"naive/fan-in from this page's own numbers is "
                 f"{true_ratio:.2f}x"
             )
@@ -165,7 +193,7 @@ def check_scaling_arithmetic() -> None:
 # by content already (compaction's gen=<hash> directories, extraction's
 # create-if-absent claim marker, the snapshot's content-addressed publish),
 # so nothing needed a lock and there is no bootstrap story left to guard.
-# See docs/coordination.md.
+# See docs/how-it-works.md.
 # ---------------------------------------------------------------------------
 
 
@@ -179,7 +207,7 @@ def check_scaling_arithmetic() -> None:
 
 
 def check_runtime_verification_honesty() -> None:
-    """Each runtime page must state the basis for its claims, and that basis differs.
+    """Each runtime section must state the basis for its claims, and that basis differs.
 
     This check was originally written when ctxlake-hook was a stub and every runtime
     page overclaimed. The hook is implemented now, so the failure mode inverted: the
@@ -199,20 +227,20 @@ def check_runtime_verification_honesty() -> None:
     hook_src = hook_path.read_text(encoding="utf-8")
     is_stub = "not yet implemented" in hook_src
 
-    for name in ("claude-code.md", "cursor.md", "hermes.md"):
-        text = read(f"runtimes/{name}")
+    for name in RUNTIME_SECTIONS:
+        text = runtime_section(name)
         low = norm(text).lower()
 
         if is_stub:
             # Back to a scaffold: every page must say so again.
             if "not yet implemented" not in text:
-                fail(f"runtimes/{name}: hook is a stub again but the page does not say so")
+                fail(f"{RUNTIMES_PAGE} § {name}: hook is a stub again but the page does not say so")
             continue
 
         # The hook is implemented, so a stale scaffold caveat is now the wrong claim.
         if "status: not yet implemented" in low:
             fail(
-                f"runtimes/{name}: still carries a 'not yet implemented' status, but "
+                f"{RUNTIMES_PAGE} § {name}: still carries a 'not yet implemented' status, but "
                 f"{hook_path.relative_to(ROOT)} is implemented — the caveat is now the "
                 f"inaccurate statement"
             )
@@ -220,9 +248,9 @@ def check_runtime_verification_honesty() -> None:
         # Every page must name its verification basis explicitly.
         if "verification basis" not in low:
             fail(
-                f"runtimes/{name}: missing an explicit 'Verification basis' line. The "
-                f"three runtimes were verified by different means and the page has to "
-                f"say which applies to it."
+                f"{RUNTIMES_PAGE} § {name}: missing an explicit 'Verification basis' line. The "
+                f"three runtimes were verified by different means and the section has "
+                f"to say which applies to it."
             )
 
     # Cursor's known-wrong fields must stay disclosed while they are still wrong.
@@ -230,12 +258,12 @@ def check_runtime_verification_honesty() -> None:
     if cursor_rs.exists():
         src = cursor_rs.read_text(encoding="utf-8")
         corrected = "workspace_roots" in src and "exitCode" in src
-        disclosed = "workspace_roots" in read("runtimes/cursor.md")
+        disclosed = "workspace_roots" in runtime_section("Cursor")
         if not corrected and not disclosed:
             fail(
-                "runtimes/cursor.md: the adapter still reads neither workspace_roots nor "
+                f"{RUNTIMES_PAGE} § Cursor: the adapter still reads neither workspace_roots nor "
                 "tool_output.exitCode, so Cursor events carry no cwd and no exit code. "
-                "Until the adapter is fixed the page must disclose that."
+                "Until the adapter is fixed the section must disclose that."
             )
 
 

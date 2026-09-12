@@ -1,17 +1,77 @@
-# Memory — the claim model
+# Memory — from a finished session to something the fleet believes
 
-The episodic layer records what happened. The memory layer records what is *believed*,
-and those two have completely different risk profiles. A transcript is an immutable fact;
-a belief is an inference that can be wrong, can be shared, and can quietly become a
-fleet-wide consensus that contains no information.
+Three tiers turn a sealed session into something the next agent can use. **The default
+needs no LLM API key.** Only the third tier does, and it is optional.
 
-This page is the claim model. For the pipeline that produces claims, see
-[summarization.md](summarization.md).
+| Tier | What it produces | Needs a model? | On by default? |
+|---|---|---|---|
+| **0 — structural digest** | files touched, commands and exit codes, tests, commits, duration, cost, friction signals | No | Yes |
+| **1 — agent self-handoff** | a note attached to its own session. **Not a belief.** | No — the agent that did the work writes it, cache-warm, on a key you already pay for | Yes |
+| **2 — batch extraction** | candidate claims → four gates → promoted → snapshot → briefing | Yes | No |
 
-> **Almost all the value is episodic and almost all the danger is semantic.** Session
-> history, briefings, and handoffs cannot mislead a fleet — they are derived mechanically.
-> Everything on this page can. That asymmetry is why the belief layer is off by default
-> and why `mode = "shadow"` exists.
+Tier 0 is pure arithmetic over captured events, so it cannot hallucinate. A line like
+*"abandoned after 4 failed `cargo test -p oxidant-connect` runs"* is often the most useful
+in a briefing, costs nothing, and is never wrong. `ctxlake maint` writes one `digest.json`
+per sealed session, reading `tool.exit_code` regardless of which runtime produced it.
+
+> **Tier 1 produces notes, not beliefs.** An agent summarizing its own session is
+> self-reporting. A handoff is *episodic* — "here is what I did and what failed" —
+> attached to its session and attributed to it. It never enters the belief layer. At turn
+> end a hook returns a one-time nudge and the agent calls `fleet_handoff`; Claude Code
+> uses `Stop`, Cursor `stop`, Hermes `on_session_end`. **This nudge is not wired yet**,
+> so `tier 1 nudges fired: 0` is expected today.
+
+> **Almost all the value is episodic and almost all the danger is semantic.** History,
+> briefings and handoffs are derived mechanically and cannot mislead a fleet. Everything
+> below can. That asymmetry is why the belief layer is off by default.
+
+## Turning on Tier 2
+
+`ctxlake maint --once` compacts, digests and snapshots for free. For Tier 2, point it at
+a model in `ctxlake.toml` ([full reference](reference.md#summarize)):
+
+```toml
+[summarize]
+mode = "shadow"              # keep this for now
+
+[summarize.batch]
+provider    = "anthropic"    # or "openai-compatible", or "ollama" for fully local
+model       = "claude-haiku-4-5"
+api_key_env = "ANTHROPIC_API_KEY"   # the NAME of an env var, never the key
+```
+
+```sh
+export ANTHROPIC_API_KEY=...
+ctxlake doctor                                # reports whether the name resolves. Never its value.
+ctxlake maint --once                          # now also extracts and runs the gates
+ctxlake claims --status candidate --explain   # what was extracted, which gate rejected what
+ctxlake claims --status contested             # where claims disagree with each other
+```
+
+`mode = "shadow"` runs the whole chain with agent reads disabled: claims accumulate,
+gate reports accumulate, nothing reaches a context window. Give it a couple of weeks of
+real sessions and answer one question — *would I want an agent to act on this?*
+
+> **Sit in shadow mode longer than feels necessary.** It needs your sessions, your repos
+> and your judgment; no amount of documentation substitutes. Everything a wrong claim
+> costs is paid later and by someone else, in a context window, as a confident assertion
+> with no sign it was ever in doubt.
+
+Then `mode = "live"`. Reverting is the same line.
+
+## Extraction costs
+
+Roughly 8K input and 500 output tokens per session. Batch pricing is half of live, and
+the schema prefix is byte-identical across sessions so prompt caching bills it once.
+
+| Fleet | Live requests | Batched |
+|---|---:|---:|
+| 40 sessions/day | ~$0.42/day | **~$0.21/day** |
+| 400 sessions/day (50 agents) | ~$4.20/day | **~$2.10/day** |
+
+The largest line item in the system, and the only one that scales with session count
+rather than storage — which is why it is the tier you can switch off. Under
+`mode = "none"` you lose the belief layer and nothing else.
 
 ## What a claim is
 
@@ -28,20 +88,16 @@ An atomic proposition with evidence attached.
 | `evidence_count` | How many sessions support it |
 | `independent_count` | How many of those did **not** read a related prior claim |
 | `status` | `candidate` / `promoted` / `contested` / `retired` |
-| `confidence` | Derived, not self-reported — see calibration below |
+| `confidence` | Derived, never self-reported |
 
 > **No evidence, no claim.** An extraction that cannot cite a specific
-> `(session_id, message_id)` is dropped, not stored with low confidence. This single rule
-> removes most hallucinated memory, because a model that invents a belief usually cannot
-> invent a citation that resolves.
+> `(session_id, message_id)` is dropped, not stored with low confidence. A model that
+> invents a belief usually cannot invent a citation that resolves.
 
-Claims are stored as an append-only event log, not as mutable rows — `proposed`,
-`promoted`, `contested`, `retired` are all appends, and current state is the fold. See
-[layout.md](layout.md) and [concepts.md](concepts.md).
+Claims are an append-only event log — `proposed`, `promoted`, `contested` and `retired`
+are all appends, and current state is the fold.
 
-## Claim types drive policy
-
-The type is not a label; it decides how a claim gets promoted and how long it lives.
+### The type decides the policy
 
 | Type | Example | Promotion | TTL |
 |---|---|---|---|
@@ -51,12 +107,97 @@ The type is not a label; it decides how a claim gets promoted and how long it li
 | `preference` | "prefers terse output" | human approval | 365d |
 | `hypothesis` | "the flake is a colima scheduling artifact" | **never auto-promotes beyond agent scope** | 14d |
 
-That last row is the one that protects a fleet. A hypothesis is an agent's opinion.
-Promoting opinions into shared memory is how you turn several independent signals into
-one correlated signal without noticing — and the fleet then looks more confident than it
-has any right to be.
+A hypothesis is an agent's opinion. Promoting opinions into shared memory turns several
+independent signals into one correlated one, and the fleet then looks more confident than
+it has any right to be.
 
-## Scopes, and which direction they flow
+## Promotion: four gates, in order
+
+<svg viewBox="0 0 720 212" role="img" aria-label="An extracted candidate claim passes four gates in order — evidence, contradiction, provenance, independence — before it is promoted and reaches a briefing. Failing any gate sends the claim to a contested queue for a human instead of dropping it. In shadow mode the final step to the briefing is cut." style="width:100%;height:auto">
+  <defs>
+    <marker id="mg" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="var(--oxidant-text-muted)"/>
+    </marker>
+    <style>
+      .b { fill: var(--oxidant-surface); stroke: var(--oxidant-border-strong); stroke-width: 1; rx: 6 }
+      .t { fill: var(--oxidant-text); font: 500 12px var(--oxidant-font-ui) }
+      .s { fill: var(--oxidant-text-muted); font: 400 10px var(--oxidant-font-ui) }
+      .l { stroke: var(--oxidant-text-muted); stroke-width: 1.25; fill: none; marker-end: url(#mg) }
+      .dash { stroke-dasharray: 4 3 }
+    </style>
+  </defs>
+
+  <text x="8" y="34" class="s">TIER 2 PROPOSES</text>
+  <text x="132" y="34" class="s">FOUR GATES, IN ORDER</text>
+  <text x="608" y="34" class="s">AGENT-VISIBLE</text>
+
+  <rect class="b" x="8" y="48" width="100" height="48"/>
+  <text x="20" y="70" class="t">candidate</text>
+  <text x="20" y="86" class="s">with citations</text>
+
+  <rect class="b" x="132" y="48" width="102" height="48"/>
+  <text x="144" y="70" class="t">evidence</text>
+  <text x="144" y="86" class="s">by type</text>
+
+  <rect class="b" x="250" y="48" width="102" height="48"/>
+  <text x="262" y="70" class="t">contradiction</text>
+  <text x="262" y="86" class="s">same subject</text>
+
+  <rect class="b" x="368" y="48" width="102" height="48"/>
+  <text x="380" y="70" class="t">provenance</text>
+  <text x="380" y="86" class="s">hashes resolve</text>
+
+  <rect class="b" x="486" y="48" width="102" height="48"/>
+  <text x="498" y="70" class="t">independence</text>
+  <text x="498" y="86" class="s">unexposed only</text>
+
+  <rect class="b" x="608" y="48" width="104" height="48"/>
+  <text x="620" y="70" class="t">promoted</text>
+  <text x="620" y="86" class="s">attributed</text>
+
+  <path class="l" d="M108 72 H128"/>
+  <path class="l" d="M234 72 H246"/>
+  <path class="l" d="M352 72 H364"/>
+  <path class="l" d="M470 72 H482"/>
+  <path class="l" d="M588 72 H604"/>
+
+  <path class="l" d="M183 96 V134"/>
+  <path class="l" d="M301 96 V134"/>
+  <path class="l" d="M419 96 V134"/>
+  <path class="l" d="M537 96 V134"/>
+
+  <rect class="b" x="132" y="138" width="470" height="44"/>
+  <text x="144" y="160" class="t">contested — a human decides</text>
+  <text x="144" y="176" class="s">both sides move here; newest never wins; nothing is silently dropped</text>
+
+  <path class="l dash" d="M660 96 V134"/>
+  <rect class="b" x="608" y="138" width="104" height="44"/>
+  <text x="620" y="160" class="t">briefing</text>
+  <text x="620" y="176" class="s">shadow cuts this</text>
+</svg>
+
+1. **Evidence** — meets the threshold for its type, per the table above.
+2. **Contradiction** — vector and lexical search against promoted claims on the same
+   subject. A conflict sends *both* claims to `contested`. Newest-wins is tempting and
+   wrong: the newer claim is not better evidence, it is just later, and silent overwrite
+   is how a fleet gaslights itself.
+3. **Provenance** — the observing agent is real, the timestamp falls inside the session
+   window, and the cited excerpt hashes resolve.
+4. **Independence** — the gate that matters most. If agent B had agent A's claim injected
+   into its session and then asserts something derived from it, that is **one observation
+   with two reporters**. So `independent_count` is the supporting sessions minus those
+   that had a related claim injected into them, and thresholds read it, never
+   `evidence_count`.
+
+> **Read-lineage cannot be retrofitted.** By the time you want to know whether a consensus
+> was independent, the sessions are gone. `injected_context` is captured on every envelope
+> from the first commit, before anything reads it.
+
+**Context fencing** is the other half: injected claims are wrapped in a delimiter and
+extraction strips those spans, so an agent cannot rediscover what it was just told and
+file it as a fresh observation.
+
+## Scopes flow one way
 
 ```text
 agent scope   →   repo scope   →   fleet scope
@@ -64,56 +205,13 @@ agent scope   →   repo scope   →   fleet scope
                    project does)    believe)
 ```
 
-- **Writes go to agent scope only.** Nothing writes to repo or fleet scope except the
-  promotion gate.
-- **Reads walk up the chain**, and the scope is labelled in what the agent sees.
-- `ctxlake` has no API that writes a promoted claim. Agents call `memory_propose`; there
-  is deliberately no `memory_write`.
-
-## Independence: the gate that matters most
-
-Two agents agreeing looks like corroboration. It usually is not.
-
-If agent B's session had agent A's claim injected into it, and B then asserts something
-derived from it, that is **one observation with two reporters**. Counting it as two is how
-a fleet talks itself into confidence.
-
-So every envelope records which claims were injected into that session
-(`injected_context`), and promotion counts only the evidence sessions that did *not*
-already read a related claim:
-
-```text
-independent_count = sessions supporting the claim
-                  − sessions that had a related claim injected into them
-```
-
-Thresholds read `independent_count`, never `evidence_count`.
-
-> **Read-lineage cannot be retrofitted.** By the time you want to know whether a
-> consensus was independent, the sessions are gone. This is why `injected_context` is
-> captured from the first commit, before anything reads it.
-
-**Context fencing** is the other half: injected claims are wrapped in a delimiter, and
-extraction strips those spans before it runs. Without it an agent rediscovers what it was
-just told and files it as a fresh observation — the same echo, one step earlier.
-
-## Contradiction: both sides contest, newest never wins
-
-When a candidate conflicts with a promoted claim on the same subject, **both** move to
-`contested` and a human resolves it.
-
-Newest-wins is tempting and wrong. The newer claim is not better evidence — it is just
-later. Silently overwriting is how a fleet gaslights itself: the old belief disappears
-with no record that anything disagreed.
-
-```sh
-ctxlake claims --status contested
-```
+Writes go to agent scope only; nothing writes repo or fleet scope except the promotion
+gate. Reads walk up the chain, labelled with their scope. Agents call `memory_propose`;
+there is deliberately no `memory_write`.
 
 ## Attribution on read — never flatten
 
-Retrieval is only half of it; rendering is the rest. A peer's belief must never reach a
-context window as bare fact:
+A peer's belief must never reach a context window as bare fact:
 
 ```text
 ## Fleet context (peer observations — verify before relying on these)
@@ -128,101 +226,63 @@ context window as bare fact:
 An agent reading *"1 session, contested"* behaves differently from one reading a bare
 assertion. That difference is the entire safety margin, and it costs a few tokens.
 
-## Quarantine: the kill switch
+## Quarantine — the kill switch
 
-One flag per agent, reversible, auditable, one line: its claims stop promoting, its
-already-promoted claims move to `contested`, and **its capture continues** — you want the
-record of the failure, not a gap where it used to be.
+```sh
+ctxlake quarantine <agent_id>
+```
 
-The signal to reach for it: a rising contradiction rate from one agent usually means its
-extraction has drifted — the early warning that lets you act before the pool is polluted
-rather than after.
+One agent's claims stop promoting, its already-promoted claims move to `contested`, and
+**its capture continues** — you want the record of the failure, not a gap where it used to
+be. Reach for it when one agent's contradiction rate rises, which usually means its
+extraction has drifted. The gate re-checks quarantine ahead of the four gates on every
+run; un-quarantining restores the *ability* to promote, while already-demoted claims stay
+`contested` for a human.
 
-The gate's own quarantine log checks every candidate *before* the four gates (a
-quarantined agent's candidate never reaches the evidence check) and demotes that agent's
-already-promoted claims to `contested` on every run, not just once. Un-quarantining
-restores the *ability* to promote again — a claim already demoted stays `contested` for a
-human to review, like any other contradiction.
-
-> **Known gap: `ctxlake quarantine <agent_id>`, the CLI command, does not reach the gate's
-> quarantine log yet.** It writes a marker and edits the local fleet cache mirror, which
-> the gate never consults — so today there is no command-line entry point to the kill
-> switch that actually stops promotion. Treat the CLI command and the real mechanism as
-> separate until this is wired up.
+> **Known gap: the `ctxlake quarantine` command does not reach the gate's quarantine log
+> yet.** It writes a marker and edits the local cache mirror, which the gate never
+> consults — so there is no command-line entry point to the kill switch that actually
+> stops promotion. Treat the CLI command and the real mechanism as separate until this is
+> wired up.
 
 ## Confidence is derived, not claimed
 
-A model asserting "confidence 0.9" is asserting nothing checkable. So confidence comes
-from track record instead:
-
-1. An agent emits a prediction; extraction files it as a `hypothesis` with a resolution
-   date.
-2. Reality arrives as an `outcome` claim — from CI, from a benchmark, from a deploy.
-3. A resolver joins hypothesis to outcome and scores it.
-4. Future claims from that agent are discounted or trusted accordingly.
-
-This only works because provenance and independence were kept from the start. It is the
-payoff that justifies the discipline on the rest of this page.
-
-The resolver joins each hypothesis to the earliest matching, already-promoted `outcome`
-claim observed by a *different* agent — requiring a different observer closes off an
-agent manufacturing its own track record (propose a hypothesis, then an agreeing
-"outcome" under its own identity). A hypothesis whose resolution date passes with no
-matching outcome is `Expired`, deliberately **not** the same as `Incorrect`: an
-unanswered question must never lower a score the way a wrong answer does.
-
-An agent's score is blended with a neutral prior weighted by a fixed pseudo-count
-(Bayesian shrinkage), so three resolved predictions — even three-for-three — cannot
-swing trust nearly as far as three hundred can; a `low_sample` flag marks the raw case
-explicitly so a "1.00" from three data points is never read as a "1.00" from three
-hundred.
-
-A newly-promoted claim's confidence is still a structural function of
-`independent_count`, scaled by the observing agent's trust multiplier — neutral for an
-agent with no resolved track record yet, above or below neutral for a proven-reliable
-or unreliable one. There is no self-reported confidence anywhere on a proposed claim —
-the schema carries no such field — so the only way an agent's assertions carry more or
-less weight is by earning it.
+A model asserting "confidence 0.9" is asserting nothing checkable, and the schema carries
+no self-reported confidence field. The designed source is track record: a `hypothesis`
+resolves against a later `outcome` claim, and the agent's future claims are discounted or
+trusted accordingly. Three rules keep that honest — the matching `outcome` must come from
+a **different** agent; an unanswered hypothesis is `Expired`, **not** `Incorrect`; and
+scores are blended with a neutral prior so three resolved predictions cannot swing trust
+as far as three hundred, with a `low_sample` flag marking the raw case.
 
 ## Known limitations
 
-- **Contradiction detection is a proxy, not semantics.** There is no NLI model here to
-  tell "confirms" from "contradicts" apart — the gate treats "same subject, high
-  similarity, different claim text" as a conflict worth a human's attention. That sends
-  some genuine corroboration to `contested` for a human to wave through; the trade is
-  intentional, against silently trusting two similar-but-different claims to agree.
-- **Confidence is a placeholder formula**, not the resolver described above. It climbs
-  with `independent_count` and is bounded. The hypothesis-to-outcome resolver that
-  would make confidence mean "this agent's track record" is future work.
-- **`memory_search`'s vector search runs over a stand-in embedding.** Nothing in this
-  codebase computes a real one yet, so every claim carries `embedding: None` and search
-  falls back to a deterministic, dependency-free lexical fingerprint. It is a lexical
-  proxy, not a semantic one.
-- **The hypothesis/outcome agreement check is a word-overlap heuristic**, not real
-  negation parsing. A refutation phrased without a recognized negation word or cue can
-  still misread as agreement; conversely, an outcome phrased very differently from a
-  hypothesis it actually confirms can misread as disagreement. The bias runs toward the
-  milder direction (unearned credit an agent can still lose later), not the dangerous
-  one (inflating a demonstrably wrong agent's trust).
-- **Extraction does not yet ask the model for a resolution date.** Every hypothesis
-  extraction today has no resolution date, so a hypothesis never expires on the
-  calendar — it can still resolve early the moment a matching outcome claim lands, but
-  the pool can otherwise accumulate stale, unresolved hypotheses.
+- **Contradiction detection is a proxy, not semantics.** No NLI model here; the gate
+  treats "same subject, high similarity, different text" as a conflict worth a human's
+  attention, so some genuine corroboration lands in `contested`.
+- **Confidence is a placeholder formula**, not the resolver above. It climbs with
+  `independent_count` and is bounded; the resolver is future work.
+- **`memory_search`'s vector search runs over a stand-in embedding.** Nothing here
+  computes a real one, so every claim carries `embedding: None` and search falls back to a
+  deterministic lexical fingerprint — a lexical proxy, not a semantic one.
+- **The hypothesis/outcome agreement check is word overlap**, not negation parsing. A
+  refutation phrased without a recognized cue can misread as agreement; the bias runs
+  toward unearned credit an agent can still lose, not toward inflating a wrong agent.
+- **Extraction does not yet ask the model for a resolution date**, so no hypothesis
+  expires on the calendar — it can still resolve early when a matching outcome lands, but
+  stale hypotheses otherwise accumulate.
 
-Watch all of the above in shadow mode, like any other proxy on this page, before
-trusting it.
+Watch all of it in shadow mode before trusting it.
 
 ## Anti-goals
 
-- Do not auto-promote hypotheses beyond agent scope. Ever.
-- Do not let newest-wins resolve a contradiction.
-- Do not extract from injected context.
-- Do not skip `injected_context` capture because it looks like overhead.
-- Do not put the lake on the inference path — if it is unreachable, agents run degraded,
-  not broken.
+Never auto-promote a hypothesis beyond agent scope. Never let newest-wins resolve a
+contradiction. Never extract from injected context, and never skip `injected_context`
+capture because it looks like overhead. Never put the lake on the inference path — if it
+is unreachable, agents run degraded, not broken.
 
 ## Next steps
 
-- [summarization.md](summarization.md) — how claims get produced, and the three tiers
-- [coordination.md](coordination.md) — the live layer, which has none of this risk
+- [reference.md](reference.md) — `[summarize]` keys, `ctxlake claims`, the MCP tools
+- [adding-it.md](adding-it.md) — seeding the belief layer from conventions you wrote
 - [security.md](security.md) — why anything read from the lake is untrusted input

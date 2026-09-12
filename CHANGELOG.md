@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.1.2
+
+Tier 2 actually works now, the daemon runs maintenance itself, and `ctxlake sync
+install` refuses a host that cannot do the job.
+
+### Tier 2 runs end to end
+
+`ctxlake maint` ran compact → digest → publish and stopped. `extract::run` and
+`gate::run` were complete, tested, and called by nothing, so configuring a model
+produced no claims and an empty `ctxlake claims` list was indistinguishable from
+"extraction found nothing worth claiming". The chain is now
+compact → digest → extract → gate → snapshot.
+
+Two properties that are easy to get wrong, each pinned by a test: the gate runs
+**even with no model configured** (claims also arrive from the `memory_propose`
+MCP tool), and it runs **before** the snapshot publish (reversing them leaves a
+just-promoted claim showing as `candidate` for a whole cycle).
+
+**New providers: OpenRouter and Gemini**, alongside Anthropic, OpenAI-compatible
+and Ollama. `provider = "openrouter" | "gemini"` in `[summarize.batch]`.
+
+Four bugs that each made extraction silently produce nothing, all found within
+minutes of the first live call against a real model and none of them visible to
+the test suite:
+
+- The transcript sent to the model contained **no tool calls** — on a real session
+  `content` holds the user's prompt and nothing else, so the model was shown the
+  question and never the work.
+- The transcript **never named the session**, while the schema demanded a
+  `session_id` per citation. The model supplied the only id-shaped string it could
+  see and every claim was dropped as unresolvable.
+- The OpenAI-compatible path sent **no `response_format`**, so the model wrapped
+  its JSON in a ```json fence and the parser rejected it.
+- A transient provider failure **discarded the session permanently**: the
+  extraction marker was written before the call and never released on failure.
+
+### Maintenance moved into the daemon
+
+Getting started used to tell you to point cron or a systemd timer at `ctxlake
+maint` — on a machine where `ctxlake sync install` had just set up a service.
+The daemon now runs the chain itself every 5 minutes. Cron is gone from the docs.
+
+A failed cycle logs and retries; a `[summarize.batch]` whose key cannot be
+resolved is caught before the daemon starts, so it exits 78 and the unit declines
+to restart it.
+
+### `ctxlake sync install` checks the host first
+
+It refuses, and writes no unit, when the store is unreachable, a CAS probe fails,
+a configured model's key is unset, or the key resolves but the provider rejects a
+live call. Missing runtime hooks are a warning, not a blocker. `--skip-checks`
+overrides.
+
+**`ctxlake doctor` now calls the provider for real.** A revoked key, a typo'd
+model name and an account over quota all resolve an environment variable
+perfectly and then fail hours later inside a maintenance log.
+
+### AWS credentials
+
+ctxlake now reads `~/.aws/credentials`, following the AWS CLI's own order:
+environment, then the credentials file (`AWS_PROFILE`, else `default`), then an
+instance or container role. Previously it read only the environment and fell
+through to EC2 instance metadata, so a laptop with a working `aws` CLI waited ~16
+seconds for a confusing timeout — and a **supervised daemon**, which has no shell,
+would have failed on every cycle.
+
+`doctor` now prints which identity it resolved and tells a `403` apart from a
+network error. SSO, `credential_process` and assume-role profiles are still
+declined rather than half-read, since they expire under a long-running daemon, but
+`doctor` names the mechanism.
+
+### Also
+
+- A cross-fleet leak: `extract::list_sealed_sessions` had no fleet filter, so in a
+  store holding two fleets one team's transcripts became evidence for another
+  team's claims.
+- `ctxlake maint` prints a readable summary instead of a `Debug` dump.
+
+### Verified
+
+Against a real AWS S3 bucket and a real model, not fixtures: all six CAS probes
+pass on S3; a session captured through the real hook is sealed, digested,
+compacted and published; and the same session yields 4 extracted claims, each
+citing real evidence, 4 promoted by the gate and correctly withheld from agents
+under `mode = "shadow"`.
+
 ## v0.1.1
 
 Three things: the lease concept is gone, the sync daemon can survive a reboot, and the

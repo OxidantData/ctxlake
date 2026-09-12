@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "ctxlake-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "ctxlake-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aho-corasick",
  "hex",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "ctxlake-hook"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ctxlake-core",
  "serde",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "ctxlake-maint"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "ctxlake-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ctxlake-core",
  "rusqlite",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "ctxlake-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "ctxlake-sync"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "bytes",

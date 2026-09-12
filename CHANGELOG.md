@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.1.8
+
+### `sync install` did not replace a running daemon on Linux
+
+Upgrading a Linux host left the *old* daemon running. `install` rewrote the unit,
+reported success, and the previous process kept going — with the previous binary,
+which the installer had already replaced on disk. On a real host mid-upgrade:
+`/proc/<pid>/exe` pointed at a path marked `(deleted)`, `ctxlake sync status` said
+`active`, and the machine spent an hour writing to a `live/` layout the rest of the
+fleet had moved off in v0.1.7.
+
+The cause was one word. `install` ran `systemctl --user enable --now`, and `--now`
+means *start* — `systemctl start` against an already-active unit does nothing. It now
+runs `enable` and `restart` separately: `restart` starts a stopped unit and replaces a
+running one, which is what "install this and run it" has to mean. `--no-start` still
+enables without starting.
+
+macOS was never affected: launchd's `bootout` + `bootstrap` genuinely replaces the
+process, which is why the same upgrade worked there and silently did not on Linux.
+
+**If you are on v0.1.7 on a Linux host, run `systemctl --user restart ctxlake-sync`
+once** — the unit is already correct, only the process is stale. From v0.1.8 on,
+`sync install` and `ctxlake update` both handle it.
+
 ## v0.1.7
 
 > **Upgrading: run `ctxlake sync install` once on every host after updating.**

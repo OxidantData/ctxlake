@@ -17,11 +17,13 @@
 //! different — recording a *candidate* needs no gate to exist yet, so it works
 //! today and simply queues for whenever promotion does.
 
+use ctxlake_core::redact::Redactor;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 
 use crate::sanitize;
+use crate::write_guard;
 
 /// `docs/memory.md`'s claim-type table. Anything else is rejected at `propose`
 /// time rather than silently accepted and mis-filed — an unrecognized type has no
@@ -33,6 +35,21 @@ pub const ALLOWED_CLAIM_TYPES: &[&str] = &[
     "preference",
     "hypothesis",
 ];
+
+/// Rows returned by `memory_timeline`/`memory_search` when no `limit`/`k` is
+/// given. Shares [`crate::fleet::MAX_ROW_LIMIT`]'s reasoning: a per-field length
+/// bound is defeated by row count alone, so both need a cap.
+pub const DEFAULT_ROW_LIMIT: usize = crate::fleet::DEFAULT_ROW_LIMIT;
+/// Hard ceiling on rows returned by a single call, regardless of what a caller
+/// requests.
+pub const MAX_ROW_LIMIT: usize = crate::fleet::MAX_ROW_LIMIT;
+
+/// Citations are meant to be identifiers (`{session_id, message_id}`), not a place
+/// to paste a transcript — this caps how many a single `memory_propose` call may
+/// attach. Without it, nothing stops an agent looping on `memory_propose` from
+/// growing one spool line (and, eventually, one bronze record) without bound;
+/// see `spool.rs`'s disk-fill cap for the complementary guard at the file level.
+pub const MAX_EVIDENCE_ITEMS: usize = 20;
 
 /// A promoted (or contested) claim as read back from the local cache. This is the
 /// far side of `docs/memory.md`'s claim model — everything the promotion gate
@@ -104,6 +121,7 @@ fn claims_cache_path(cache_root: &Path, fleet_id: &str) -> std::path::PathBuf {
 /// ranking model here, and the result says so rather than implying semantic
 /// search it cannot do.
 pub fn search(cache_root: &Path, fleet_id: &str, query: &str, k: usize) -> Value {
+    let k = k.clamp(1, MAX_ROW_LIMIT);
     let path = claims_cache_path(cache_root, fleet_id);
     let Ok(bytes) = std::fs::read(&path) else {
         return json!({
@@ -143,12 +161,14 @@ pub fn search(cache_root: &Path, fleet_id: &str, query: &str, k: usize) -> Value
     // Highest-confidence first, so a caller capped by `k` sees the strongest
     // evidence rather than whatever happened to sort first in the cache file.
     matches.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
-    matches.truncate(k.max(1));
+    let truncated = matches.len() > k;
+    matches.truncate(k);
 
     let rendered: Vec<String> = matches.iter().map(|c| render(c)).collect();
     json!({
         "enabled": true,
         "results": rendered,
+        "truncated": truncated,
         "note": "peer observations — verify before relying on these; a claim with \
                   only 1 independent session or marked CONTESTED is weaker evidence \
                   than it may read as.",
@@ -189,17 +209,38 @@ pub fn propose(
                 .to_string(),
         );
     }
+    if evidence.len() > MAX_EVIDENCE_ITEMS {
+        // A citation is an identifier, not a transcript — see MAX_EVIDENCE_ITEMS's
+        // docs. Rejecting outright (rather than silently truncating the list) means
+        // the caller notices and trims it, instead of an evidence set quietly
+        // losing entries a human might have expected to see land.
+        return Err(format!(
+            "`evidence` carries {} citations, over the {MAX_EVIDENCE_ITEMS} limit — \
+             cite the strongest few, not every session that touched this",
+            evidence.len()
+        ));
+    }
+
+    // AGENTS.md invariant 7: `claim` is free text an agent typed, and `evidence`
+    // is caller-shaped JSON that may quote raw tool output — both must be scrubbed
+    // for secrets before this record ever reaches the spool. See `write_guard`'s
+    // module doc.
+    let redactor = Redactor::new();
+    let scrubbed_evidence: Vec<Value> = evidence
+        .iter()
+        .map(|e| write_guard::bound_and_scrub_value(&redactor, e, sanitize::MAX_SHORT_FIELD, true))
+        .collect();
 
     let id = ctxlake_core::envelope::next_event_id();
     let record = json!({
         "kind": "claim_propose",
         "id": id,
         "fleet_id": fleet_id,
-        "claim": sanitize::clean(claim, sanitize::MAX_LONG_FIELD),
+        "claim": write_guard::bound_and_scrub_str(&redactor, claim, sanitize::MAX_LONG_FIELD, false),
         "claim_type": claim_type,
         "status": "candidate",
         "observed_by": agent_id,
-        "evidence": evidence,
+        "evidence": scrubbed_evidence,
         "evidence_count": evidence.len(),
     });
     crate::spool::append_at(spool_root, fleet_id, &record)?;
@@ -216,10 +257,20 @@ pub fn propose(
     }))
 }
 
-/// `memory_timeline(subject, since?)`. Reads
+/// `memory_timeline(subject, since?, limit?)`. Reads
 /// `<cache_root>/<fleet_id>/timeline/<subject-hash-free-form>.json` — nothing
-/// writes this yet either, so this degrades exactly like [`search`].
-pub fn timeline(cache_root: &Path, fleet_id: &str, subject: &str, since: Option<&str>) -> Value {
+/// writes this yet either, so this degrades exactly like [`search`]. `limit`
+/// defaults to [`DEFAULT_ROW_LIMIT`] and is clamped to [`MAX_ROW_LIMIT`] — see
+/// `fleet::MAX_ROW_LIMIT`'s docs for why a row cap matters as much as the
+/// per-field length bound.
+pub fn timeline(
+    cache_root: &Path,
+    fleet_id: &str,
+    subject: &str,
+    since: Option<&str>,
+    limit: usize,
+) -> Value {
+    let limit = limit.clamp(1, MAX_ROW_LIMIT);
     let path = cache_root.join(fleet_id).join("timeline.json");
     let Ok(bytes) = std::fs::read(&path) else {
         return json!({
@@ -239,7 +290,7 @@ pub fn timeline(cache_root: &Path, fleet_id: &str, subject: &str, since: Option<
         });
     };
     let subject_lower = subject.to_lowercase();
-    let entries: Vec<Value> = all
+    let matched: Vec<Value> = all
         .into_iter()
         .filter(|e| {
             let matches_subject = e
@@ -253,15 +304,17 @@ pub fn timeline(cache_root: &Path, fleet_id: &str, subject: &str, since: Option<
             });
             matches_subject && matches_since
         })
-        .map(|mut e| {
-            if let Some(summary) = e.get("summary").and_then(Value::as_str) {
-                let cleaned = sanitize::clean(summary, sanitize::MAX_LONG_FIELD);
-                e["summary"] = json!(cleaned);
-            }
-            e
-        })
         .collect();
-    json!({ "enabled": true, "entries": entries })
+    let truncated = matched.len() > limit;
+    // Recurses over the whole entry rather than naming `summary` alone — see
+    // `sanitize::clean_value`'s docs for why a fixed field list can't be trusted
+    // to cover a cache schema this crate does not control.
+    let entries: Vec<Value> = matched
+        .into_iter()
+        .take(limit)
+        .map(|e| sanitize::clean_value(&e, sanitize::MAX_LONG_FIELD))
+        .collect();
+    json!({ "enabled": true, "entries": entries, "truncated": truncated })
 }
 
 #[cfg(test)]
@@ -417,8 +470,122 @@ mod tests {
     #[test]
     fn timeline_without_a_cache_file_is_honest_and_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let out = timeline(dir.path(), "oxidant", "flaky test", None);
+        let out = timeline(dir.path(), "oxidant", "flaky test", None, DEFAULT_ROW_LIMIT);
         assert_eq!(out["enabled"], false);
         assert_eq!(out["entries"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn timeline_caps_rows_and_recursively_cleans_an_unnamed_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet_dir = dir.path().join("oxidant");
+        std::fs::create_dir_all(&fleet_dir).unwrap();
+        let entries: Vec<Value> = (0..10)
+            .map(|i| {
+                json!({
+                    "subject": "flaky test",
+                    "at": "2026-09-09",
+                    "what": format!("attempt {i}\u{200B}"),
+                })
+            })
+            .collect();
+        std::fs::write(
+            fleet_dir.join("timeline.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let out = timeline(dir.path(), "oxidant", "flaky test", None, 3);
+        let got = out["entries"].as_array().unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(out["truncated"], true);
+        // `what` isn't in any hardcoded field list — recursion is what cleans it.
+        assert!(!got[0]["what"].as_str().unwrap().contains('\u{200B}'));
+    }
+
+    #[test]
+    fn search_truncated_flag_reflects_whether_k_dropped_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet_dir = dir.path().join("oxidant");
+        std::fs::create_dir_all(&fleet_dir).unwrap();
+        let claims: Vec<ClaimRecord> = (0..5)
+            .map(|i| ClaimRecord {
+                claim: format!("claim {i}"),
+                claim_type: "convention".into(),
+                subject: None,
+                observed_by: "cc-01".into(),
+                observed_at: "2026-09-09".into(),
+                independent_count: 1,
+                confidence: i as f64 / 10.0,
+                status: "promoted".into(),
+            })
+            .collect();
+        std::fs::write(
+            fleet_dir.join("claims.json"),
+            serde_json::to_vec(&claims).unwrap(),
+        )
+        .unwrap();
+
+        let out = search(dir.path(), "oxidant", "", 2);
+        assert_eq!(out["results"].as_array().unwrap().len(), 2);
+        assert_eq!(out["truncated"], true);
+
+        let out_all = search(dir.path(), "oxidant", "", 20);
+        assert_eq!(out_all["results"].as_array().unwrap().len(), 5);
+        assert_eq!(out_all["truncated"], false);
+    }
+
+    #[test]
+    fn propose_rejects_more_evidence_than_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence: Vec<Value> = (0..(MAX_EVIDENCE_ITEMS + 1))
+            .map(|i| json!({"session_id": format!("s{i}")}))
+            .collect();
+        let result = propose(dir.path(), "oxidant", "cc-01", "x", "convention", &evidence);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("limit"));
+    }
+
+    /// AGENTS.md invariant 7: a secret pasted straight into `claim` text must never
+    /// reach the spool, since `ctxlake sync` ships it into immutable bronze.
+    #[test]
+    fn propose_redacts_a_secret_in_the_claim_before_it_reaches_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = vec![json!({"session_id": "s1", "message_id": "m1"})];
+        propose(
+            dir.path(),
+            "oxidant",
+            "cc-01",
+            "found it: AKIAABCDEFGHIJKLMNOP is the leaked key",
+            "outcome",
+            &evidence,
+        )
+        .unwrap();
+        let spooled =
+            std::fs::read_to_string(dir.path().join("mcp").join("oxidant.ndjson")).unwrap();
+        assert!(!spooled.contains("AKIAABCDEFGHIJKLMNOP"));
+    }
+
+    /// Same invariant, for the field the original bug missed entirely: a secret
+    /// quoted inside an evidence citation, not the claim text itself.
+    #[test]
+    fn propose_redacts_a_secret_inside_an_evidence_citation() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = vec![json!({
+            "session_id": "s1",
+            "quote": "export ANTHROPIC_API_KEY=sk-ant-api03-REALLOOKINGSECRET1234567890",
+        })];
+        propose(
+            dir.path(),
+            "oxidant",
+            "cc-01",
+            "a claim",
+            "outcome",
+            &evidence,
+        )
+        .unwrap();
+        let spooled =
+            std::fs::read_to_string(dir.path().join("mcp").join("oxidant.ndjson")).unwrap();
+        assert!(!spooled.contains("sk-ant-api03-REALLOOKINGSECRET1234567890"));
     }
 }

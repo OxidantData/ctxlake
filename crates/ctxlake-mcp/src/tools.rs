@@ -83,7 +83,15 @@ fn call_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<Value, ToolError> {
         "fleet_history" => {
             let repo = optional_str(args, "repo")?;
             let since = optional_str(args, "since")?;
-            Ok(fleet::history(&ctx.cache_root, &ctx.fleet_id, repo, since))
+            let limit =
+                optional_u64(args, "limit")?.unwrap_or(fleet::DEFAULT_ROW_LIMIT as u64) as usize;
+            Ok(fleet::history(
+                &ctx.cache_root,
+                &ctx.fleet_id,
+                repo,
+                since,
+                limit,
+            ))
         }
         "fleet_handoff" => {
             let summary = required_str(args, "summary")?;
@@ -121,11 +129,14 @@ fn call_tool(name: &str, args: &Value, ctx: &Ctx) -> Result<Value, ToolError> {
         "memory_timeline" => {
             let subject = required_str(args, "subject")?;
             let since = optional_str(args, "since")?;
+            let limit =
+                optional_u64(args, "limit")?.unwrap_or(memory::DEFAULT_ROW_LIMIT as u64) as usize;
             Ok(memory::timeline(
                 &ctx.cache_root,
                 &ctx.fleet_id,
                 subject,
                 since,
+                limit,
             ))
         }
         other => Err(ToolError::Params(format!("unknown tool `{other}`"))),
@@ -234,11 +245,12 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "fleet_history",
-            "description": "Recent sessions and their outcomes from the local cache, optionally filtered by repo and a since timestamp. Returns an honest empty result if no history has synced locally yet.",
+            "description": "Recent sessions and their outcomes from the local cache, optionally filtered by repo and a since timestamp. Returns an honest empty result if no history has synced locally yet. Rows are capped (default 50, hard ceiling 200) regardless of how much history matches; `truncated: true` in the result means more rows existed than were returned.",
             "inputSchema": object_schema(
                 json!({
                     "repo": string_prop("Filter to sessions against this repo"),
                     "since": string_prop("RFC3339 timestamp; only sessions ending at or after this"),
+                    "limit": { "type": "integer", "description": "Maximum sessions to return (default 50, hard ceiling 200)" },
                 }),
                 &[],
             ),
@@ -262,7 +274,7 @@ pub fn tool_definitions() -> Value {
                 json!({
                     "query": string_prop("Free-text query, matched against claim text and subject"),
                     "scope": string_prop("agent | repo | fleet (accepted, not yet enforced — no promoted claim exists yet)"),
-                    "k": { "type": "integer", "description": "Maximum results to return (default 10)" },
+                    "k": { "type": "integer", "description": "Maximum results to return (default 10, hard ceiling 200)" },
                 }),
                 &["query"],
             ),
@@ -281,11 +293,12 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "memory_timeline",
-            "description": "What this fleet has actually tried regarding a subject, from the local cache. Honestly empty until a timeline has been synced locally.",
+            "description": "What this fleet has actually tried regarding a subject, from the local cache. Honestly empty until a timeline has been synced locally. Rows are capped (default 50, hard ceiling 200); `truncated: true` in the result means more entries matched than were returned.",
             "inputSchema": object_schema(
                 json!({
                     "subject": string_prop("Subject to look up, e.g. a repo, a service, a command"),
                     "since": string_prop("RFC3339 timestamp; only entries at or after this"),
+                    "limit": { "type": "integer", "description": "Maximum entries to return (default 50, hard ceiling 200)" },
                 }),
                 &["subject"],
             ),
@@ -374,5 +387,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["isError"], false);
+    }
+
+    /// Regression: `fleet_history`'s `limit` argument must actually reach
+    /// `fleet::history` through dispatch, not just exist in the schema.
+    #[test]
+    fn fleet_history_limit_argument_reaches_the_cache_read() {
+        let (dir, ctx) = test_ctx();
+        let fleet_dir = dir.path().join("cache").join("test-fleet");
+        std::fs::create_dir_all(&fleet_dir).unwrap();
+        let sessions: Vec<Value> = (0..10)
+            .map(|i| json!({"repo": "r", "ended_at": "2026-09-09", "summary": format!("s{i}")}))
+            .collect();
+        std::fs::write(
+            fleet_dir.join("history.json"),
+            serde_json::to_vec(&sessions).unwrap(),
+        )
+        .unwrap();
+
+        let result = tools_call(
+            &json!({"name": "fleet_history", "arguments": {"limit": 2}}),
+            &ctx,
+        )
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["truncated"], true);
+    }
+
+    /// Same regression for `memory_timeline`'s `limit` argument.
+    #[test]
+    fn memory_timeline_limit_argument_reaches_the_cache_read() {
+        let (dir, ctx) = test_ctx();
+        let fleet_dir = dir.path().join("cache").join("test-fleet");
+        std::fs::create_dir_all(&fleet_dir).unwrap();
+        let entries: Vec<Value> = (0..10)
+            .map(|i| json!({"subject": "x", "at": "2026-09-09", "what": format!("e{i}")}))
+            .collect();
+        std::fs::write(
+            fleet_dir.join("timeline.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let result = tools_call(
+            &json!({"name": "memory_timeline", "arguments": {"subject": "x", "limit": 2}}),
+            &ctx,
+        )
+        .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["truncated"], true);
     }
 }

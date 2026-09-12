@@ -7,13 +7,23 @@ are all MCP clients, so a runtime with no native hook surface for something can 
 get it through this server, and a runtime *with* hooks gets a second, symmetric way to
 ask for the same information mid-turn instead of only at fixed lifecycle points.
 
-> **Status: implemented, with an honest gap.** The protocol layer, the fleet tools, and
-> `memory_propose` all work today, against the local filesystem. `memory_search` and
-> `memory_timeline` are wired up and tested, but read from a local cache file nothing in
-> this codebase writes yet — the daemon that would populate it, and the promotion gate
-> that would give it something to promote, are both later work (Wave 3). Until then both
-> tools say so plainly (`"enabled": false`) rather than returning a fabricated result.
-> See [memory.md](memory.md) for the belief layer they're waiting on.
+> **Status: the server is implemented; `ctxlake mcp` is not wired up yet.** The protocol
+> layer, the fleet tools, and `memory_propose` all work today, against the local
+> filesystem, and this crate ships a real `ctxlake-mcp` binary that runs them on real
+> stdin/stdout. What does **not** exist yet is `ctxlake-cli`'s `mcp` subcommand —
+> `crates/ctxlake-cli` is still the Wave 1 scaffold, so there is no `ctxlake mcp` to spawn
+> and no `ctxlake install` to write the config block below into a runtime's settings. If
+> you want to run this server today, point a runtime's MCP config at the `ctxlake-mcp`
+> binary this crate builds directly (`cargo build -p ctxlake-mcp --bin ctxlake-mcp`), or
+> call [`ctxlake_mcp::run_stdio()`](../crates/ctxlake-mcp/src/lib.rs) from your own thin
+> wrapper — both do exactly what `ctxlake mcp` will do once it exists.
+>
+> Separately, `memory_search` and `memory_timeline` are wired up and tested, but read
+> from a local cache file nothing in this codebase writes yet — the daemon that would
+> populate it, and the promotion gate that would give it something to promote, are both
+> later work (Wave 3). Until then both tools say so plainly (`"enabled": false`) rather
+> than returning a fabricated result. See [memory.md](memory.md) for the belief layer
+> they're waiting on.
 
 ## Why this process never touches the object store
 
@@ -49,7 +59,9 @@ merge later for no benefit now.
 
 ## Wiring it up
 
-Each runtime's own MCP config points at the `ctxlake` binary:
+The eventual shape — once `ctxlake-cli` grows an `mcp` subcommand and an `install`
+command to go with it (see the status callout above) — is each runtime's own MCP config
+pointing at the `ctxlake` binary:
 
 ```json
 {
@@ -59,9 +71,15 @@ Each runtime's own MCP config points at the `ctxlake` binary:
 }
 ```
 
-`CTXLAKE_FLEET_ID` and `CTXLAKE_AGENT_ID` scope every read and write this process does;
-`ctxlake install` sets both when it merges this block into a runtime's config (see
-[getting-started.md](getting-started.md)).
+with `ctxlake install` merging that block into a runtime's config (see
+[getting-started.md](getting-started.md)) the same way it merges the hook entries.
+Neither `ctxlake mcp` nor `ctxlake install` exists today, so that block is not yet
+something you can paste in and expect to work — point `"command"` at the `ctxlake-mcp`
+binary this crate builds instead (see the status callout for how to build it).
+
+`CTXLAKE_FLEET_ID` and `CTXLAKE_AGENT_ID` scope every read and write this process
+does — set them in the runtime's MCP config's `env` block until `ctxlake install` can
+set them for you.
 
 ## The tools
 
@@ -70,16 +88,28 @@ Each runtime's own MCP config points at the `ctxlake` binary:
 | `fleet_status()` | read | Who's active and what they hold, as of the last cache refresh. |
 | `fleet_claim(paths[], reason, ttl_secs?)` | write | Queue an advisory-lease request. |
 | `fleet_release(paths[]?)` | write | Queue a release; omit `paths` for "everything I hold." |
-| `fleet_history(repo?, since?)` | read | Recent sessions and outcomes from the cache. |
+| `fleet_history(repo?, since?, limit?)` | read | Recent sessions and outcomes from the cache. |
 | `fleet_handoff(summary, status, next?)` | write | Leave a note for whoever picks this up next. |
 | `memory_search(query, scope?, k?)` | read | Promoted claims matching `query`, with attribution. |
 | `memory_propose(claim, type, evidence[])` | write | File a claim **candidate**. Never promotes. |
-| `memory_timeline(subject, since?)` | read | What this fleet has actually tried, re: `subject`. |
+| `memory_timeline(subject, since?, limit?)` | read | What this fleet has actually tried, re: `subject`. |
 
 Every *read* tool degrades honestly when its cache file is missing or unparseable: an
 empty result with a `note` explaining why, never an error and never a guess. Every
 *write* tool queues to the local spool and returns once the write is durably queued
 locally — never once it has reached the fleet, which this process cannot observe.
+
+### Row counts are capped, independently of field length
+
+`sanitize.rs`'s per-field length bound (below) stops one oversized field from crowding
+out a model's context window; it does nothing about *row count*. `fleet_history`,
+`memory_search`, and `memory_timeline` each cap how many rows a single call can return —
+`limit`/`k` default to 50 (10 for `memory_search`, unchanged) and are clamped to a hard
+ceiling of 200 no matter what a caller asks for. A result that had more matching rows
+than it returned says so with `"truncated": true`, rather than silently dropping the
+tail the way the length bound's truncation marker makes visible for a single field.
+`memory_propose`'s `evidence` array gets the same treatment on the write side: at most
+20 citations per call, rejected outright over that rather than silently trimmed.
 
 ### `memory_propose` never writes a promoted claim
 
@@ -125,13 +155,46 @@ faithfully but not to have sanitized them. Before any such field reaches a tool 
 
 This happens in `crates/ctxlake-mcp/src/sanitize.rs`, at render time, on every field this
 crate ever hands back — not only once, at ingest, on the theory that whatever wrote the
-cache already cleaned it. It deliberately does **not** try to pattern-match phrases like
-"ignore previous instructions"; that's a losing game, and it isn't the actual defense
-here. The actual defense is architectural: [memory.md](memory.md)'s attribution framing
-means a peer's claim never arrives as a bare assertion the reading model might follow —
-it arrives labeled as somebody else's observation, with a session count and confidence
-attached, under a "verify before relying on these" heading. Sanitization's job is only to
-make sure that framing can't be visually hidden or defeated by an invisible character.
+cache already cleaned it. Concretely, `sanitize::clean_value` recurses over the *whole*
+JSON value a cache file handed back — object keys and values, array elements, at any
+depth — rather than naming a fixed list of fields to clean. This crate does not control
+the schema the future cache-writer (`ctxlake sync`, Wave 3) will actually use, so a fixed
+field list would only cover whatever shape today's author guessed at; a field the list
+didn't name, or one nested inside a field it did, would pass through untouched. Recursing
+over the value has no such gap: whatever shape a cache record takes, every string in it
+is cleaned before this crate hands it back.
+
+It deliberately does **not** try to pattern-match phrases like "ignore previous
+instructions"; that's a losing game, and it isn't the actual defense here. The actual
+defense is architectural: [memory.md](memory.md)'s attribution framing means a peer's
+claim never arrives as a bare assertion the reading model might follow — it arrives
+labeled as somebody else's observation, with a session count and confidence attached,
+under a "verify before relying on these" heading. Sanitization's job is only to make sure
+that framing can't be visually hidden or defeated by an invisible character.
+
+## Every write-shaped argument is scrubbed for secrets before the spool
+
+The read-time cleaning above closes an injection channel; it says nothing about a
+different direction of harm, AGENTS.md invariant 7: a secret an agent pastes into a
+`fleet_claim` reason, a `fleet_handoff` summary, or a `memory_propose` claim or evidence
+citation must never reach `spool.rs`'s ndjson file, because `ctxlake sync` ships that
+file's contents into bronze, and bronze is immutable — nothing after this point can
+un-leak it. `crates/ctxlake-mcp/src/write_guard.rs` runs every free-text argument to
+`fleet_claim`, `fleet_release`, `fleet_handoff`, and `memory_propose` through
+`ctxlake_core::redact::Redactor` — the same scrubber `ctxlake-hook`'s adapters use for the
+identical reason — before the record is ever built, so a literal secret marker (`sk-`,
+`AKIA`, a PEM header, ...) is withheld rather than written verbatim. `evidence` is
+caller-shaped JSON, not a fixed set of named fields, so it gets the same recursive
+treatment as the read path: every string at any depth is scrubbed, not only the fields
+this crate happens to know about.
+
+Nothing drains `spool/mcp/*.ndjson` yet either (that daemon-side consumer is later work,
+same as `ctxlake-hook`'s own spool), and every agent in a fleet shares one file per fleet.
+`spool.rs` caps that directory's total size and rotates a fleet's file once it gets large,
+mirroring `ctxlake-hook`'s own spool guard — but where the hook must silently drop an
+over-cap event (it can never fail the host agent's turn), this server has a real return
+channel: hitting the cap comes back as an ordinary tool-call error the calling agent can
+see and act on.
 
 ## Protocol conformance
 
@@ -153,10 +216,16 @@ a panic or a dropped connection:
 
 **stdout carries JSON-RPC frames and nothing else.** Every diagnostic in this crate goes
 to stderr. A client parses stdout one line at a time as JSON; a stray `println!` would
-corrupt every frame after it in a way that is hard to diagnose from the client's side —
-this is checked by a test that drives a full mixed session (well-formed calls, garbage,
-notifications, bad arguments) through the real serving loop and asserts every line
-written is valid, single-line JSON-RPC.
+corrupt every frame after it in a way that is hard to diagnose from the client's side.
+Two tests check this from two different vantage points, because they catch different
+bugs: `lib.rs`'s in-memory test drives a full mixed session (well-formed calls, garbage,
+notifications, bad arguments) through `serve()` against a buffer it controls, which
+proves the *response-building* logic never emits more or less than one frame per
+request — but it cannot see a stray write to the process's *real* stdout, since nothing
+in that test path touches it. `tests/stdio_subprocess.rs` closes that gap by spawning the
+actual `ctxlake-mcp` binary as a child process and asserting every line on its real
+stdout is exactly one valid JSON-RPC frame; a `println!`/`eprintln!`-to-stdout mistake
+anywhere on the dispatch path fails this test and only this test.
 
 ## Next steps
 

@@ -8,6 +8,16 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# The real binary: `ctxlake-mcp` on stdin/stdout, exactly what `run_stdio` drives.
+# It exists so the crate's stdout-purity guarantee can be tested against a genuine
+# child process — a `serve()` call against an in-memory buffer never observes a
+# stray write to the process's *real* stdout, which is the one this guarantee is
+# actually about. `ctxlake-cli`'s own `mcp` subcommand (Wave 2, not yet wired) will
+# eventually just exec this same `run_stdio()`.
+[[bin]]
+name = "ctxlake-mcp"
+path = "src/bin/ctxlake-mcp.rs"
+
 [dependencies]
 # ctxlake-core only, matching ctxlake-hook's own discipline (AGENTS.md invariant
 # 1/2, extended here on purpose): this process never touches the network, in

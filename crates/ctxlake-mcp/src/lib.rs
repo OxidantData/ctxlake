@@ -27,6 +27,9 @@
 //!   contract the other two hold until the belief layer ships.
 //! - [`sanitize`] — the render-time cleaner every untrusted field (a peer's claim,
 //!   a peer's handoff note) is routed through before it reaches a tool result.
+//! - [`write_guard`] — the write-time secret scrubber every free-text argument to a
+//!   write-shaped tool call is routed through before it reaches the spool
+//!   (AGENTS.md invariant 7) — [`sanitize`]'s mirror image on the write path.
 //! - [`paths`] — local spool/cache roots, and the [`paths::Ctx`] threaded through
 //!   every dispatch call.
 //! - [`spool`] — the append-only local queue every write-shaped tool call uses.
@@ -38,6 +41,7 @@ pub mod protocol;
 pub mod sanitize;
 pub mod spool;
 pub mod tools;
+pub mod write_guard;
 
 use std::io::{self, BufRead, Write};
 

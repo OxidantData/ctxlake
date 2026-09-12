@@ -37,7 +37,7 @@ extraction, in `ctxlake.toml` ([full reference](reference.md#summarize)):
 mode = "shadow"              # keep this for now
 
 [summarize.batch]
-provider    = "anthropic"    # or "openai-compatible", or "ollama" for fully local
+provider    = "anthropic"    # or "openai-compatible", "ollama" (fully local), "openrouter", "gemini"
 model       = "claude-haiku-4-5"
 api_key_env = "ANTHROPIC_API_KEY"   # the NAME of an env var, never the key
 ```

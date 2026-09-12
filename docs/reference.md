@@ -271,13 +271,21 @@ of this setting. `[summarize.batch]` is ignored under `none` and `agent`:
 
 | Field | Meaning | Default |
 |---|---|---|
-| `provider` | `anthropic`, `openai-compatible`, or `ollama` | required |
+| `provider` | `anthropic`, `openai-compatible`, `ollama`, `openrouter`, or `gemini` | required |
 | `model` | Model name for the batch provider | required |
 | `api_key_env` | **Name** of the environment variable holding the API key | required |
-| `base_url` | Override for a self-hosted or `ollama` endpoint | provider default |
+| `base_url` | Override for a self-hosted, `ollama`, `openrouter`, or `gemini` endpoint | provider default |
 | `use_batch_api` | Use the provider's batch API — half the price, results out of order, keyed by request id | `true` |
 | `max_sessions_per_run` | Sessions extracted per maintenance run | `50` |
 | `max_input_tokens` | Per-session input cap; oldest turns truncated first | `8000` |
+
+| `provider` | Wire shape | Needs `base_url`? |
+|---|---|---|
+| `anthropic` | Messages API | No — defaults to `api.anthropic.com` |
+| `openai-compatible` | `/chat/completions` | Yes — any self-hosted gateway speaking it |
+| `ollama` | `/api/chat` | No — defaults to `localhost:11434` |
+| `openrouter` | `/chat/completions` (OpenAI-shaped) | No — defaults to `openrouter.ai`; value is not needing to know the URL |
+| `gemini` | `generateContent`, structured output via `responseSchema` | No — defaults to `generativelanguage.googleapis.com` |
 
 Running entirely locally, so no transcript leaves the host — a first-class path, not a
 degraded one:

@@ -60,6 +60,39 @@ impl std::fmt::Display for SummarizeMode {
     }
 }
 
+/// `[summarize.batch] provider`, mirroring `ctxlake_maint::extract::ProviderKind`
+/// field-for-field so [`BatchConfig`]'s `From` impl below is a plain rename, not
+/// a place a fifth or sixth value could quietly diverge between the two crates.
+/// A separate type rather than reusing `ctxlake_maint`'s directly: this crate's
+/// `Config` is `ctxlake.toml`'s serde shape, and a config crate should not need
+/// to change just because `ctxlake-maint` reshapes its own internal enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    #[default]
+    Anthropic,
+    OpenaiCompatible,
+    Ollama,
+    /// OpenAI-shaped, hosted at a fixed `openrouter.ai` endpoint — see
+    /// `ctxlake_maint::extract::OpenRouterProvider`.
+    Openrouter,
+    /// `contents`/`systemInstruction`, not a `messages` array — see
+    /// `ctxlake_maint::extract::GeminiProvider`.
+    Gemini,
+}
+
+impl From<ProviderKind> for ctxlake_maint::extract::ProviderKind {
+    fn from(p: ProviderKind) -> Self {
+        match p {
+            ProviderKind::Anthropic => Self::Anthropic,
+            ProviderKind::OpenaiCompatible => Self::OpenaiCompatible,
+            ProviderKind::Ollama => Self::Ollama,
+            ProviderKind::Openrouter => Self::Openrouter,
+            ProviderKind::Gemini => Self::Gemini,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -73,7 +106,7 @@ fn default_max_input_tokens() -> u32 {
 /// `[summarize.batch]` — only read when `mode` is one of `batch`, `both`, `shadow`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchConfig {
-    pub provider: String,
+    pub provider: ProviderKind,
     pub model: String,
     /// The NAME of an environment variable holding the API key — never the key
     /// itself (AGENTS.md invariant 10). `ctxlake doctor` reports whether it
@@ -101,6 +134,49 @@ pub struct SummarizeConfig {
 
 fn summarize_is_default(s: &SummarizeConfig) -> bool {
     s.mode == SummarizeMode::Agent && s.batch.is_none()
+}
+
+impl From<SummarizeMode> for ctxlake_maint::extract::SummarizeMode {
+    fn from(m: SummarizeMode) -> Self {
+        match m {
+            SummarizeMode::None => Self::None,
+            SummarizeMode::Agent => Self::Agent,
+            SummarizeMode::Batch => Self::Batch,
+            SummarizeMode::Both => Self::Both,
+            SummarizeMode::Shadow => Self::Shadow,
+        }
+    }
+}
+
+/// `ctxlake.toml`'s `u32` fields become `ctxlake_maint`'s `usize` ones — infallible
+/// on every platform this ships for (usize is at least 32 bits), so this is a
+/// plain `From`, not a `TryFrom` with an error path nothing can actually hit.
+impl From<&BatchConfig> for ctxlake_maint::extract::BatchConfig {
+    fn from(b: &BatchConfig) -> Self {
+        Self {
+            provider: b.provider.into(),
+            model: b.model.clone(),
+            api_key_env: b.api_key_env.clone(),
+            base_url: b.base_url.clone(),
+            use_batch_api: b.use_batch_api,
+            max_sessions_per_run: b.max_sessions_per_run as usize,
+            max_input_tokens: b.max_input_tokens as usize,
+        }
+    }
+}
+
+/// The bridge `maint_cmd.rs` uses to hand `ctxlake-maint::extract` and `::gate`
+/// the config they need — this crate's own `SummarizeConfig` is `ctxlake.toml`'s
+/// serde shape (kebab-case `provider`, `u32` counters); `ctxlake-maint`'s is the
+/// shape its HTTP layer wants. Nothing converts the other way: `ctxlake-maint`
+/// does not, and must not, depend back on `ctxlake-cli`.
+impl From<&SummarizeConfig> for ctxlake_maint::extract::SummarizeConfig {
+    fn from(s: &SummarizeConfig) -> Self {
+        Self {
+            mode: s.mode.into(),
+            batch: s.batch.as_ref().map(Into::into),
+        }
+    }
 }
 
 /// The full contents of `ctxlake.toml`. See `docs/reference.md`.
@@ -217,7 +293,7 @@ mod tests {
         let mut cfg = Config::new("s3://b/p", "myteam", "cc-01");
         cfg.summarize.mode = SummarizeMode::Batch;
         cfg.summarize.batch = Some(BatchConfig {
-            provider: "anthropic".into(),
+            provider: ProviderKind::Anthropic,
             model: "claude-haiku-4-5".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
             base_url: None,
@@ -231,6 +307,79 @@ mod tests {
             !toml.to_lowercase().contains("api_key ="),
             "must never serialize a field literally named api_key: {toml}"
         );
+    }
+
+    #[test]
+    fn provider_openrouter_and_gemini_parse_from_their_documented_toml_spelling() {
+        // The exact strings docs/memory.md and docs/reference.md tell an operator
+        // to type — a serde kebab-case default would otherwise render `Openrouter`
+        // as `open-router`, which is not what either doc says to write.
+        for (word, expected) in [
+            ("anthropic", ProviderKind::Anthropic),
+            ("openai-compatible", ProviderKind::OpenaiCompatible),
+            ("ollama", ProviderKind::Ollama),
+            ("openrouter", ProviderKind::Openrouter),
+            ("gemini", ProviderKind::Gemini),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ctxlake.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "store = \"file:///tmp/lake\"\nfleet_id = \"myteam\"\nagent_id = \"cc-01\"\n\n\
+                     [summarize]\nmode = \"batch\"\n\n\
+                     [summarize.batch]\nprovider = \"{word}\"\nmodel = \"m\"\napi_key_env = \"K\"\n"
+                ),
+            )
+            .unwrap();
+            let cfg = load(&path).unwrap();
+            assert_eq!(
+                cfg.summarize.batch.unwrap().provider,
+                expected,
+                "word {word:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_config_converts_into_ctxlake_maint_s_shape_field_for_field() {
+        let cli_cfg = BatchConfig {
+            provider: ProviderKind::Gemini,
+            model: "gemini-2.0-flash".into(),
+            api_key_env: "GEMINI_API_KEY".into(),
+            base_url: Some("http://localhost:9999".into()),
+            use_batch_api: false,
+            max_sessions_per_run: 7,
+            max_input_tokens: 1234,
+        };
+        let maint_cfg: ctxlake_maint::extract::BatchConfig = (&cli_cfg).into();
+        assert_eq!(
+            maint_cfg.provider,
+            ctxlake_maint::extract::ProviderKind::Gemini
+        );
+        assert_eq!(maint_cfg.model, "gemini-2.0-flash");
+        assert_eq!(maint_cfg.api_key_env, "GEMINI_API_KEY");
+        assert_eq!(maint_cfg.base_url.as_deref(), Some("http://localhost:9999"));
+        assert!(!maint_cfg.use_batch_api);
+        assert_eq!(maint_cfg.max_sessions_per_run, 7);
+        assert_eq!(maint_cfg.max_input_tokens, 1234);
+    }
+
+    #[test]
+    fn summarize_config_conversion_carries_mode_and_an_absent_batch_through() {
+        let cli_cfg = SummarizeConfig {
+            mode: SummarizeMode::Shadow,
+            batch: None,
+        };
+        let maint_cfg: ctxlake_maint::extract::SummarizeConfig = (&cli_cfg).into();
+        assert_eq!(
+            maint_cfg.mode,
+            ctxlake_maint::extract::SummarizeMode::Shadow
+        );
+        assert!(maint_cfg.batch.is_none());
+        // And tier2_enabled must agree: shadow mode with no batch config is not
+        // actually enabled, on either side of the conversion.
+        assert!(!ctxlake_maint::extract::tier2_enabled(&maint_cfg));
     }
 
     #[test]

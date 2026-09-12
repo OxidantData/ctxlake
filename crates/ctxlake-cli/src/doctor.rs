@@ -25,6 +25,11 @@ use crate::store_ctx::{self, full_path};
 
 pub struct Report {
     pub store_url: String,
+    /// Best-effort identification of which backend `store_url` addresses
+    /// (`ctxlake_store::backend::describe`) — `None` only when `store_url`
+    /// itself doesn't parse as a URL, in which case `reachable` is already
+    /// `false` and `reachable_detail` explains why.
+    pub backend: Option<ctxlake_store::backend::BackendInfo>,
     pub reachable: bool,
     pub reachable_detail: String,
     pub probes: Vec<ctxlake_store::probe::ProbeResult>,
@@ -103,6 +108,12 @@ impl Report {
 
     pub fn print(&self) {
         println!("store   {}", self.store_url);
+        if let Some(backend) = &self.backend {
+            println!("backend: {}", backend.kind);
+            for caveat in &backend.caveats {
+                println!("  caveat: {caveat}");
+            }
+        }
         if !self.reachable {
             println!("  UNREACHABLE: {}", self.reachable_detail);
         } else {
@@ -282,6 +293,12 @@ pub async fn run(cfg: &Config) -> Result<Report> {
     let mut maint = MaintReport {
         last_snapshot_age: None,
     };
+    // Best-effort label only — an unparseable `store_url` already shows up as
+    // `reachable: false` with `reachable_detail` explaining why, so there is
+    // nothing more useful to say here than "we don't know" (`None`).
+    let backend = url::Url::parse(&cfg.store).ok().map(|url| {
+        ctxlake_store::backend::describe(&url, &ctxlake_store::backend::BackendOptions::default())
+    });
     let (reachable, reachable_detail, probes) = match &connected {
         Err(e) => (false, format!("{e:#}"), Vec::new()),
         Ok(ctx) => {
@@ -377,6 +394,7 @@ pub async fn run(cfg: &Config) -> Result<Report> {
 
     Ok(Report {
         store_url: cfg.store.clone(),
+        backend,
         reachable,
         reachable_detail,
         probes,
@@ -437,6 +455,11 @@ mod tests {
             "{:?}",
             report.probes.iter().find(|p| !p.passed)
         );
+        assert_eq!(
+            report.backend.as_ref().map(|b| b.kind),
+            Some("local filesystem"),
+            "doctor must report which backend it detected (see docs/storage.md)"
+        );
     }
 
     #[test]
@@ -446,6 +469,7 @@ mod tests {
         // capture — only a store that cannot be written to at all has.
         let report = Report {
             store_url: "s3://bucket".into(),
+            backend: None,
             reachable: true,
             reachable_detail: "ok".into(),
             probes: vec![

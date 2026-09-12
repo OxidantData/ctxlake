@@ -1,0 +1,198 @@
+# Builds `ctxlake` and `ctxlake-hook` for four targets, archives each as a
+# `.tar.xz`, checksums the lot, and attaches everything to a GitHub Release —
+# plus a filled-in Homebrew formula template (packaging/README.md documents
+# the manual step of publishing that into OxidantData/homebrew-tap).
+#
+# Fired by `workflow_dispatch`, not `on: push: tags`, on purpose: the sibling
+# Oxidant repo (../Oxidant/.github/workflows/binaries.yml) learned this the
+# hard way — two `v0.1.0` tag pushes there produced zero workflow events, and
+# even when a tag-push trigger *does* fire, a push authored with the default
+# `GITHUB_TOKEN` (which is how most tagging automation would create the tag in
+# the first place) does not cascade into triggering other workflows at all —
+# that's a deliberate GitHub Actions anti-recursion rule, not a bug to work
+# around. So this fires explicitly:
+#
+#   gh workflow run release.yml --ref <tag> -f tag=<tag>
+#
+# `push: tags` is kept anyway as a second path for the case where a human
+# pushes a `vX.Y.Z` tag with their own credentials (not GITHUB_TOKEN) from a
+# machine where tag-push triggers happen to behave — belt-and-suspenders, not
+# the documented way to release.
+#
+# Inert-safe: this workflow fires on neither `push: branches` nor
+# `pull_request`, so it cannot run — successfully or otherwise — as a side
+# effect of ordinary commits on a repo that has never cut a release. The
+# `release` job's own "does a release for this tag already exist" check
+# (`gh release view` before `gh release create`) means the first-ever release
+# and a re-run of a later one both take the same code path without one of
+# them needing a special case.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Release tag to build (e.g. v0.1.0). Required for workflow_dispatch —
+          see this file's header comment for why triggering happens this way.
+        required: true
+        type: string
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: write
+
+# One release build per tag at a time; never cancel a partially-uploaded
+# release out from under itself the way `cancel-in-progress` would on a
+# second dispatch for the same tag.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.ref_name }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::no tag resolved — pass workflow_dispatch input 'tag', or push a vX.Y.Z tag"
+            exit 1
+          fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::tag '$TAG' does not start with 'v' — release tags in this repo are vX.Y.Z"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: resolve-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: both targets build on the same arm64 runner. Apple Silicon
+          # runners cross-compile x86_64-apple-darwin fine — the bundled Xcode
+          # command line tools ship both architectures' linker/SDK support, no
+          # extra toolchain install needed, so this is a native+cross pair on
+          # one runner rather than two.
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Native build on a GitHub-hosted arm64 runner rather than
+          # cross-compiling — same choice the sibling Oxidant repo's
+          # package-linux job makes, and for the same reason: a native build
+          # needs no cross-linker/sysroot setup to get glibc right.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.90"
+
+      - run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Only the two shipped binaries — `-p ctxlake-cli -p ctxlake-hook` —
+      # not `--workspace`, so a release build never depends on (or fails
+      # because of) crates that aren't part of the release.
+      - name: Build ctxlake and ctxlake-hook
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ctxlake-cli -p ctxlake-hook
+
+      - name: Archive and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir="target/${{ matrix.target }}/release"
+          stage="$(mktemp -d)"
+          cp "${bin_dir}/ctxlake" "${bin_dir}/ctxlake-hook" "$stage/"
+          # Best-effort: present in a normal checkout, but an archive step
+          # should never fail a release over a missing doc file.
+          cp README.md LICENSE NOTICE "$stage/" 2>/dev/null || true
+
+          archive="ctxlake-${{ matrix.target }}.tar.xz"
+          tar -cJf "$archive" -C "$stage" .
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+          cat "${archive}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            ctxlake-${{ matrix.target }}.tar.xz
+            ctxlake-${{ matrix.target }}.tar.xz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [resolve-tag, build]
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
+      VERSION: ${{ needs.resolve-tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums and render the Homebrew formula template
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+          bash ../packaging/render-formula.sh "$VERSION" . > ctxlake.rb
+          ruby -c ctxlake.rb
+
+      # `gh release view` first rather than assuming either state: this is
+      # what makes the workflow safe to dispatch again for the same tag
+      # (uploads `--clobber` onto the existing release) and, on a repo with no
+      # release at all yet, takes the `create` branch with no special case —
+      # the "must not fail on a repo with no release yet" requirement this
+      # workflow carries.
+      - name: Create or update the GitHub Release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release $TAG already exists — uploading (clobbering same-named assets)"
+            gh release upload "$TAG" dist/* --repo "${{ github.repository }}" --clobber
+          else
+            echo "creating release $TAG"
+            gh release create "$TAG" dist/* \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --generate-notes
+          fi

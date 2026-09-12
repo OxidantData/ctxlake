@@ -1,0 +1,60 @@
+# Homebrew formula TEMPLATE for ctxlake.
+#
+# This is not consumed by Homebrew directly — it is filled in by
+# `packaging/render-formula.sh` (called from .github/workflows/release.yml's
+# `release` job, after the four target archives and their checksums exist) and
+# the *rendered* file is attached to the GitHub Release as `ctxlake.rb`.
+#
+# Publishing that rendered file into OxidantData/homebrew-tap is a manual step,
+# deliberately: this workflow does not hold a token scoped to the tap repo, and
+# pushing a formula automatically is a bigger blast radius than the benefit of
+# saving that one `cp` + commit. See docs/getting-started.md's Homebrew section
+# and packaging/README.md for the exact command.
+#
+# Shape matches ../../homebrew-tap/Formula/oxidant.rb (the house style: one
+# `if OS.mac? / if Hardware::CPU.arm?` branch per platform+arch, not a loop) —
+# ctxlake ships two binaries per archive (`ctxlake`, `ctxlake-hook`) where
+# Oxidant ships one, so `install` lists both.
+class Ctxlake < Formula
+  desc "Zero-compute coordination layer for fleets of coding agents: ctxlake and ctxlake-hook"
+  homepage "https://github.com/OxidantData/ctxlake"
+  version "@@VERSION@@"
+  if OS.mac?
+    if Hardware::CPU.arm?
+      url "https://github.com/OxidantData/ctxlake/releases/download/v@@VERSION@@/ctxlake-aarch64-apple-darwin.tar.xz"
+      sha256 "@@SHA256_AARCH64_APPLE_DARWIN@@"
+    end
+    if Hardware::CPU.intel?
+      url "https://github.com/OxidantData/ctxlake/releases/download/v@@VERSION@@/ctxlake-x86_64-apple-darwin.tar.xz"
+      sha256 "@@SHA256_X86_64_APPLE_DARWIN@@"
+    end
+  end
+  if OS.linux?
+    if Hardware::CPU.arm?
+      url "https://github.com/OxidantData/ctxlake/releases/download/v@@VERSION@@/ctxlake-aarch64-unknown-linux-gnu.tar.xz"
+      sha256 "@@SHA256_AARCH64_UNKNOWN_LINUX_GNU@@"
+    end
+    if Hardware::CPU.intel?
+      url "https://github.com/OxidantData/ctxlake/releases/download/v@@VERSION@@/ctxlake-x86_64-unknown-linux-gnu.tar.xz"
+      sha256 "@@SHA256_X86_64_UNKNOWN_LINUX_GNU@@"
+    end
+  end
+  license "AGPL-3.0-or-later"
+
+  def install
+    bin.install "ctxlake"
+    bin.install "ctxlake-hook"
+
+    # Homebrew installs these automatically from the prefix; ship whatever the
+    # archive happens to carry without failing when one is absent (a source
+    # checkout always has them, but keep this robust to what the archive step
+    # decides to include).
+    doc_files = Dir["README.*", "readme.*", "LICENSE", "LICENSE.*", "NOTICE", "CHANGELOG.*"]
+    leftover_contents = Dir["*"] - doc_files - ["ctxlake", "ctxlake-hook"]
+    pkgshare.install(*leftover_contents) unless leftover_contents.empty?
+  end
+
+  test do
+    system "#{bin}/ctxlake", "--version"
+  end
+end

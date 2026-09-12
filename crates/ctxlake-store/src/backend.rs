@@ -141,10 +141,196 @@ pub fn build(url: &Url, opts: &BackendOptions) -> Result<(Arc<dyn ObjectStore>, 
     }
 }
 
+/// A friendly identity for the backend a store URL addresses, plus any
+/// operational caveats specific to *that* backend (not the generic matrix in
+/// docs/storage.md, but the one-liners worth a human's attention right now).
+///
+/// This exists because `url.scheme()` alone collapses AWS S3, MinIO and
+/// Cloudflare R2 into the same `s3` string — they all take the identical code
+/// path in [`build`] (that's the point: "one setting, every S3-shaped backend
+/// in scope," per this module's doc), but an operator staring at `ctxlake
+/// doctor` output still wants to know *which one* they're pointed at and what
+/// is worth double-checking about it. Detection here is a best-effort label
+/// for display, never a branch [`build`] takes — [`build`] must keep working
+/// identically regardless of what this guesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendInfo {
+    /// Human-readable backend name, e.g. `"s3-compatible (Cloudflare R2)"`.
+    pub kind: &'static str,
+    /// Zero or more short, backend-specific caveats. Empty when there is
+    /// nothing beyond the general matrix in docs/storage.md worth surfacing.
+    pub caveats: Vec<&'static str>,
+}
+
+const MINIO_NO_PUT_IF_ABSENT: &str = "no put-if-absent (minio/minio#20346) — ctxlake never \
+     relies on it; leases are CAS-only (AGENTS.md invariant 4)";
+
+const R2_CONDITIONAL_WRITE_MODE: &str = "CAS depends on the bucket's conditional-write mode \
+     being ETagMatch-compatible — a bucket created in the wrong mode returns success codes for \
+     writes whose condition silently did not apply (see docs/storage.md); `ctxlake doctor`'s \
+     cas-update/cas-conflict-detection probes are what actually catch this, this label is only \
+     a pointer to run them";
+
+const GCS_GENERATION_PRECONDITIONS: &str = "CAS uses generation preconditions \
+     (x-goog-if-generation-match), not ETags — verified by reading object_store's GCS client \
+     source, not against a live bucket in this environment (see docs/storage.md)";
+
+/// `opts.endpoint`, falling back to the same environment variables
+/// [`AmazonS3Builder::from_env`] itself recognizes for an S3 endpoint override
+/// (`AWS_ENDPOINT_URL`, `AWS_ENDPOINT`, `ENDPOINT_URL`, `ENDPOINT` — see
+/// `object_store`'s `aws/builder.rs` `FromStr` impl for `ConfigKey`).
+///
+/// [`describe`] needs this because `ctxlake-cli`'s `store_ctx::connect` calls
+/// [`build`] with a bare `BackendOptions::default()` today — nothing in
+/// `ctxlake.toml` carries an endpoint field yet, so a MinIO or R2 deployment is
+/// configured purely through these env vars. Without checking them too,
+/// `describe` would call every S3-shaped bucket "AWS S3" the moment it's asked
+/// with the same options `connect` actually uses, which defeats the point of
+/// telling MinIO and R2 apart from real S3 at all.
+fn resolve_s3_endpoint(opts: &BackendOptions) -> Option<String> {
+    opts.endpoint.clone().or_else(|| {
+        [
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT",
+            "ENDPOINT_URL",
+            "ENDPOINT",
+        ]
+        .into_iter()
+        .find_map(|k| std::env::var(k).ok())
+    })
+}
+
+/// Best-effort identification of the backend `url` (plus `opts`, since an `s3://`
+/// URL's real identity — AWS vs. MinIO vs. R2 — lives in the endpoint override,
+/// not the scheme) addresses, for display in `ctxlake doctor` output.
+///
+/// Endpoint sniffing is a heuristic over a hostname substring, not a protocol
+/// negotiation — a self-hosted MinIO behind a proxy with a custom domain won't
+/// match `"minio"`, and that's fine: worst case this falls back to the generic
+/// "S3-compatible" label, which is still accurate, just less specific.
+pub fn describe(url: &Url, opts: &BackendOptions) -> BackendInfo {
+    match url.scheme() {
+        "s3" | "s3a" => {
+            let endpoint = resolve_s3_endpoint(opts)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if endpoint.is_empty() {
+                BackendInfo {
+                    kind: "AWS S3",
+                    caveats: vec![],
+                }
+            } else if endpoint.contains("r2.cloudflarestorage.com") {
+                BackendInfo {
+                    kind: "s3-compatible (Cloudflare R2)",
+                    caveats: vec![R2_CONDITIONAL_WRITE_MODE],
+                }
+            } else if endpoint.contains("minio") {
+                BackendInfo {
+                    kind: "s3-compatible (MinIO)",
+                    caveats: vec![MINIO_NO_PUT_IF_ABSENT],
+                }
+            } else {
+                BackendInfo {
+                    kind: "s3-compatible (unrecognized vendor)",
+                    caveats: vec![
+                        "vendor not recognized from the endpoint hostname — run `ctxlake \
+                         doctor` and don't assume put-if-absent works (MinIO doesn't)",
+                    ],
+                }
+            }
+        }
+        "gs" => BackendInfo {
+            kind: "Google Cloud Storage",
+            caveats: vec![GCS_GENERATION_PRECONDITIONS],
+        },
+        "az" | "abfs" | "abfss" => BackendInfo {
+            kind: "Azure Blob Storage",
+            caveats: vec![],
+        },
+        "file" => BackendInfo {
+            kind: "local filesystem",
+            caveats: vec![
+                "CAS is emulated with flock + rename, single-host only — not a substitute \
+                 for a real object store in a multi-host fleet (see docs/storage.md)",
+            ],
+        },
+        "memory" => BackendInfo {
+            kind: "in-memory (test only)",
+            caveats: vec!["not durable across process restarts — never use outside tests"],
+        },
+        _ => BackendInfo {
+            kind: "unknown",
+            caveats: vec!["unrecognized store URL scheme — see docs/storage.md"],
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store::ObjectStoreExt;
+
+    // `describe`'s env-var fallback reads process-wide state (`std::env::var`),
+    // and `cargo test` runs a crate's tests on multiple threads of the same
+    // process by default — two tests setting/clearing the same env var
+    // concurrently would flake each other. This serializes just the tests that
+    // touch it; every other test in this file is unaffected.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: always restores (or removes) the env var on drop, including
+    /// on an assertion panic mid-test, so one failing test can't poison every
+    /// test that runs after it in the same process.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: serialized by `ENV_LOCK`, held by every caller of this guard.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: serialized by `ENV_LOCK`, held by every caller of this guard.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by `ENV_LOCK`, held by every caller of this guard.
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    const S3_ENDPOINT_ENV_KEYS: [&str; 4] = [
+        "AWS_ENDPOINT_URL",
+        "AWS_ENDPOINT",
+        "ENDPOINT_URL",
+        "ENDPOINT",
+    ];
+
+    /// Every `describe()` test below that doesn't itself mean to test the env
+    /// fallback still runs under this: a developer's own shell (`ENDPOINT` is
+    /// not an uncommon name to have set for something unrelated) must not leak
+    /// into `resolve_s3_endpoint`'s ambient reads and flake an assertion about
+    /// `opts.endpoint` alone.
+    fn clear_s3_endpoint_env() -> Vec<EnvVarGuard> {
+        S3_ENDPOINT_ENV_KEYS
+            .iter()
+            .map(|k| EnvVarGuard::clear(k))
+            .collect()
+    }
 
     #[test]
     fn file_scheme_builds_a_local_store() {
@@ -208,6 +394,185 @@ mod tests {
         // ever issues `PutMode::Update`, so this setting is exercised on every
         // lease-file test) lives in lease.rs.
         let _ = store;
+    }
+
+    #[test]
+    fn r2_endpoint_builds_with_the_same_etag_conditional_put_as_minio() {
+        // R2 speaks the S3 API through the exact same `s3`/`s3a` scheme as MinIO —
+        // there is no `r2://` branch in `build()`, by design (this module's doc:
+        // "one setting, every S3-shaped backend in scope"). This test exists so
+        // that claim stays checked: an R2-shaped endpoint (the real
+        // `<account_id>.r2.cloudflarestorage.com` hostname pattern) must build
+        // exactly as readily as a MinIO endpoint does, with no separate code path
+        // to fall out of sync. As with the MinIO test above, `conditional_put` is
+        // private to `object_store`'s `AmazonS3`, so what's assertable here is
+        // that construction succeeds unconditionally (never gated behind
+        // recognizing the endpoint as "R2") — the wildcard-vs-ETagMatch lesson
+        // (AGENTS.md invariant 4) applies to R2 identically because it is the
+        // identical code path, not a parallel one that could drift.
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let opts = BackendOptions {
+            endpoint: Some("https://abc123.r2.cloudflarestorage.com".into()),
+            virtual_hosted_style_request: true,
+            ..Default::default()
+        };
+        let (store, path) = build(&url, &opts).unwrap();
+        assert_eq!(path.as_ref(), "ctxlake");
+        let _ = store;
+    }
+
+    #[test]
+    fn gs_scheme_builds_a_gcs_store() {
+        let url = Url::parse("gs://my-bucket/ctxlake").unwrap();
+        let (store, path) = build(&url, &BackendOptions::default()).unwrap();
+        assert_eq!(path.as_ref(), "ctxlake");
+        let _ = store;
+    }
+
+    #[test]
+    fn gs_url_missing_a_bucket_is_reported_not_panicked() {
+        let url = Url::parse("gs:/no-host").unwrap();
+        let err = build(&url, &BackendOptions::default());
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn describe_recognizes_aws_s3_by_scheme_with_no_endpoint_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let info = describe(&url, &BackendOptions::default());
+        assert_eq!(info.kind, "AWS S3");
+        assert!(info.caveats.is_empty());
+    }
+
+    #[test]
+    fn describe_recognizes_minio_from_the_endpoint_hostname() {
+        // A bare "http://localhost:9000" (this crate's own CI/dev default,
+        // AGENTS.md's "hard-won facts") has nothing in it that says "MinIO" —
+        // the hostname is generic. This test uses the shape a self-hosted
+        // deployment's endpoint actually carries (a "minio" hostname segment,
+        // e.g. docker-compose's service-name-as-DNS-name convention) so the
+        // heuristic has something real to match; the localhost case correctly
+        // falls through to the generic "S3-compatible" label instead (covered
+        // by `describe_falls_back_to_generic_s3_compatible_for_an_unrecognized_endpoint`).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let opts = BackendOptions {
+            endpoint: Some("http://minio.internal:9000".into()),
+            ..Default::default()
+        };
+        let info = describe(&url, &opts);
+        assert_eq!(info.kind, "s3-compatible (MinIO)");
+        assert!(
+            info.caveats.iter().any(|c| c.contains("put-if-absent")),
+            "MinIO's missing put-if-absent (minio/minio#20346) must be surfaced: {:?}",
+            info.caveats
+        );
+    }
+
+    #[test]
+    fn describe_recognizes_r2_from_the_endpoint_hostname() {
+        // Regression guard: this is the "R2 needs the same treatment as MinIO"
+        // requirement, checked at the level that actually matters for an
+        // operator reading `ctxlake doctor` output — the right *label and
+        // caveat*, not just that `build()` didn't panic (covered above).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let opts = BackendOptions {
+            endpoint: Some("https://abc123.r2.cloudflarestorage.com".into()),
+            ..Default::default()
+        };
+        let info = describe(&url, &opts);
+        assert_eq!(info.kind, "s3-compatible (Cloudflare R2)");
+        assert!(
+            info.caveats
+                .iter()
+                .any(|c| c.contains("conditional-write mode")),
+            "R2's conditional-write-mode footgun must be surfaced: {:?}",
+            info.caveats
+        );
+    }
+
+    #[test]
+    fn describe_falls_back_to_the_same_env_vars_from_env_reads_for_the_endpoint() {
+        // `store_ctx::connect` (ctxlake-cli) calls `build` with a bare
+        // `BackendOptions::default()` — nothing in `ctxlake.toml` carries an
+        // `endpoint` field today, so a real MinIO/R2 deployment's endpoint comes
+        // in purely through `AmazonS3Builder::from_env()`'s env vars. If
+        // `describe` only looked at `opts.endpoint`, it would call every such
+        // bucket "AWS S3" under the exact options `connect` actually uses —
+        // this guards against that regression by exercising `describe` the same
+        // way: default `BackendOptions`, endpoint supplied via env var alone.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+        let _env = EnvVarGuard::set("AWS_ENDPOINT_URL", "http://minio.internal:9000");
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let info = describe(&url, &BackendOptions::default());
+        assert_eq!(
+            info.kind, "s3-compatible (MinIO)",
+            "an endpoint set only via AWS_ENDPOINT_URL must still be detected"
+        );
+    }
+
+    #[test]
+    fn describe_prefers_an_explicit_opts_endpoint_over_the_environment() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+        let _env = EnvVarGuard::set("AWS_ENDPOINT_URL", "http://minio.internal:9000");
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let opts = BackendOptions {
+            endpoint: Some("https://abc123.r2.cloudflarestorage.com".into()),
+            ..Default::default()
+        };
+        let info = describe(&url, &opts);
+        assert_eq!(
+            info.kind, "s3-compatible (Cloudflare R2)",
+            "an explicit endpoint in BackendOptions must win over the ambient environment"
+        );
+    }
+
+    #[test]
+    fn describe_falls_back_to_generic_s3_compatible_for_an_unrecognized_endpoint() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clean = clear_s3_endpoint_env();
+
+        let url = Url::parse("s3://my-bucket/ctxlake").unwrap();
+        let opts = BackendOptions {
+            endpoint: Some("https://storage.example-vendor.net".into()),
+            ..Default::default()
+        };
+        let info = describe(&url, &opts);
+        assert_eq!(info.kind, "s3-compatible (unrecognized vendor)");
+    }
+
+    #[test]
+    fn describe_recognizes_gcs_and_flags_generation_preconditions_as_unverified_live() {
+        let url = Url::parse("gs://my-bucket/ctxlake").unwrap();
+        let info = describe(&url, &BackendOptions::default());
+        assert_eq!(info.kind, "Google Cloud Storage");
+        assert!(
+            info.caveats
+                .iter()
+                .any(|c| c.contains("generation") && c.contains("not against a live bucket")),
+            "GCS's verification basis (source-read, not live) must be honest: {:?}",
+            info.caveats
+        );
+    }
+
+    #[test]
+    fn describe_recognizes_the_local_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(dir.path()).unwrap();
+        let info = describe(&url, &BackendOptions::default());
+        assert_eq!(info.kind, "local filesystem");
     }
 
     #[test]

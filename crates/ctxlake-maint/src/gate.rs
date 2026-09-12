@@ -7,14 +7,17 @@
 //! `ctxlake claims --status candidate --explain`) until a human or a later run
 //! with more evidence changes the outcome.
 //!
-//! **Precondition this module does not enforce itself:** the caller (`ctxlake
-//! maint`'s promotion step) must hold `lease_maintenance`
-//! (`ctxlake_store::lease`) before calling [`run`]. That is what makes
+//! **The caller must hold `lease_maintenance` before calling [`run`], and this
+//! module now makes that a compile-time requirement rather than a comment.**
+//! [`run`] takes a `&ctxlake_store::lease::LeaseHandle` and checks at runtime that
+//! its key is actually `lease_maintenance` — a lease for the wrong key is still a
+//! caller mistake worth rejecting, not a proof of anything. That is what makes
 //! `publish_fleet_state`'s plain overwrite and this module's total absence of a
 //! version column or a CAS retry loop correct rather than reckless — see
 //! `claims::publish_fleet_state`'s doc and AGENTS.md's maintenance chain. Gate
-//! logic is not the place to re-implement lease acquisition; it is the place to
-//! assume it already happened.
+//! logic is not the place to re-implement lease acquisition (renewal, stealing,
+//! TTL) — it is the place to require proof it already happened, which a
+//! `LeaseHandle` value only exists once `lease::acquire` has succeeded.
 
 use std::collections::HashMap;
 
@@ -95,10 +98,6 @@ fn lexical_overlap(a: &str, b: &str) -> f32 {
     shared as f32 / words_a.len() as f32
 }
 
-fn normalize(claim: &str) -> String {
-    claim.trim().to_lowercase()
-}
-
 /// Everything the gate needs that isn't already on the candidate itself —
 /// injected as plain data/closures rather than an async trait so the four checks
 /// stay synchronous and trivially unit-testable without a runtime or a fake
@@ -142,12 +141,26 @@ pub enum GateDecision {
 
 /// Gate 1 (coarse): can this claim type structurally ever promote right now,
 /// judging only by the raw evidence on file — cheap enough to run before the
-/// more expensive checks. `hypothesis` and un-approved `preference` fail here
-/// unconditionally; everything else needs at least one evidence session (the
-/// authoritative per-type count is enforced later, in gate 4, using
-/// `independent_count` rather than this raw count — docs/memory.md: "thresholds
-/// read independent_count, never evidence_count").
+/// more expensive checks. Every claim type needs at least one evidence citation,
+/// full stop — docs/memory.md's "No evidence, no claim" — and `hypothesis` and
+/// un-approved `preference` fail unconditionally on top of that. The
+/// authoritative *count* for the types that need more than one is enforced
+/// later, in gate 4, using `independent_count` rather than this raw count —
+/// docs/memory.md: "thresholds read independent_count, never evidence_count".
 fn evidence_precheck(candidate: &ClaimState, human_approved: bool) -> Result<(), String> {
+    // docs/memory.md's "No evidence, no claim" is stated as a floor beneath every
+    // claim type, not a per-type option some rows of the promotion table happen to
+    // repeat — "This single rule removes most hallucinated memory." A zero-evidence
+    // `preference` used to slip past this function once `human_approved` was set,
+    // because the empty-evidence check previously lived only inside the
+    // Environment/Outcome/Convention arm below. Checking it here, before the
+    // per-type match, makes the gate the authoritative enforcement point
+    // docs/memory.md claims it is, rather than trusting extraction and
+    // `memory_propose` to have already filtered — belt and braces, since this
+    // function's whole job is to be the belt for every claim type at once.
+    if candidate.evidence.is_empty() {
+        return Err("no evidence at all".to_string());
+    }
     match candidate.claim_type {
         ClaimType::Hypothesis => Err(
             "hypothesis claims never auto-promote beyond agent scope, at any evidence count"
@@ -160,13 +173,7 @@ fn evidence_precheck(candidate: &ClaimState, human_approved: bool) -> Result<(),
                 Err("preference claims require human approval".to_string())
             }
         }
-        ClaimType::Environment | ClaimType::Outcome | ClaimType::Convention => {
-            if candidate.evidence.is_empty() {
-                Err("no evidence at all".to_string())
-            } else {
-                Ok(())
-            }
-        }
+        ClaimType::Environment | ClaimType::Outcome | ClaimType::Convention => Ok(()),
     }
 }
 
@@ -179,7 +186,8 @@ fn find_contradiction(candidate: &ClaimState, promoted: &[ClaimState]) -> Option
         .filter(|p| p.subject == candidate.subject && p.status == ClaimStatus::Promoted)
         .collect();
     for p in &same_subject {
-        if normalize(&p.claim) == normalize(&candidate.claim) {
+        if claims::normalize_claim_text(&p.claim) == claims::normalize_claim_text(&candidate.claim)
+        {
             // Same claim, not a conflict — this is corroboration, handled by
             // evidence accumulation on the same claim_id, not the gate.
             continue;
@@ -198,10 +206,21 @@ fn find_contradiction(candidate: &ClaimState, promoted: &[ClaimState]) -> Option
     None
 }
 
-/// Gate 3: `observed_by` is a real agent, every evidence citation's session
-/// falls inside a known window at `observed_at`, and (delegated to the caller
-/// via `excerpt_resolves`, since resolving a hash needs the actual transcript)
-/// every excerpt hash checks out.
+/// Gate 3: `observed_by` is a real agent, every evidence citation's *own*
+/// `observed_at` falls inside *its own* session's window, and (delegated to the
+/// caller via `excerpt_resolves`, since resolving a hash needs the actual
+/// transcript) every excerpt hash checks out.
+///
+/// This checks each [`Evidence`]'s own `observed_at` against its own session's
+/// window — never the claim-level `candidate.observed_at` against every cited
+/// session's window. A claim's evidence can span sessions from different days (a
+/// `convention` first proposed Tuesday, corroborated Friday, is the whole point
+/// of the independence gate); `candidate.observed_at` only ever holds the
+/// timestamp of whichever `Proposed` event created the claim (see `fold`, which
+/// never updates it on later evidence merges), so checking it against a *later*
+/// session's window would reject every multi-session claim as a matter of course,
+/// which is a livelock the fixture data controlling test dates would happily hide
+/// (every session in the old `windows_for` test helper shared the same day).
 fn check_provenance(
     candidate: &ClaimState,
     ctx: &GateContext,
@@ -217,12 +236,10 @@ fn check_provenance(
         let Some((start, end)) = ctx.session_windows.get(&e.session_id) else {
             return Err(format!("session {} has no known time window", e.session_id));
         };
-        if candidate.observed_at.as_str() < start.as_str()
-            || candidate.observed_at.as_str() > end.as_str()
-        {
+        if e.observed_at.as_str() < start.as_str() || e.observed_at.as_str() > end.as_str() {
             return Err(format!(
-                "observed_at {} falls outside session {}'s window [{start}, {end}]",
-                candidate.observed_at, e.session_id
+                "evidence observed_at {} falls outside session {}'s window [{start}, {end}]",
+                e.observed_at, e.session_id
             ));
         }
         if !excerpt_resolves(e) {
@@ -387,16 +404,35 @@ pub struct GateRunSummary {
 
 /// Fold every event, run the gate over every still-`candidate` claim, append the
 /// resulting events, and republish `claims/fleet/` for anything that changed
-/// status. Assumes the caller already holds `lease_maintenance` — see the module
-/// doc.
+/// status.
+///
+/// `lease` must be a [`ctxlake_store::lease::LeaseHandle`] for
+/// `ctxlake_store::layout::lease_maintenance()` — see the module doc for why this
+/// is a parameter rather than a comment. It is not renewed or released here;
+/// callers own its lifecycle exactly as they do today, this just makes "did you
+/// remember to acquire it" a value you have to produce instead of a sentence you
+/// have to remember.
 pub async fn run(
     store: &dyn ObjectStore,
+    lease: &ctxlake_store::lease::LeaseHandle,
     ctx_at: &str,
     known_agents: &std::collections::HashSet<String>,
     session_windows: &HashMap<String, (String, String)>,
     injected_context_by_session: &HashMap<String, std::collections::HashSet<String>>,
     excerpt_resolves: impl Fn(&Evidence) -> bool,
 ) -> Result<GateRunSummary, StoreError> {
+    let expected_key = ctxlake_store::layout::lease_maintenance();
+    if lease.key != expected_key {
+        // A `LeaseHandle` for some other key proves nothing about who else may be
+        // touching `claims/fleet/` right now — accepting it would make the type
+        // requirement above theater. This is a caller bug (wrong lease threaded
+        // through), not a race, so it fails loudly rather than silently trusting
+        // the wrong proof.
+        return Err(StoreError::Config(format!(
+            "gate::run requires a LeaseHandle for {expected_key} (lease_maintenance), got one for {}",
+            lease.key
+        )));
+    }
     let events = claims::list_events(store).await?;
     let folded = claims::fold(events.iter());
     let mut promoted: Vec<ClaimState> = folded
@@ -512,6 +548,38 @@ mod tests {
             session_id: session.into(),
             message_id: msg.into(),
             excerpt_hash: format!("hash-{session}-{msg}"),
+            // Inside `windows_for`'s default 2026-09-09 window, so tests that
+            // don't care about provenance timing at all don't have to think
+            // about it. Tests that DO care (the provenance suite below)
+            // override this per evidence item.
+            observed_at: "2026-09-09T12:00:00Z".into(),
+        }
+    }
+
+    /// Acquire a real [`ctxlake_store::lease::LeaseHandle`] for
+    /// `lease_maintenance` against a fresh in-memory store — `gate::run` now
+    /// requires one (see the module doc), and `LeaseHandle`'s CAS `version` field
+    /// is private outside `ctxlake_store::lease`, so a test can't just construct
+    /// one by hand; it has to go through the real acquire path like any caller
+    /// would.
+    async fn test_maintenance_lease(store: &dyn ObjectStore) -> ctxlake_store::lease::LeaseHandle {
+        let key = ctxlake_store::layout::lease_maintenance();
+        ctxlake_store::lease::provision(store, &key).await.unwrap();
+        match ctxlake_store::lease::acquire(
+            store,
+            &ctxlake_store::clock::SystemClock,
+            &key,
+            "test-maintenance-runner",
+            None,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap()
+        {
+            ctxlake_store::lease::AcquireOutcome::Acquired(handle) => handle,
+            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => {
+                panic!("a freshly provisioned lease on an empty store must always be acquirable")
+            }
         }
     }
 
@@ -886,7 +954,9 @@ mod tests {
     fn provenance_rejects_an_observed_at_outside_the_session_window() {
         let mut c = candidate(ClaimType::Environment, "staging", "SSH on 2222", &["s1"]);
         c.observed_by = "cc-01".into();
-        c.observed_at = "2099-01-01T00:00:00Z".into();
+        // The check is against each evidence item's OWN observed_at, not the
+        // claim-level one — see `check_provenance`'s doc.
+        c.evidence[0].observed_at = "2099-01-01T00:00:00Z".into();
         let known_agents = StdHashSet::from(["cc-01".to_string()]);
         let windows = windows_for(&["s1"]);
         let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
@@ -943,9 +1013,11 @@ mod tests {
         let known_agents = StdHashSet::from(["cc-01".to_string()]);
         let windows = windows_for(&["s1"]);
         let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
+        let lease = test_maintenance_lease(&store).await;
 
         let summary = run(
             &store,
+            &lease,
             "2026-09-09T12:05:00Z",
             &known_agents,
             &windows,
@@ -982,9 +1054,11 @@ mod tests {
         let known_agents = StdHashSet::from(["cc-01".to_string()]);
         let windows = windows_for(&["s1"]);
         let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
+        let lease = test_maintenance_lease(&store).await;
 
         let summary = run(
             &store,
+            &lease,
             "2026-09-09T12:05:00Z",
             &known_agents,
             &windows,
@@ -1001,5 +1075,140 @@ mod tests {
         let folded = claims::fold(events.iter());
         assert_eq!(folded.get("c1").unwrap().status, ClaimStatus::Candidate);
         assert!(claims::list_fleet_claims(&store).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_lease_for_the_wrong_key() {
+        // A LeaseHandle is a value, not magic — `run` must actually check which
+        // key it names rather than accepting any handle as proof someone,
+        // somewhere, holds *some* lease. Threading in a handle for an unrelated
+        // key is the caller-side bug this check exists to catch.
+        let store = object_store::memory::InMemory::new();
+        let wrong_key = object_store::path::Path::from("live/leases/not-maintenance");
+        ctxlake_store::lease::provision(&store, &wrong_key)
+            .await
+            .unwrap();
+        let wrong_lease = match ctxlake_store::lease::acquire(
+            &store,
+            &ctxlake_store::clock::SystemClock,
+            &wrong_key,
+            "someone-else",
+            None,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap()
+        {
+            ctxlake_store::lease::AcquireOutcome::Acquired(h) => h,
+            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => unreachable!(),
+        };
+
+        let known_agents = StdHashSet::new();
+        let windows = HashMap::new();
+        let injected = HashMap::new();
+        let err = run(
+            &store,
+            &wrong_lease,
+            "2026-09-09T12:05:00Z",
+            &known_agents,
+            &windows,
+            &injected,
+            always_resolves,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("lease_maintenance"),
+            "expected a lease-key error, got: {err}"
+        );
+    }
+
+    // ---- "no evidence, no claim" applies even to a human-approved preference ----
+
+    #[test]
+    fn preference_with_zero_evidence_never_promotes_even_with_human_approval() {
+        // docs/memory.md's "No evidence, no claim" is stated as an absolute floor,
+        // not a rule that only applies to types whose promotion table entry
+        // happens to name a raw count. A preference with nothing cited must fail
+        // the evidence gate regardless of `human_approved`.
+        let c = candidate(
+            ClaimType::Preference,
+            "output-style",
+            "prefers terse output",
+            &[],
+        );
+        let known_agents = StdHashSet::from(["cc-01".to_string()]);
+        let windows = HashMap::new();
+        let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
+        let promoted = Vec::new();
+        let mut ctx = default_ctx(&promoted, &known_agents, &windows, &injected);
+        ctx.human_approved = true;
+
+        let decision = run_gate(&c, &ctx, always_resolves);
+        assert!(
+            matches!(
+                decision,
+                GateDecision::Review {
+                    failed_gate: "evidence",
+                    ..
+                }
+            ),
+            "a zero-evidence preference must not promote even when human-approved, got {decision:?}"
+        );
+    }
+
+    // ---- provenance must check each citation against its OWN session, not the
+    //      claim's single observed_at against every session ----
+
+    #[test]
+    fn provenance_accepts_evidence_spanning_two_different_session_windows() {
+        // The exact scenario a `convention` needs to demonstrate independence:
+        // first observed in session-a on 2026-09-09, corroborated three days
+        // later in session-b. Each evidence item's OWN observed_at sits inside
+        // its OWN session's window even though the two windows don't overlap —
+        // checking the claim-level observed_at (fixed at first-proposal time)
+        // against session-b's later window is exactly the bug this test guards.
+        let mut c = candidate(
+            ClaimType::Convention,
+            "build-tooling",
+            "this repo uses just, not make",
+            &["session-a", "session-b"],
+        );
+        c.embedding = None;
+        c.evidence[0].observed_at = "2026-09-09T12:00:00Z".into();
+        c.evidence[1].observed_at = "2026-09-12T09:00:00Z".into();
+
+        let mut windows = HashMap::new();
+        windows.insert(
+            "session-a".to_string(),
+            (
+                "2026-09-09T00:00:00Z".to_string(),
+                "2026-09-09T23:59:59Z".to_string(),
+            ),
+        );
+        windows.insert(
+            "session-b".to_string(),
+            (
+                "2026-09-12T00:00:00Z".to_string(),
+                "2026-09-12T23:59:59Z".to_string(),
+            ),
+        );
+        let known_agents = StdHashSet::from(["cc-01".to_string()]);
+        let injected: HashMap<String, StdHashSet<String>> = HashMap::new();
+        let promoted = Vec::new();
+        let ctx = default_ctx(&promoted, &known_agents, &windows, &injected);
+
+        let decision = run_gate(&c, &ctx, always_resolves);
+        assert!(
+            matches!(
+                decision,
+                GateDecision::Promote {
+                    independent_count: 2,
+                    ..
+                }
+            ),
+            "evidence spanning two genuinely different session windows must not be \
+             rejected by provenance, got {decision:?}"
+        );
     }
 }

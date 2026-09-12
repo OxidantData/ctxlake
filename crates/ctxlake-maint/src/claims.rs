@@ -79,11 +79,32 @@ pub enum ClaimStatus {
 /// A `(session_id, message_id, excerpt_hash)` citation. `excerpt_hash` is always
 /// computed by ctxlake from the real transcript, never taken from the model's own
 /// claimed hash — see `extract`'s citation-verification doc.
+///
+/// `observed_at` is the timestamp of *this specific message* — the envelope's own
+/// `emitted_at`, computed the same untrusted-input-safe way as `excerpt_hash`, not
+/// the claim-level `observed_at` on [`ProposedClaim`]/[`ClaimState`] (which is
+/// "when the claim was first proposed" and does not move as more evidence
+/// accrues). The provenance gate (`gate::check_provenance`) checks each citation's
+/// *own* `observed_at` against *its own* session's window — checking the single
+/// claim-level timestamp against every cited session's window instead would reject
+/// any claim whose evidence spans more than one session, which is exactly the
+/// multi-day corroboration the independence gate exists to reward, not punish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evidence {
     pub session_id: String,
     pub message_id: String,
     pub excerpt_hash: String,
+    pub observed_at: String,
+}
+
+/// Lowercase, trimmed claim text — the equality ctxlake-maint uses everywhere it
+/// needs to decide "is this the same claim I already have on file," never a raw
+/// `==` on the model's own casing/whitespace. Shared by [`fold`]'s callers
+/// (extraction's claim_id-reuse, see `extract::find_existing_claim_id`) and the
+/// contradiction gate (`gate::find_contradiction`), so the two places that ask
+/// "same claim or not" can't drift into disagreeing definitions of "same."
+pub(crate) fn normalize_claim_text(claim: &str) -> String {
+    claim.trim().to_lowercase()
 }
 
 /// One proposal: either a brand-new claim (`claim_id` never seen before) or
@@ -303,12 +324,21 @@ pub async fn list_events(store: &dyn ObjectStore) -> Result<Vec<ClaimEvent>, Sto
 
 /// Overwrite `claims/fleet/<claim_id>.json` with this claim's current folded
 /// state. A plain [`ObjectStore::put`] (no CAS) is correct, not a shortcut: the
-/// promotion gate runs single-writer under `lease_maintenance`
-/// (docs/architecture.md's maintenance chain), so by the time any code reaches
-/// this call there is, by construction, no concurrent writer to race — the
+/// promotion gate runs single-writer while holding `lease_maintenance`
+/// (`gate::run` takes a [`ctxlake_store::lease::LeaseHandle`] and refuses to run
+/// without one for exactly this reason), so by the time any code reaches this
+/// call there is, by construction, no concurrent writer to race — the
 /// version-checked CAS that `live/` needs would just be locking a resource this
 /// design already made single-writer. See `layout::claim_fleet`.
-pub async fn publish_fleet_state(
+///
+/// `pub(crate)`, not `pub`: this is the one function in the crate that writes a
+/// `Promoted`/`Contested` [`ClaimState`] straight to fleet scope, so AGENTS.md
+/// invariant 9 ("nothing writes to fleet scope except the promotion gate") is
+/// only as real as this function being unreachable from outside `gate::run`'s own
+/// call sites. A `pub` fn here would have handed `ctxlake-cli` (which already
+/// depends on this crate) — or any future crate that does — the identical
+/// capability to skip every gate.
+pub(crate) async fn publish_fleet_state(
     store: &dyn ObjectStore,
     state: &ClaimState,
 ) -> Result<(), StoreError> {
@@ -318,10 +348,21 @@ pub async fn publish_fleet_state(
     Ok(())
 }
 
-/// Read every claim currently published to fleet scope. `Ok(vec![])` covers both
-/// "nothing has ever been promoted" and "the prefix doesn't exist yet" — neither
-/// is an error a caller needs to branch on separately.
-pub async fn list_fleet_claims(store: &dyn ObjectStore) -> Result<Vec<ClaimState>, StoreError> {
+/// Read every claim currently published to fleet scope, **with no shadow-mode
+/// filtering at all** — this is the raw contents of `claims/fleet/`, promoted and
+/// contested alike, in whatever mode the gate last ran in. `pub(crate)`, not
+/// `pub`: it is an implementation detail of [`read_promoted_for_agents`] and this
+/// module's own tests, not a sanctioned way for anything else to read fleet
+/// claims. A `pub` version of exactly this function is what a briefing builder or
+/// an MCP cache refresh would reach for first, and it would hand back promoted,
+/// shadow-mode claim text with no mode argument to even pass — see
+/// [`claims_visible_to_agents`]'s doc for the read path that is safe to expose.
+/// `Ok(vec![])` covers both "nothing has ever been promoted" and "the prefix
+/// doesn't exist yet" — neither is an error a caller needs to branch on
+/// separately.
+pub(crate) async fn list_fleet_claims(
+    store: &dyn ObjectStore,
+) -> Result<Vec<ClaimState>, StoreError> {
     use futures::StreamExt;
     let prefix = ctxlake_store::layout::claims_fleet_prefix();
     let mut out = Vec::new();
@@ -343,10 +384,22 @@ pub async fn list_fleet_claims(store: &dyn ObjectStore) -> Result<Vec<ClaimState
 
 /// The one sanctioned way for anything downstream (a briefing builder, an MCP
 /// cache refresh) to ask "which claims may an agent actually see." Shadow mode is
-/// enforced *here*, not only where `ctxlake.toml` is parsed — a caller cannot get
-/// a promoted, shadow-mode claim by going around config, because there is no
-/// other read path in this crate that returns fleet claims. See the module-level
-/// task brief: "structurally impossible for a shadow-mode claim to be served."
+/// enforced *here*, not only where `ctxlake.toml` is parsed.
+///
+/// This is enforced structurally for the fleet-scope *publish* path:
+/// [`list_fleet_claims`] and [`publish_fleet_state`] are both `pub(crate)`, so
+/// nothing outside this crate can reach `claims/fleet/` except through this
+/// function or [`read_promoted_for_agents`]. It is **not**, and cannot be, enforced
+/// against [`list_events`]/[`fold`]: those are the general append-only-log
+/// primitives the gate itself needs to run (including in shadow mode — shadow
+/// mode still promotes claims, it just stops them from being served), so they stay
+/// `pub` and shadow-unaware by design. A caller with `pub` access to this crate
+/// that reaches for `fold(list_events(store).await?)` directly, instead of this
+/// function, gets the same raw promoted/contested claim text shadow mode is meant
+/// to hide — this function's guarantee covers callers going through the sanctioned
+/// read path, not every possible way to reconstruct state from the log. Anything
+/// that renders a claim into an agent's context window must go through this
+/// function or [`read_promoted_for_agents`], never `fold`/`list_events` directly.
 ///
 /// Only `Promoted` claims are ever agent-visible; `Contested` and `Retired`
 /// entries that still live under `claims/fleet/` (kept for audit, per the "older
@@ -400,6 +453,7 @@ mod tests {
             session_id: session.into(),
             message_id: msg.into(),
             excerpt_hash: format!("hash-{session}-{msg}"),
+            observed_at: "2026-09-09T00:00:00Z".into(),
         }
     }
 
@@ -415,6 +469,18 @@ mod tests {
             evidence: vec![evidence(session, "m1")],
             embedding: None,
         })
+    }
+
+    #[test]
+    fn normalize_claim_text_ignores_case_and_surrounding_whitespace() {
+        assert_eq!(
+            normalize_claim_text("  This repo uses Just, not Make  "),
+            normalize_claim_text("this repo uses just, not make")
+        );
+        assert_ne!(
+            normalize_claim_text("this repo uses just"),
+            normalize_claim_text("this repo uses make")
+        );
     }
 
     #[test]

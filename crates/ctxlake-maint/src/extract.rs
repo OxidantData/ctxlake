@@ -23,7 +23,7 @@
 //!   with `PutMode::Create` before doing any work, so a re-run (or a second host
 //!   racing the same session) extracts it at most once.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ctxlake_core::Envelope;
 use ctxlake_store::StoreError;
@@ -31,7 +31,7 @@ use futures::future::BoxFuture;
 use object_store::{Error as OsError, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use serde::{Deserialize, Serialize};
 
-use crate::claims::{ClaimType, Evidence, ProposedClaim, Scope};
+use crate::claims::{self, ClaimState, ClaimType, Evidence, ProposedClaim, Scope};
 
 /// `docs/summarization.md`'s `[summarize] mode` values. `Shadow` is not listed
 /// alongside the other four in the `mode` doc comment there because it gets its
@@ -578,10 +578,25 @@ pub fn parse_claims_response(raw: &str) -> Result<Vec<RawClaim>, ExtractError> {
     Ok(parsed.claims)
 }
 
-/// `(session_id, message_id) -> excerpt_hash`, built from the session's own
-/// envelopes — the only place an excerpt hash is allowed to come from. See
-/// [`claim_from_raw`].
-pub type ResolvableIndex = HashMap<(String, String), String>;
+/// What a `(session_id, message_id)` citation resolves to, once verified against
+/// the session's own captured envelopes — never taken from what a model claims.
+/// `observed_at` is the *envelope's own* `emitted_at`, i.e. when this specific
+/// message actually happened, not the session-level fallback timestamp
+/// [`extract_session`] uses for the claim as a whole. See [`Evidence`]'s doc for
+/// why the two must not be conflated: `gate::check_provenance` checks each
+/// citation's own timestamp against its own session's window, and a claim whose
+/// evidence spans more than one session (the whole point of corroboration) needs
+/// each citation to carry the time it was actually made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCitation {
+    pub excerpt_hash: String,
+    pub observed_at: String,
+}
+
+/// `(session_id, message_id) -> ResolvedCitation`, built from the session's own
+/// envelopes — the only place an excerpt hash or a citation's timestamp is
+/// allowed to come from. See [`claim_from_raw`].
+pub type ResolvableIndex = HashMap<(String, String), ResolvedCitation>;
 
 pub fn build_resolvable_index(envelopes: &[Envelope]) -> ResolvableIndex {
     let mut idx = HashMap::new();
@@ -589,25 +604,72 @@ pub fn build_resolvable_index(envelopes: &[Envelope]) -> ResolvableIndex {
         if let Some(message_id) = &e.message_id {
             idx.insert(
                 (e.session_id.clone(), message_id.clone()),
-                e.content_hash.clone(),
+                ResolvedCitation {
+                    excerpt_hash: e.content_hash.clone(),
+                    observed_at: e.emitted_at.clone(),
+                },
             );
         }
     }
     idx
 }
 
+/// Find a `claim_id` already on file for the same `(claim_type, subject,
+/// normalized claim text)` — the matching [`ProposedClaim`]'s own doc comment
+/// promises: "additional corroborating evidence for an existing candidate
+/// (`claim_id` reused — extraction ... does this when they recognize a claim
+/// already on file for the same subject)". Matches against any non-`Retired`
+/// state (`Candidate`, `Promoted`, or `Contested`) — a retired claim is done, and
+/// resurrecting it by silently reusing its id would put fresh evidence behind a
+/// status a human already closed out.
+///
+/// This is what makes `gate::compute_independent_count` mean anything in
+/// production: without it, every extraction mints a brand-new `claim_id`, so two
+/// sessions that "agree" always look like two unrelated single-evidence claims
+/// rather than one claim with two evidence sessions — the independence gate has
+/// nothing to discount and `independent_count` trivially equals `evidence_count`
+/// for every claim, exactly the failure the gate exists to prevent.
+fn find_existing_claim_id(
+    existing: &BTreeMap<String, ClaimState>,
+    claim_type: ClaimType,
+    subject: &str,
+    claim_text: &str,
+) -> Option<String> {
+    let norm_subject = claims::normalize_claim_text(subject);
+    let norm_claim = claims::normalize_claim_text(claim_text);
+    existing
+        .values()
+        .find(|s| {
+            s.status != crate::claims::ClaimStatus::Retired
+                && s.claim_type == claim_type
+                && claims::normalize_claim_text(&s.subject) == norm_subject
+                && claims::normalize_claim_text(&s.claim) == norm_claim
+        })
+        .map(|s| s.claim_id.clone())
+}
+
 /// Turn one raw candidate into a [`ProposedClaim`], or drop it. Two ways to be
 /// dropped, both silent (no low-confidence record, per docs/memory.md's
 /// "no evidence, no claim"): an unrecognized `claim_type`, or zero citations that
-/// actually resolve against this session's real transcript. `excerpt_hash` is
-/// **computed here**, from the session's own `content_hash`, never taken from
-/// whatever the model may have claimed — a model that invents a citation cannot
-/// also invent the hash of content that doesn't exist.
+/// actually resolve against this session's real transcript. `excerpt_hash` and
+/// each citation's `observed_at` are **computed here**, from the session's own
+/// captured envelopes, never taken from whatever the model may have claimed — a
+/// model that invents a citation cannot also invent the hash (or the timestamp)
+/// of content that doesn't exist.
+///
+/// `existing` is every claim currently on file (any status but `Retired`),
+/// keyed by `claim_id` — the fold of `claims/events/` at the time extraction
+/// runs. When this candidate matches one on `(claim_type, subject, claim text)`
+/// (see [`find_existing_claim_id`]), its `claim_id` is reused so the new evidence
+/// accumulates onto the same claim instead of minting a look-alike sibling; the
+/// event log's `fold` (see `claims.rs`) already merges evidence for a reused
+/// `claim_id`, so this is the only piece extraction needed to add.
 pub fn claim_from_raw(
     raw: RawClaim,
     observed_by: &str,
     observed_at: &str,
     resolvable: &ResolvableIndex,
+    existing: &BTreeMap<String, ClaimState>,
 ) -> Option<ProposedClaim> {
     let claim_type = ClaimType::parse(&raw.claim_type)?;
     let evidence: Vec<Evidence> = raw
@@ -616,18 +678,21 @@ pub fn claim_from_raw(
         .filter_map(|c| {
             resolvable
                 .get(&(c.session_id.clone(), c.message_id.clone()))
-                .map(|hash| Evidence {
+                .map(|resolved| Evidence {
                     session_id: c.session_id.clone(),
                     message_id: c.message_id.clone(),
-                    excerpt_hash: hash.clone(),
+                    excerpt_hash: resolved.excerpt_hash.clone(),
+                    observed_at: resolved.observed_at.clone(),
                 })
         })
         .collect();
     if evidence.is_empty() {
         return None;
     }
+    let claim_id = find_existing_claim_id(existing, claim_type, &raw.subject, &raw.claim)
+        .unwrap_or_else(ctxlake_core::envelope::next_event_id);
     Some(ProposedClaim {
-        claim_id: ctxlake_core::envelope::next_event_id(),
+        claim_id,
         claim: raw.claim,
         claim_type,
         subject: raw.subject,
@@ -689,6 +754,27 @@ pub async fn mark_extracted_if_new(
     {
         Ok(_) => Ok(true),
         Err(OsError::AlreadyExists { .. }) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read-only: has `session_id` already been extracted? A cheap existence check
+/// [`run`] uses to skip past done sessions *without* spending its
+/// `max_sessions_per_run` budget on them — see that function's doc for the
+/// silent-stall bug this exists to avoid. This intentionally does not claim
+/// anything: a session marked not-yet-extracted here can still race with another
+/// caller between this check and the real attempt, and that race is resolved the
+/// same way it always was, by [`mark_extracted_if_new`]'s atomic `Create` inside
+/// [`extract_session`] — this function only ever affects scheduling, never
+/// correctness.
+pub async fn is_already_extracted(
+    store: &dyn ObjectStore,
+    session_id: &str,
+) -> Result<bool, StoreError> {
+    let path = ctxlake_store::layout::claims_extracted(session_id);
+    match store.get(&path).await {
+        Ok(_) => Ok(true),
+        Err(OsError::NotFound { .. }) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
@@ -822,9 +908,22 @@ pub async fn extract_session(
         .map(|e| e.emitted_at.clone())
         .unwrap_or_default();
 
+    // What's already on file, so a matching claim (same type, subject, and text —
+    // see `find_existing_claim_id`) reuses its `claim_id` instead of minting a
+    // sibling the independence gate cannot tell apart from a second reporter of
+    // the same observation. Read once per session's extraction call: two claims
+    // *within the same session's own output* that happen to duplicate each other
+    // is a model-quality problem this pass doesn't try to solve, and is a
+    // different situation from cross-session corroboration, which is what
+    // `find_existing_claim_id` exists for.
+    let existing_events = crate::claims::list_events(store).await?;
+    let existing = crate::claims::fold(existing_events.iter());
+
     let mut proposed = 0usize;
     for raw in raw_claims {
-        if let Some(claim) = claim_from_raw(raw, &session.agent_id, &observed_at, &resolvable) {
+        if let Some(claim) =
+            claim_from_raw(raw, &session.agent_id, &observed_at, &resolvable, &existing)
+        {
             crate::claims::append_proposed(store, date, &claim).await?;
             proposed += 1;
         }
@@ -860,7 +959,23 @@ pub async fn run(
         .unwrap_or(0);
     let sealed = list_sealed_sessions(store).await?;
     let mut summary = ExtractRunSummary::default();
-    for session_ref in sealed.into_iter().take(limit) {
+    // `list_sealed_sessions` returns every sealed session, oldest first, with no
+    // notion of "already extracted" baked in (`mark_extracted_if_new`'s job, not
+    // its own — see that function's doc). Applying `max_sessions_per_run` to this
+    // raw list, as a naive `.take(limit)` used to, means that once the oldest
+    // `limit` sessions have ever been extracted, every subsequent run re-lists
+    // those exact same sessions, skips every one of them as already-done, and
+    // never reaches anything new — `sessions_processed: 0`, forever, with no
+    // error. The fix: skip already-extracted sessions with a cheap existence
+    // check *before* they count against the budget, so the budget is spent only
+    // on sessions this run actually attempts.
+    for session_ref in sealed {
+        if summary.sessions_processed >= limit {
+            break;
+        }
+        if is_already_extracted(store, &session_ref.session_id).await? {
+            continue;
+        }
         let transcript = load_transcript(store, &session_ref).await?;
         let date = transcript
             .envelopes
@@ -890,6 +1005,31 @@ mod tests {
             session,
             EventType::Assistant,
             format!("2026-09-09T12:{minute:02}:00.000Z"),
+        );
+        e.message_id = Some(message_id.to_string());
+        e.content = Some(content.to_string());
+        e.content_hash = ctxlake_core::hash::content_hash(content);
+        e
+    }
+
+    /// Like [`env_with`], but with a fully explicit `agent_id` and `emitted_at`
+    /// instead of a fixed date — needed for tests where two envelopes must land
+    /// in two different sessions' time windows (see the echo-case end-to-end
+    /// test below), which `env_with`'s single hardcoded date can't express.
+    fn env_with_at(
+        agent_id: &str,
+        session: &str,
+        message_id: &str,
+        content: &str,
+        emitted_at: &str,
+    ) -> Envelope {
+        let mut e = Envelope::new(
+            "oxidant",
+            agent_id,
+            Runtime::ClaudeCode,
+            session,
+            EventType::Assistant,
+            emitted_at.to_string(),
         );
         e.message_id = Some(message_id.to_string());
         e.content = Some(content.to_string());
@@ -1013,6 +1153,10 @@ mod tests {
 
     // ---- no evidence, no claim ----
 
+    fn no_existing_claims() -> BTreeMap<String, ClaimState> {
+        BTreeMap::new()
+    }
+
     #[test]
     fn claim_from_raw_drops_a_claim_with_zero_citations() {
         let raw = RawClaim {
@@ -1022,7 +1166,14 @@ mod tests {
             evidence: vec![],
         };
         let resolvable = ResolvableIndex::new();
-        assert!(claim_from_raw(raw, "cc-01", "2026-09-09T00:00:00Z", &resolvable).is_none());
+        assert!(claim_from_raw(
+            raw,
+            "cc-01",
+            "2026-09-09T00:00:00Z",
+            &resolvable,
+            &no_existing_claims()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1037,15 +1188,28 @@ mod tests {
             }],
         };
         let mut resolvable = ResolvableIndex::new();
-        resolvable.insert(("s1".to_string(), "m1".to_string()), "realhash".to_string());
+        resolvable.insert(
+            ("s1".to_string(), "m1".to_string()),
+            ResolvedCitation {
+                excerpt_hash: "realhash".to_string(),
+                observed_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        );
         assert!(
-            claim_from_raw(raw, "cc-01", "2026-09-09T00:00:00Z", &resolvable).is_none(),
+            claim_from_raw(
+                raw,
+                "cc-01",
+                "2026-09-09T00:00:00Z",
+                &resolvable,
+                &no_existing_claims()
+            )
+            .is_none(),
             "a citation to a message_id absent from the session must be dropped, not trusted"
         );
     }
 
     #[test]
-    fn claim_from_raw_keeps_a_claim_with_a_real_citation_and_uses_our_own_hash() {
+    fn claim_from_raw_keeps_a_claim_with_a_real_citation_and_uses_our_own_hash_and_timestamp() {
         let raw = RawClaim {
             claim: "staging SSH listens on 2222".into(),
             claim_type: "environment".into(),
@@ -1056,9 +1220,34 @@ mod tests {
             }],
         };
         let mut resolvable = ResolvableIndex::new();
-        resolvable.insert(("s1".to_string(), "m1".to_string()), "realhash".to_string());
-        let claim = claim_from_raw(raw, "cc-01", "2026-09-09T00:00:00Z", &resolvable).unwrap();
+        resolvable.insert(
+            ("s1".to_string(), "m1".to_string()),
+            ResolvedCitation {
+                excerpt_hash: "realhash".to_string(),
+                // Deliberately different from the call's own `observed_at`
+                // (below) — this is the message's own real timestamp, and the
+                // evidence item must carry THIS one, not the claim-level one.
+                observed_at: "2026-09-09T12:03:00Z".to_string(),
+            },
+        );
+        let claim = claim_from_raw(
+            raw,
+            "cc-01",
+            "2026-09-09T23:59:00Z",
+            &resolvable,
+            &no_existing_claims(),
+        )
+        .unwrap();
         assert_eq!(claim.evidence[0].excerpt_hash, "realhash");
+        assert_eq!(
+            claim.evidence[0].observed_at, "2026-09-09T12:03:00Z",
+            "evidence.observed_at must come from the cited message's own timestamp, \
+             not the session-level observed_at passed to claim_from_raw"
+        );
+        assert_eq!(
+            claim.observed_at, "2026-09-09T23:59:00Z",
+            "the claim-level observed_at is a separate field: when the claim was proposed"
+        );
     }
 
     #[test]
@@ -1073,8 +1262,119 @@ mod tests {
             }],
         };
         let mut resolvable = ResolvableIndex::new();
-        resolvable.insert(("s1".to_string(), "m1".to_string()), "h".to_string());
-        assert!(claim_from_raw(raw, "cc-01", "2026-09-09T00:00:00Z", &resolvable).is_none());
+        resolvable.insert(
+            ("s1".to_string(), "m1".to_string()),
+            ResolvedCitation {
+                excerpt_hash: "h".to_string(),
+                observed_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        );
+        assert!(claim_from_raw(
+            raw,
+            "cc-01",
+            "2026-09-09T00:00:00Z",
+            &resolvable,
+            &no_existing_claims()
+        )
+        .is_none());
+    }
+
+    // ---- claim_id reuse: the corroboration / independence gate's precondition ----
+
+    #[test]
+    fn claim_from_raw_reuses_the_claim_id_of_a_matching_existing_claim() {
+        // Same claim_type, subject, and (normalized) claim text as an existing
+        // claim already on file — this must reuse its claim_id so the new
+        // evidence accumulates onto it, rather than minting a fresh id that
+        // `gate::compute_independent_count` can never join against the first.
+        let raw = RawClaim {
+            claim: "  This repo uses JUST, not make ".into(),
+            claim_type: "convention".into(),
+            subject: "Build-Tooling".into(),
+            evidence: vec![RawCitation {
+                session_id: "s2".into(),
+                message_id: "m1".into(),
+            }],
+        };
+        let mut resolvable = ResolvableIndex::new();
+        resolvable.insert(
+            ("s2".to_string(), "m1".to_string()),
+            ResolvedCitation {
+                excerpt_hash: "h2".to_string(),
+                observed_at: "2026-09-12T00:00:00Z".to_string(),
+            },
+        );
+        let mut existing = BTreeMap::new();
+        existing.insert(
+            "claim-original".to_string(),
+            ClaimState {
+                claim_id: "claim-original".into(),
+                claim: "this repo uses just, not make".into(),
+                claim_type: ClaimType::Convention,
+                subject: "build-tooling".into(),
+                scope: Scope::Fleet,
+                observed_by: "cc-01".into(),
+                observed_at: "2026-09-09T00:00:00Z".into(),
+                evidence: vec![],
+                status: crate::claims::ClaimStatus::Promoted,
+                independent_count: 1,
+                confidence: 0.65,
+                embedding: None,
+            },
+        );
+
+        let claim =
+            claim_from_raw(raw, "cc-02", "2026-09-12T00:00:00Z", &resolvable, &existing).unwrap();
+        assert_eq!(
+            claim.claim_id, "claim-original",
+            "matching subject+text must reuse the existing claim_id, not mint a new one"
+        );
+    }
+
+    #[test]
+    fn claim_from_raw_mints_a_new_id_when_nothing_matches() {
+        let raw = RawClaim {
+            claim: "a completely different observation".into(),
+            claim_type: "environment".into(),
+            subject: "staging".into(),
+            evidence: vec![RawCitation {
+                session_id: "s1".into(),
+                message_id: "m1".into(),
+            }],
+        };
+        let mut resolvable = ResolvableIndex::new();
+        resolvable.insert(
+            ("s1".to_string(), "m1".to_string()),
+            ResolvedCitation {
+                excerpt_hash: "h".to_string(),
+                observed_at: "2026-09-09T00:00:00Z".to_string(),
+            },
+        );
+        let mut existing = BTreeMap::new();
+        existing.insert(
+            "claim-original".to_string(),
+            ClaimState {
+                claim_id: "claim-original".into(),
+                claim: "this repo uses just, not make".into(),
+                claim_type: ClaimType::Convention,
+                subject: "build-tooling".into(),
+                scope: Scope::Fleet,
+                observed_by: "cc-01".into(),
+                observed_at: "2026-09-09T00:00:00Z".into(),
+                evidence: vec![],
+                status: crate::claims::ClaimStatus::Promoted,
+                independent_count: 1,
+                confidence: 0.65,
+                embedding: None,
+            },
+        );
+
+        let claim =
+            claim_from_raw(raw, "cc-01", "2026-09-09T00:00:00Z", &resolvable, &existing).unwrap();
+        assert_ne!(
+            claim.claim_id, "claim-original",
+            "an unrelated claim must never be glued onto an existing claim_id"
+        );
     }
 
     // ---- structured output parsing ----
@@ -1330,6 +1630,102 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
+    /// Emits one claim per session, citing whatever session the transcript
+    /// itself says it came from (via a `session-marker:<id>` token this test
+    /// embeds in the envelope content) — unlike [`TriggerSensitiveProvider`],
+    /// which hardcodes `session_id: "s1"` and so can't stand in for three
+    /// distinct sealed sessions in the same test.
+    struct SessionMarkerProvider;
+    impl Provider for SessionMarkerProvider {
+        fn complete<'a>(
+            &'a self,
+            req: &'a CompletionRequest,
+        ) -> BoxFuture<'a, Result<String, ExtractError>> {
+            let prompt = req.user_prompt.clone();
+            Box::pin(async move {
+                const MARKER: &str = "session-marker:";
+                let Some(idx) = prompt.find(MARKER) else {
+                    return Ok(r#"{"claims":[]}"#.to_string());
+                };
+                let rest = &prompt[idx + MARKER.len()..];
+                let session_id: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '-')
+                    .collect();
+                Ok(format!(
+                    r#"{{"claims":[{{"claim":"staging SSH listens on 2222","claim_type":"environment","subject":"staging","evidence":[{{"session_id":"{session_id}","message_id":"m1"}}]}}]}}"#
+                ))
+            })
+        }
+    }
+
+    /// Seal one session (write its one segment plus its `_SEALED` marker) under
+    /// `dt`, so `list_sealed_sessions` finds it — factored out because the
+    /// budget-exhaustion test below needs three of these.
+    async fn seal_one_session(store: &dyn ObjectStore, dt: &str, session_id: &str) {
+        let content = format!("{TRIGGER_PHRASE} session-marker:{session_id}");
+        let envelope = env_with(session_id, "m1", &content, 0);
+        let bytes = ctxlake_sync::codec::encode(&[envelope]).unwrap();
+        let seg_path = ctxlake_store::layout::session_segment(
+            dt,
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            session_id,
+            0,
+        );
+        store.put(&seg_path, PutPayload::from(bytes)).await.unwrap();
+        let sealed_path = ctxlake_store::layout::session_sealed(
+            dt,
+            "oxidant",
+            Runtime::ClaudeCode,
+            "cc-01",
+            session_id,
+        );
+        store
+            .put(&sealed_path, PutPayload::from_static(b"{}"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_reaches_new_sessions_even_when_older_ones_are_already_extracted() {
+        // The exact stall this finding describes: three sealed sessions exist,
+        // oldest-first (s1, s2, s3 by ascending `dt`). s1 and s2 were already
+        // extracted by a PRIOR run. A budget of 1 must still reach s3 — applying
+        // the budget to the raw sealed list (as `.take(limit)` used to) would
+        // grab s1, find it already done, and report `sessions_processed: 0`
+        // forever, never reaching s3 no matter how many times `run` is called.
+        let store = object_store::memory::InMemory::new();
+        seal_one_session(&store, "2026-09-01", "s1").await;
+        seal_one_session(&store, "2026-09-02", "s2").await;
+        seal_one_session(&store, "2026-09-03", "s3").await;
+        mark_extracted_if_new(&store, "s1").await.unwrap();
+        mark_extracted_if_new(&store, "s2").await.unwrap();
+
+        let cfg = SummarizeConfig {
+            mode: SummarizeMode::Shadow,
+            batch: Some(BatchConfig {
+                max_sessions_per_run: 1,
+                ..BatchConfig::default()
+            }),
+        };
+        let summary = run(&store, &cfg, &SessionMarkerProvider).await.unwrap();
+
+        assert_eq!(
+            summary.sessions_processed, 1,
+            "a budget of 1 must process exactly one NEW session, not stall on \
+             already-extracted ones that happen to sort first"
+        );
+        assert_eq!(
+            summary.claims_proposed, 1,
+            "the one session actually processed (s3) must have been extracted \
+             for real, not merely skipped"
+        );
+        // s3 specifically — not s1 or s2 again — must be the one newly marked.
+        assert!(is_already_extracted(&store, "s3").await.unwrap());
+    }
+
     #[test]
     fn resolve_api_key_never_requires_one_for_ollama() {
         let cfg = BatchConfig {
@@ -1338,5 +1734,184 @@ mod tests {
             ..BatchConfig::default()
         };
         assert_eq!(resolve_api_key(&cfg), None);
+    }
+
+    // ---- claim_id reuse across real extraction runs, end-to-end through the gate ----
+    //
+    // This is the scenario docs/memory.md's independence section exists to catch,
+    // run through the ACTUAL pipeline rather than a hand-built ClaimState: session
+    // A observes a fact; the claim gets injected into session B's context; B
+    // "independently" re-observes the same fact. If extraction minted a fresh
+    // claim_id for B (as it used to), the gate would have nothing to discount and
+    // would promote a convention on one real observation wearing two reporters.
+
+    /// Always emits the same claim, citing whatever session it's told to (a real
+    /// provider wouldn't need telling — the transcript IS the session — but this
+    /// test double stands in for "the model observed the same fact," which is
+    /// the input this scenario needs to hold constant across two calls).
+    struct FixedClaimProvider {
+        session_id: &'static str,
+    }
+    impl Provider for FixedClaimProvider {
+        fn complete<'a>(
+            &'a self,
+            _req: &'a CompletionRequest,
+        ) -> BoxFuture<'a, Result<String, ExtractError>> {
+            let body = format!(
+                r#"{{"claims":[{{"claim":"this repo uses just, not make","claim_type":"convention","subject":"build-tooling","evidence":[{{"session_id":"{}","message_id":"m1"}}]}}]}}"#,
+                self.session_id
+            );
+            Box::pin(async move { Ok(body) })
+        }
+    }
+
+    #[tokio::test]
+    async fn echo_case_end_to_end_extraction_reuses_claim_id_and_gate_holds_it_back() {
+        let store = object_store::memory::InMemory::new();
+
+        // Session A: the first, genuine observation.
+        let session_a = SessionTranscript {
+            session_id: "session-a".into(),
+            agent_id: "cc-01".into(),
+            envelopes: vec![env_with_at(
+                "cc-01",
+                "session-a",
+                "m1",
+                "this repo uses just, not make",
+                "2026-09-09T12:00:00.000Z",
+            )],
+        };
+        let outcome_a = extract_session(
+            &store,
+            &shadow_cfg(),
+            &FixedClaimProvider {
+                session_id: "session-a",
+            },
+            &session_a,
+            "2026-09-09",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome_a.claims_proposed, 1);
+
+        let folded_after_a =
+            crate::claims::fold(crate::claims::list_events(&store).await.unwrap().iter());
+        assert_eq!(folded_after_a.len(), 1, "exactly one claim after session A");
+        let claim_id = folded_after_a.keys().next().unwrap().clone();
+
+        // Session B, three days later: it had `claim_id` injected into its
+        // context (it read A's claim) before "independently" re-observing the
+        // identical fact.
+        let session_b = SessionTranscript {
+            session_id: "session-b".into(),
+            agent_id: "cc-02".into(),
+            envelopes: vec![env_with_at(
+                "cc-02",
+                "session-b",
+                "m1",
+                "this repo uses just, not make",
+                "2026-09-12T09:00:00.000Z",
+            )],
+        };
+        let outcome_b = extract_session(
+            &store,
+            &shadow_cfg(),
+            &FixedClaimProvider {
+                session_id: "session-b",
+            },
+            &session_b,
+            "2026-09-12",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome_b.claims_proposed, 1);
+
+        // The extraction-side assertion: B's matching observation must fold into
+        // the SAME claim as A's, not mint a second one.
+        let folded_after_b =
+            crate::claims::fold(crate::claims::list_events(&store).await.unwrap().iter());
+        assert_eq!(
+            folded_after_b.len(),
+            1,
+            "session B's matching observation must reuse session A's claim_id, \
+             not create a second claim — the independence gate can only discount \
+             evidence sessions on ONE shared claim_id"
+        );
+        let merged = folded_after_b.get(&claim_id).unwrap();
+        assert_eq!(merged.evidence_session_count(), 2);
+
+        // The gate-side assertion: with B's session recorded as having had
+        // `claim_id` injected into it, independent_count must be 1 (not 2), and
+        // a convention (needs 2 independent) must be held for review, not
+        // promoted as if two people had agreed independently.
+        let known_agents: std::collections::HashSet<String> =
+            ["cc-01".to_string(), "cc-02".to_string()]
+                .into_iter()
+                .collect();
+        let mut windows = HashMap::new();
+        windows.insert(
+            "session-a".to_string(),
+            (
+                "2026-09-09T00:00:00Z".to_string(),
+                "2026-09-09T23:59:59Z".to_string(),
+            ),
+        );
+        windows.insert(
+            "session-b".to_string(),
+            (
+                "2026-09-12T00:00:00Z".to_string(),
+                "2026-09-12T23:59:59Z".to_string(),
+            ),
+        );
+        let mut injected: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        injected.insert(
+            "session-b".to_string(),
+            std::collections::HashSet::from([claim_id.clone()]),
+        );
+
+        let lease_key = ctxlake_store::layout::lease_maintenance();
+        ctxlake_store::lease::provision(&store, &lease_key)
+            .await
+            .unwrap();
+        let lease = match ctxlake_store::lease::acquire(
+            &store,
+            &ctxlake_store::clock::SystemClock,
+            &lease_key,
+            "test-maintenance-runner",
+            None,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap()
+        {
+            ctxlake_store::lease::AcquireOutcome::Acquired(h) => h,
+            ctxlake_store::lease::AcquireOutcome::NotAcquired { .. } => unreachable!(),
+        };
+
+        let summary = crate::gate::run(
+            &store,
+            &lease,
+            "2026-09-12T10:00:00Z",
+            &known_agents,
+            &windows,
+            &injected,
+            |_e| true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            summary.promoted, 0,
+            "one observation wearing two reporters must not promote a convention \
+             (which requires 2 INDEPENDENT sessions)"
+        );
+        assert_eq!(summary.sent_to_review, 1);
+        assert!(
+            crate::claims::list_fleet_claims(&store)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the echoed claim must never reach fleet scope"
+        );
     }
 }

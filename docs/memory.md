@@ -165,21 +165,46 @@ payoff that justifies the discipline on the rest of this page.
   `claims/events/` (see [layout.md](layout.md)); `fold()` replays them into current
   state, and nothing anywhere overwrites one of these events in place. The one exception
   is `claims/fleet/<claim_id>.json`, which the gate *does* overwrite as a claim's status
-  changes — safe specifically because the gate runs single-writer under
-  `lease_maintenance` (docs/architecture.md), so there is never a second writer to race.
+  changes — safe specifically because `gate::run` *requires* a
+  `ctxlake_store::lease::LeaseHandle` for `lease_maintenance` as a parameter (checked
+  against its key at runtime), not merely a comment saying the caller ought to hold one,
+  so there is never a second writer to race. `publish_fleet_state` and
+  `list_fleet_claims` are `pub(crate)`: nothing outside this crate can reach
+  `claims/fleet/` directly, only through the gate or the shadow-mode-aware read path
+  below.
 - **Extraction** — `crates/ctxlake-maint/src/extract.rs`. Context fencing, the
   provider trait over `reqwest` (`anthropic` / `openai-compatible` / `ollama`), and
   "no evidence, no claim" all live here. Citation verification is real: an
-  `excerpt_hash` is always computed from the session's own captured content, never
-  taken from what a model claims it is.
-- **The four gates** — `crates/ctxlake-maint/src/gate.rs`. Independence
-  (`compute_independent_count`) joins evidence sessions against
-  `injected_context` and is the authoritative threshold check; the earlier evidence
-  check is a cheap pre-filter on raw evidence, not the real gate — see that module's
-  doc comment for why the order in this page's list and the order of enforcement
-  aren't quite the same thing. Shadow mode is enforced in `claims::claims_visible_to_agents`
-  and `claims::read_promoted_for_agents` — the only two functions in the crate that
-  return fleet-scope claims — not merely by how `ctxlake.toml` is parsed.
+  `excerpt_hash`, and each citation's own `observed_at`, are always computed from the
+  session's own captured content, never taken from what a model claims. A raw claim
+  that matches an existing one on file (same `claim_type`, `subject`, and normalized
+  claim text — `find_existing_claim_id`) reuses that claim's `claim_id` instead of
+  minting a new one, so corroborating evidence from a later session actually
+  accumulates onto the same claim rather than creating an indistinguishable sibling —
+  this is what makes independence checking (below) mean anything across real
+  extraction runs, not only in a hand-built test fixture.
+- **The four gates** — `crates/ctxlake-maint/src/gate.rs`. "No evidence, no claim" is
+  enforced as a floor beneath every claim type in `evidence_precheck`, including a
+  human-approved `preference` — human approval is an *additional* requirement, not a
+  substitute for having any evidence at all. Provenance checks each evidence citation's
+  own `observed_at` against its own session's window, never the claim's single
+  first-proposed timestamp against every cited session — a claim's evidence can, and
+  for `convention`'s two-independent-session bar routinely will, span sessions on
+  different days. Independence (`compute_independent_count`) joins evidence sessions
+  against `injected_context` and is the authoritative threshold check; the earlier
+  evidence check is a cheap pre-filter on raw evidence, not the real gate — see that
+  module's doc comment for why the order in this page's list and the order of
+  enforcement aren't quite the same thing. Shadow mode is enforced in
+  `claims::claims_visible_to_agents` and `claims::read_promoted_for_agents`, and
+  because `list_fleet_claims`/`publish_fleet_state` are `pub(crate)`, those two
+  functions are the only way anything *outside this crate* can read a fleet-scope
+  claim. That guarantee does not extend to `claims::list_events`/`claims::fold`
+  themselves, which stay `pub` and shadow-unaware on purpose — the gate needs the full,
+  unfiltered state to run at all, in shadow mode included, since shadow mode changes
+  who may *read* a promoted claim, not whether one gets promoted. Anything rendering a
+  claim into an agent's context window must go through the two agent-facing functions,
+  never `fold`/`list_events` directly; see `claims_visible_to_agents`'s doc for why
+  that boundary is enforced by convention there, not by the type system.
 
 Two things this wave deliberately does not claim to have solved:
 

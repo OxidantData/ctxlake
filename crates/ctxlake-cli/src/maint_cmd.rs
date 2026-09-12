@@ -25,6 +25,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ctxlake_maint::run::Tier2;
 
 use crate::config::{Config, SummarizeMode};
 use crate::store_ctx;
@@ -57,20 +58,55 @@ async fn run_one_cycle(cfg: &Config) -> Result<()> {
     let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
     let store = store_ctx::prefixed_store(&ctx);
 
+    // `ctxlake-cli`'s own `SummarizeConfig` is `ctxlake.toml`'s serde shape;
+    // `ctxlake_maint::extract`'s is what its HTTP layer wants. See
+    // `config.rs`'s `From` impls for the field-for-field bridge between them.
+    let extract_cfg: ctxlake_maint::extract::SummarizeConfig = (&cfg.summarize).into();
+
+    // A provider is only ever constructed when Tier 2 is actually configured —
+    // `tier2_enabled` is the same gate `ctxlake_maint::extract` itself checks
+    // first, so a `mode = "agent"` fleet never resolves an env var or builds an
+    // HTTP client it isn't going to use. When it *is* enabled, an unresolvable
+    // `api_key_env` must fail the whole run loudly rather than let maintenance
+    // silently skip extraction forever — see `build_provider`'s doc.
+    let provider: Option<Box<dyn ctxlake_maint::extract::Provider>> =
+        if ctxlake_maint::extract::tier2_enabled(&extract_cfg) {
+            let batch_cfg = extract_cfg
+                .batch
+                .as_ref()
+                .expect("tier2_enabled just confirmed cfg.batch.is_some()");
+            Some(
+                ctxlake_maint::extract::build_provider(batch_cfg)
+                    .context("resolving the Tier 2 provider from [summarize.batch]")?,
+            )
+        } else {
+            None
+        };
+    let tier2 = provider.as_deref().map(|provider| Tier2 {
+        cfg: &extract_cfg,
+        provider,
+    });
+
+    // The gate always runs, `tier2` or not: claims also arrive via the
+    // `memory_propose` MCP tool, so `mode = "agent"` fleets still have
+    // candidates for it to promote or contest even with Tier 2 off.
     let report = ctxlake_maint::run::run(
         store.as_ref(),
         &cfg.fleet_id,
         agent_reads_enabled(cfg.summarize.mode),
+        tier2,
     )
     .await
     .context("running the maintenance chain")?;
 
     println!(
-        "compacted {} date(s) · {} digest(s) written, {} already done · snapshot {}",
+        "compacted {} date(s) · {} digest(s) written, {} already done · snapshot {} · {} · {}",
         report.dates_compacted.len(),
         report.digests_written,
         report.digests_skipped,
         describe_snapshot(&report.snapshot),
+        describe_extraction(&report.extraction),
+        describe_gate(&report.gate),
     );
     Ok(())
 }
@@ -97,9 +133,42 @@ fn describe_snapshot(o: &ctxlake_maint::snapshot::SnapshotOutcome) -> String {
     format!("{short} ({} claim(s), {state}){reads}", o.claim_count)
 }
 
+/// One line for Tier 2 extraction — `None` when `[summarize.batch]` isn't
+/// configured (`mode = "agent"` or `"none"`), matching `describe_snapshot`'s
+/// "read as normal, not as a warning" tone: a fleet that hasn't turned Tier 2 on
+/// is a configuration, not a failure.
+fn describe_extraction(o: &Option<ctxlake_maint::extract::ExtractRunSummary>) -> String {
+    match o {
+        Some(e) => format!(
+            "tier 2: {} session(s) extracted, {} claim(s) proposed",
+            e.sessions_processed, e.claims_proposed
+        ),
+        None => "tier 2: disabled".to_string(),
+    }
+}
+
+/// One line for the promotion gate — always printed, because the gate always
+/// runs: claims arrive from batch extraction *and* from the `memory_propose`
+/// MCP tool, so it has work to do even under `mode = "agent"`.
+fn describe_gate(g: &ctxlake_maint::gate::GateRunSummary) -> String {
+    let quarantine = if g.blocked_by_quarantine > 0 || g.demoted_by_quarantine > 0 {
+        format!(
+            ", {} blocked and {} demoted by quarantine",
+            g.blocked_by_quarantine, g.demoted_by_quarantine
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "gate: {} promoted, {} contested pair(s), {} sent to review{quarantine}",
+        g.promoted, g.contested_pairs, g.sent_to_review
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BatchConfig, ProviderKind};
 
     fn cfg(dir: &std::path::Path, fleet: &str, agent: &str) -> Config {
         Config::new(format!("file://{}", dir.display()), fleet, agent)
@@ -155,6 +224,47 @@ mod tests {
         assert!(describe_snapshot(&shadow).contains("shadow"));
     }
 
+    #[test]
+    fn describe_extraction_distinguishes_disabled_from_a_real_run() {
+        assert_eq!(describe_extraction(&None), "tier 2: disabled");
+        let summary = ctxlake_maint::extract::ExtractRunSummary {
+            sessions_processed: 3,
+            claims_proposed: 5,
+        };
+        let text = describe_extraction(&Some(summary));
+        assert!(text.contains('3'), "{text}");
+        assert!(text.contains('5'), "{text}");
+        assert!(!text.contains("disabled"), "{text}");
+    }
+
+    #[test]
+    fn describe_gate_reports_promotions_and_only_mentions_quarantine_when_it_fired() {
+        let quiet = ctxlake_maint::gate::GateRunSummary {
+            promoted: 2,
+            contested_pairs: 1,
+            sent_to_review: 4,
+            blocked_by_quarantine: 0,
+            demoted_by_quarantine: 0,
+        };
+        let text = describe_gate(&quiet);
+        assert!(text.contains("2 promoted"), "{text}");
+        assert!(text.contains("1 contested"), "{text}");
+        assert!(text.contains("4 sent to review"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("quarantine"),
+            "a quiet run must not mention quarantine at all: {text}"
+        );
+
+        let loud = ctxlake_maint::gate::GateRunSummary {
+            blocked_by_quarantine: 1,
+            demoted_by_quarantine: 2,
+            ..quiet
+        };
+        let text = describe_gate(&loud);
+        assert!(text.contains("1 blocked"), "{text}");
+        assert!(text.contains("2 demoted"), "{text}");
+    }
+
     #[tokio::test]
     async fn a_run_on_an_empty_store_succeeds_and_needs_no_initialization() {
         // The lease this command used to take had to be *provisioned* by `ctxlake
@@ -166,6 +276,38 @@ mod tests {
         run(&cfg(dir.path(), "myteam", "cc-01"), true)
             .await
             .expect("an un-initialized store has no work, not an error");
+    }
+
+    #[tokio::test]
+    async fn a_batch_mode_run_fails_loudly_when_the_configured_env_var_is_unset() {
+        // Tier 2 misconfiguration must not fail silently: a fleet that turned
+        // batch mode on and then never set the key should see maintenance stop
+        // and say why, not quietly run compaction/digest/gate forever while
+        // extraction does nothing.
+        let var = "CTXLAKE_TEST_MAINT_CMD_MISSING_KEY";
+        std::env::remove_var(var);
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(dir.path(), "myteam", "cc-01");
+        c.summarize.mode = SummarizeMode::Shadow;
+        c.summarize.batch = Some(BatchConfig {
+            provider: ProviderKind::Anthropic,
+            model: "claude-haiku-4-5".into(),
+            api_key_env: var.into(),
+            base_url: None,
+            use_batch_api: true,
+            max_sessions_per_run: 50,
+            max_input_tokens: 8000,
+        });
+        let err = run(&c, true).await.unwrap_err();
+        // `{:#}` (the "alternate" Display anyhow uses to walk the full `.source()`
+        // chain — see `main.rs`'s own `eprintln!("Error: {err:#}")`) is what an
+        // operator actually sees; a plain `{err}` shows only the outer
+        // `.context(...)` line and would miss the variable name entirely.
+        let full = format!("{err:#}");
+        assert!(
+            full.contains(var),
+            "error must name the unset env var: {full}"
+        );
     }
 
     #[tokio::test]

@@ -55,6 +55,14 @@ pub enum ProviderKind {
     Anthropic,
     OpenaiCompatible,
     Ollama,
+    /// OpenAI-shaped, hosted at a fixed `openrouter.ai` endpoint. Its whole value
+    /// over `openai-compatible` is that a user need not know the URL — see
+    /// [`OpenRouterProvider`].
+    Openrouter,
+    /// A genuinely different wire shape (`contents`/`systemInstruction`, and
+    /// structured output via `generationConfig.responseSchema`) — see
+    /// [`GeminiProvider`].
+    Gemini,
 }
 
 /// `[summarize.batch]`, mirroring `docs/memory.md`'s table field-for-field,
@@ -116,6 +124,61 @@ pub fn resolve_api_key(cfg: &BatchConfig) -> Option<String> {
         return None;
     }
     std::env::var(&cfg.api_key_env).ok()
+}
+
+/// The one place a `[summarize.batch]` config turns into something that can
+/// actually make a request. Every caller that needs a [`Provider`] — the real
+/// maintenance chain, `ctxlake doctor`, anything else — goes through this
+/// rather than matching on `cfg.provider` itself, so a fifth provider is one
+/// match arm here, not N call sites.
+///
+/// Fails with [`ExtractError::MissingApiKey`], naming the env var (never a
+/// value — there is never a value to print, since nothing resolved), for any
+/// provider whose key is not optional: Anthropic, OpenRouter, and Gemini all
+/// need a real key to call a real endpoint, so a missing one is a
+/// configuration error, not a silent no-auth request. Ollama needs no key at
+/// all (see [`resolve_api_key`]) and `openai-compatible` treats one as
+/// optional, matching its constructor's `Option<String>` — some self-hosted
+/// gateways sit behind no auth at all.
+pub fn build_provider(cfg: &BatchConfig) -> Result<Box<dyn Provider>, ExtractError> {
+    let api_key = resolve_api_key(cfg);
+    match cfg.provider {
+        ProviderKind::Anthropic => {
+            let key = api_key.ok_or_else(|| missing_api_key(cfg))?;
+            Ok(Box::new(AnthropicProvider::new(key, cfg.base_url.clone())))
+        }
+        ProviderKind::OpenaiCompatible => {
+            let base_url = non_empty(&cfg.base_url)
+                .ok_or_else(|| {
+                    ExtractError::Provider(
+                        "openai-compatible provider requires base_url".to_string(),
+                    )
+                })?
+                .to_string();
+            Ok(Box::new(OpenAiCompatibleProvider::new(api_key, base_url)))
+        }
+        ProviderKind::Ollama => {
+            let base_url = non_empty(&cfg.base_url)
+                .unwrap_or("http://localhost:11434")
+                .to_string();
+            Ok(Box::new(OllamaProvider::new(base_url)))
+        }
+        ProviderKind::Openrouter => {
+            let key = api_key.ok_or_else(|| missing_api_key(cfg))?;
+            Ok(Box::new(OpenRouterProvider::new(
+                Some(key),
+                cfg.base_url.clone(),
+            )))
+        }
+        ProviderKind::Gemini => {
+            let key = api_key.ok_or_else(|| missing_api_key(cfg))?;
+            Ok(Box::new(GeminiProvider::new(key, cfg.base_url.clone())))
+        }
+    }
+}
+
+fn missing_api_key(cfg: &BatchConfig) -> ExtractError {
+    ExtractError::MissingApiKey(cfg.api_key_env.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +257,14 @@ pub enum ExtractError {
     Provider(String),
     #[error("malformed structured-output response: {0}")]
     MalformedResponse(String),
+    /// [`build_provider`]'s clear, actionable failure when the env var a
+    /// `[summarize.batch]` config names is not set. Names the variable, never a
+    /// value — there is never a value to print, since nothing resolved.
+    #[error(
+        "{0} is not set — export it (or point api_key_env at the variable that \
+         actually holds the key) before running Tier 2 extraction"
+    )]
+    MissingApiKey(String),
 }
 
 /// One batch's results, keyed by the request id each was submitted under — never
@@ -433,6 +504,54 @@ pub fn parse_openai_chat_response(raw: &str) -> Result<String, ExtractError> {
         })
 }
 
+/// The `/chat/completions` request body every OpenAI-shaped provider in this
+/// module sends — split out so it is unit-testable on its own (no network) and
+/// so [`OpenAiCompatibleProvider`] and [`OpenRouterProvider`] build the exact
+/// same bytes rather than maintaining two copies that could drift.
+fn chat_completions_body(req: &CompletionRequest) -> serde_json::Value {
+    serde_json::json!({
+        "model": req.model,
+        "messages": [
+            {"role": "system", "content": req.system_prompt},
+            {"role": "user", "content": req.user_prompt},
+        ],
+    })
+}
+
+/// POST `{base_url}/chat/completions` and parse the response — the one HTTP call
+/// [`OpenAiCompatibleProvider`] and [`OpenRouterProvider`] both make. OpenRouter
+/// *is* OpenAI-compatible (same body, same response shape); the only thing it
+/// adds is a fixed base URL, a default key env var, and a couple of extra
+/// headers, so this is the shared helper the module doc's "reuse, don't copy"
+/// intent calls for rather than a second copy of this function.
+async fn chat_completions_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    req: &CompletionRequest,
+) -> Result<String, ExtractError> {
+    let body = chat_completions_body(req);
+    let mut builder = client
+        .post(format!("{base_url}/chat/completions"))
+        .json(&body);
+    if let Some(key) = api_key {
+        builder = builder.bearer_auth(key);
+    }
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| ExtractError::Provider(e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ExtractError::Provider(e.to_string()))?;
+    parse_openai_chat_response(&text)
+}
+
 /// `openai-compatible` — any endpoint speaking the `/chat/completions` shape.
 pub struct OpenAiCompatibleProvider {
     client: reqwest::Client,
@@ -455,31 +574,70 @@ impl Provider for OpenAiCompatibleProvider {
         &'a self,
         req: &'a CompletionRequest,
     ) -> BoxFuture<'a, Result<String, ExtractError>> {
-        Box::pin(async move {
-            let body = serde_json::json!({
-                "model": req.model,
-                "messages": [
-                    {"role": "system", "content": req.system_prompt},
-                    {"role": "user", "content": req.user_prompt},
-                ],
-            });
-            let mut builder = self
-                .client
-                .post(format!("{}/chat/completions", self.base_url))
-                .json(&body);
-            if let Some(key) = &self.api_key {
-                builder = builder.bearer_auth(key);
-            }
-            let resp = builder
-                .send()
-                .await
-                .map_err(|e| ExtractError::Provider(e.to_string()))?;
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| ExtractError::Provider(e.to_string()))?;
-            parse_openai_chat_response(&text)
-        })
+        Box::pin(chat_completions_request(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_deref(),
+            &[],
+            req,
+        ))
+    }
+}
+
+/// `openrouter` — OpenAI-shaped, fixed at `openrouter.ai`. Its value over a bare
+/// `openai-compatible` entry is that a user need not know the URL: just a model
+/// name and a key. Sends `X-Title: ctxlake` (shows up in OpenRouter's own
+/// dashboard/logs) and deliberately no `HTTP-Referer` — this is a CLI, not a
+/// site with a URL to attribute traffic to.
+pub struct OpenRouterProvider {
+    client: reqwest::Client,
+    api_key: Option<String>,
+    base_url: String,
+}
+
+impl OpenRouterProvider {
+    /// `base_url` overrides OpenRouter's own endpoint — for testing against a
+    /// local stand-in, mainly; a real deployment has no reason to set it.
+    pub fn new(api_key: Option<String>, base_url: Option<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key,
+            base_url: non_empty(&base_url)
+                .unwrap_or("https://openrouter.ai/api/v1")
+                .to_string(),
+        }
+    }
+
+    /// Test-only window into what `new` resolved `base_url` to — there is no
+    /// production reason to read it back once the provider is built, but the
+    /// default-vs-override behavior is exactly what a test needs to pin.
+    #[cfg(test)]
+    fn base_url_for_test(&self) -> &str {
+        &self.base_url
+    }
+}
+
+/// OpenRouter's attribution headers (its docs call these optional but
+/// recommended). `X-Title` names the calling application in OpenRouter's own
+/// dashboard/logs; `HTTP-Referer` attributes traffic to a site URL, which a
+/// CLI does not have, so it is deliberately absent rather than set to
+/// something misleading — see [`OpenRouterProvider`]'s doc. Named as a
+/// constant so the "no Referer" claim is one thing to assert on, not
+/// something to eyeball in an inline literal.
+const OPENROUTER_EXTRA_HEADERS: &[(&str, &str)] = &[("X-Title", "ctxlake")];
+
+impl Provider for OpenRouterProvider {
+    fn complete<'a>(
+        &'a self,
+        req: &'a CompletionRequest,
+    ) -> BoxFuture<'a, Result<String, ExtractError>> {
+        Box::pin(chat_completions_request(
+            &self.client,
+            &self.base_url,
+            self.api_key.as_deref(),
+            OPENROUTER_EXTRA_HEADERS,
+            req,
+        ))
     }
 }
 
@@ -538,6 +696,147 @@ impl Provider for OllamaProvider {
                 .await
                 .map_err(|e| ExtractError::Provider(e.to_string()))?;
             parse_ollama_response(&text)
+        })
+    }
+}
+
+/// The subset of Gemini's OpenAPI-flavored `responseSchema` this module needs:
+/// exactly the shape [`RawExtraction`]/[`RawClaim`]/[`RawCitation`] parse, so a
+/// `generationConfig.responseMimeType: "application/json"` request is
+/// constrained to return something [`parse_claims_response`] can read — Gemini
+/// enforces this at generation time rather than leaving it to the prompt alone,
+/// which is the one thing this provider does that the other three cannot.
+fn gemini_claims_response_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "OBJECT",
+        "properties": {
+            "claims": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "claim": {"type": "STRING"},
+                        "claim_type": {"type": "STRING"},
+                        "subject": {"type": "STRING"},
+                        "evidence": {
+                            "type": "ARRAY",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "session_id": {"type": "STRING"},
+                                    "message_id": {"type": "STRING"},
+                                },
+                                "required": ["session_id", "message_id"],
+                            },
+                        },
+                    },
+                    "required": ["claim", "claim_type", "subject"],
+                },
+            },
+        },
+        "required": ["claims"],
+    })
+}
+
+/// Gemini's `generateContent` request body: `contents`/`systemInstruction`
+/// rather than a `messages` array, plus the structured-output config above. Kept
+/// separate from the HTTP call so it is unit-testable with no network — same
+/// pattern as [`chat_completions_body`].
+fn gemini_request_body(req: &CompletionRequest) -> serde_json::Value {
+    serde_json::json!({
+        "contents": [
+            {"role": "user", "parts": [{"text": req.user_prompt}]},
+        ],
+        "systemInstruction": {
+            "parts": [{"text": req.system_prompt}],
+        },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": gemini_claims_response_schema(),
+        },
+    })
+}
+
+/// `candidates[0].content.parts[0].text` out of a Gemini `generateContent`
+/// response.
+pub fn parse_gemini_response(raw: &str) -> Result<String, ExtractError> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| ExtractError::MalformedResponse(e.to_string()))?;
+    v.get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c0| c0.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.get(0))
+        .and_then(|p0| p0.get("text"))
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ExtractError::MalformedResponse(
+                "response has no candidates[0].content.parts[0].text".to_string(),
+            )
+        })
+}
+
+/// `gemini` — a genuinely different shape from the other three, not a fourth
+/// coat of OpenAI paint: `contents`/`systemInstruction` instead of a flat
+/// `messages` array, and the key rides in the `x-goog-api-key` header, never the
+/// URL — a key in a query string ends up in logs and proxies (AGENTS.md
+/// invariant 10's spirit, applied to transport, not just config-at-rest).
+pub struct GeminiProvider {
+    client: reqwest::Client,
+    api_key: String,
+    base_url: String,
+}
+
+impl GeminiProvider {
+    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key,
+            base_url: non_empty(&base_url)
+                .unwrap_or("https://generativelanguage.googleapis.com/v1beta")
+                .to_string(),
+        }
+    }
+
+    /// Test-only window into what `new` resolved `base_url` to — see
+    /// [`OpenRouterProvider::base_url_for_test`] for why this exists only
+    /// under `cfg(test)`.
+    #[cfg(test)]
+    fn base_url_for_test(&self) -> &str {
+        &self.base_url
+    }
+}
+
+/// `{base_url}/models/{model}:generateContent` — split out so the URL shape is
+/// testable without a network call, and in particular so it is easy to assert
+/// the API key never ends up in it (it goes in the `x-goog-api-key` header
+/// instead — a key in a query string ends up in logs and proxies).
+fn gemini_url(base_url: &str, model: &str) -> String {
+    format!("{base_url}/models/{model}:generateContent")
+}
+
+impl Provider for GeminiProvider {
+    fn complete<'a>(
+        &'a self,
+        req: &'a CompletionRequest,
+    ) -> BoxFuture<'a, Result<String, ExtractError>> {
+        Box::pin(async move {
+            let body = gemini_request_body(req);
+            let url = gemini_url(&self.base_url, &req.model);
+            let resp = self
+                .client
+                .post(url)
+                .header("x-goog-api-key", &self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ExtractError::Provider(e.to_string()))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ExtractError::Provider(e.to_string()))?;
+            parse_gemini_response(&text)
         })
     }
 }
@@ -1454,6 +1753,233 @@ mod tests {
         let text = parse_ollama_response(OLLAMA_CHAT_FIXTURE).unwrap();
         let claims = parse_claims_response(&text).unwrap();
         assert!(claims.is_empty());
+    }
+
+    const GEMINI_GENERATE_CONTENT_FIXTURE: &str = r#"{
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "{\"claims\":[]}"}]
+                },
+                "finishReason": "STOP"
+            }
+        ],
+        "usageMetadata": {"promptTokenCount": 700, "candidatesTokenCount": 4}
+    }"#;
+
+    #[test]
+    fn parses_a_recorded_gemini_response() {
+        let text = parse_gemini_response(GEMINI_GENERATE_CONTENT_FIXTURE).unwrap();
+        let claims = parse_claims_response(&text).unwrap();
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn parse_gemini_response_reports_a_malformed_body_rather_than_panicking() {
+        let err = parse_gemini_response(r#"{"candidates": []}"#).unwrap_err();
+        assert!(matches!(err, ExtractError::MalformedResponse(_)));
+    }
+
+    // ---- request-building: no network, so exercised as pure functions ----
+
+    #[test]
+    fn chat_completions_body_carries_model_and_both_prompts() {
+        let req = CompletionRequest {
+            system_prompt: "sys".into(),
+            user_prompt: "usr".into(),
+            model: "gpt-x".into(),
+        };
+        let body = chat_completions_body(&req);
+        assert_eq!(body["model"], "gpt-x");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "sys");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "usr");
+    }
+
+    #[test]
+    fn openrouter_defaults_its_base_url_and_lets_it_be_overridden() {
+        let default = OpenRouterProvider::new(None, None);
+        assert_eq!(default.base_url_for_test(), "https://openrouter.ai/api/v1");
+
+        // An empty string is treated the same as "not set" (matches every
+        // other provider's `non_empty` handling of `base_url`) — a blank
+        // `base_url = ""` line in `ctxlake.toml` must not turn into a
+        // request to `/chat/completions` with no host at all.
+        let blank = OpenRouterProvider::new(None, Some(String::new()));
+        assert_eq!(blank.base_url_for_test(), "https://openrouter.ai/api/v1");
+
+        let overridden = OpenRouterProvider::new(None, Some("http://localhost:9999".to_string()));
+        assert_eq!(overridden.base_url_for_test(), "http://localhost:9999");
+    }
+
+    #[test]
+    fn openrouter_sends_x_title_and_deliberately_no_referer() {
+        assert_eq!(OPENROUTER_EXTRA_HEADERS, &[("X-Title", "ctxlake")]);
+        assert!(
+            !OPENROUTER_EXTRA_HEADERS
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("HTTP-Referer")),
+            "a CLI has no site URL to attribute traffic to"
+        );
+    }
+
+    #[test]
+    fn gemini_request_body_uses_contents_and_system_instruction_not_messages() {
+        let req = CompletionRequest {
+            system_prompt: "extract claims".into(),
+            user_prompt: "[m1] hello".into(),
+            model: "gemini-2.0-flash".into(),
+        };
+        let body = gemini_request_body(&req);
+        assert!(
+            body.get("messages").is_none(),
+            "Gemini's shape has no top-level messages array"
+        );
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "[m1] hello");
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "extract claims"
+        );
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        // The schema must actually constrain the `claims` field the rest of
+        // this module parses — a `responseSchema` that forgot it would let
+        // Gemini return anything and still claim to be "structured."
+        assert!(body["generationConfig"]["responseSchema"]["properties"]["claims"].is_object());
+    }
+
+    #[test]
+    fn gemini_url_never_embeds_the_api_key_in_the_query_string() {
+        let url = gemini_url(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-2.0-flash",
+        );
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+        );
+        assert!(
+            !url.contains("key="),
+            "the API key must ride in the x-goog-api-key header, never the URL: {url}"
+        );
+    }
+
+    #[test]
+    fn gemini_defaults_its_base_url_and_lets_it_be_overridden() {
+        let default = GeminiProvider::new("k".to_string(), None);
+        assert_eq!(
+            default.base_url_for_test(),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        let overridden =
+            GeminiProvider::new("k".to_string(), Some("http://localhost:9999".to_string()));
+        assert_eq!(overridden.base_url_for_test(), "http://localhost:9999");
+    }
+
+    // ---- build_provider: the factory bridging BatchConfig -> a live Provider ----
+
+    fn batch_cfg(provider: ProviderKind, api_key_env: &str) -> BatchConfig {
+        BatchConfig {
+            provider,
+            api_key_env: api_key_env.to_string(),
+            ..BatchConfig::default()
+        }
+    }
+
+    /// `Box<dyn Provider>` has no `Debug` impl (nothing here needs one in
+    /// production), so `Result::unwrap_err` — which requires the `Ok` side to
+    /// be `Debug` for its panic message — can't be called directly on
+    /// `build_provider`'s return type. This is the plain match that stands in
+    /// for it.
+    fn expect_provider_err(result: Result<Box<dyn Provider>, ExtractError>) -> ExtractError {
+        match result {
+            Ok(_) => panic!("expected build_provider to fail"),
+            Err(e) => e,
+        }
+    }
+
+    /// Env vars are process-global, so every test in this fn body picks a name
+    /// unlikely to collide with anything else the suite (or CI's own
+    /// environment) sets, and always removes it again — a leaked var here
+    /// would make some *other* test's "is it unset" assertion flaky depending
+    /// on run order.
+    #[test]
+    fn build_provider_fails_with_a_clear_message_naming_the_unset_env_var() {
+        let var = "CTXLAKE_TEST_MISSING_KEY_ANTHROPIC";
+        // SAFETY / hygiene: cleared unconditionally before and after, and
+        // this whole test only ever reads/removes it, never lets a real
+        // secret near it.
+        std::env::remove_var(var);
+        let cfg = batch_cfg(ProviderKind::Anthropic, var);
+        let err = expect_provider_err(build_provider(&cfg));
+        match &err {
+            ExtractError::MissingApiKey(name) => assert_eq!(name, var),
+            other => panic!("expected MissingApiKey, got {other:?}"),
+        }
+        // The message must name the variable so an operator knows what to
+        // set, and must never contain anything that looks like a resolved
+        // value — there is never one to leak, but the message text itself
+        // must not invite pasting a key into it.
+        let msg = err.to_string();
+        assert!(msg.contains(var), "{msg}");
+    }
+
+    #[test]
+    fn build_provider_succeeds_for_anthropic_openrouter_and_gemini_once_the_key_resolves() {
+        for (provider, var) in [
+            (ProviderKind::Anthropic, "CTXLAKE_TEST_KEY_ANTHROPIC"),
+            (ProviderKind::Openrouter, "CTXLAKE_TEST_KEY_OPENROUTER"),
+            (ProviderKind::Gemini, "CTXLAKE_TEST_KEY_GEMINI"),
+        ] {
+            std::env::set_var(var, "test-key-not-a-real-secret");
+            let cfg = batch_cfg(provider, var);
+            let result = build_provider(&cfg);
+            std::env::remove_var(var);
+            assert!(
+                result.is_ok(),
+                "{provider:?} should build once {var} resolves"
+            );
+        }
+    }
+
+    #[test]
+    fn build_provider_never_requires_a_key_for_ollama() {
+        // Ollama is a local endpoint; requiring a key here would make the
+        // documented "fully local, no transcript leaves the host" path
+        // depend on an env var nobody needs to set.
+        let cfg = batch_cfg(ProviderKind::Ollama, "CTXLAKE_TEST_UNUSED_OLLAMA_VAR");
+        assert!(build_provider(&cfg).is_ok());
+    }
+
+    #[test]
+    fn build_provider_rejects_openai_compatible_with_no_base_url() {
+        let cfg = batch_cfg(
+            ProviderKind::OpenaiCompatible,
+            "CTXLAKE_TEST_UNUSED_OAC_VAR",
+        );
+        assert!(cfg.base_url.is_none());
+        let err = expect_provider_err(build_provider(&cfg));
+        assert!(matches!(err, ExtractError::Provider(_)));
+    }
+
+    #[test]
+    fn build_provider_allows_openai_compatible_with_no_key_once_base_url_is_set() {
+        // Some self-hosted gateways sit behind no auth at all — a missing key
+        // here is a legitimate configuration, unlike Anthropic/OpenRouter/Gemini.
+        std::env::remove_var("CTXLAKE_TEST_UNUSED_OAC_VAR_2");
+        let cfg = BatchConfig {
+            base_url: Some("http://localhost:8000/v1".to_string()),
+            ..batch_cfg(
+                ProviderKind::OpenaiCompatible,
+                "CTXLAKE_TEST_UNUSED_OAC_VAR_2",
+            )
+        };
+        assert!(build_provider(&cfg).is_ok());
     }
 
     /// Deliberately out of order: `req-2`'s line comes before `req-1`'s, the

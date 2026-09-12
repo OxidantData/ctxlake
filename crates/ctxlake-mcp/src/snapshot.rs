@@ -163,7 +163,12 @@ fn row_to_claim(row: &rusqlite::Row) -> rusqlite::Result<ClaimRow> {
 /// order of magnitude above that is a safety rail, not a real limit in practice.
 const MAX_SCANNED_ROWS: usize = 20_000;
 
-fn fetch_visible(
+/// Crate-visible (not just `search`'s private helper) so `memory::briefing_claims`
+/// can rank confidence over the *entire* visible universe — see that function's
+/// doc for why going through `search`'s `k+1`-truncated, claim_id-tie-broken
+/// output instead would silently brief from the oldest claims rather than the
+/// strongest ones on any fleet past `MAX_ROW_LIMIT` visible claims.
+pub(crate) fn fetch_visible(
     conn: &Connection,
     subject: Option<&str>,
     claim_type: Option<&str>,
@@ -214,6 +219,17 @@ fn fts_match_expr(query: &str) -> Option<String> {
 /// enter the search index"), so this join can never surface a shadow-mode or
 /// unpromoted claim even if this function's own `WHERE` clause had a bug in it —
 /// the artifact itself is the enforcement, not this query.
+///
+/// `bm25()` takes the FTS5 table's declared name, `claims_fts` — NOT the `f`
+/// alias this query joins it under. SQLite resolves `bm25()`'s argument by
+/// looking up the schema object by that literal identifier, not by resolving it
+/// as a table reference the way an ordinary column would be; `bm25(f)` fails
+/// `prepare()` with "no such column: f" (confirmed against this crate's bundled
+/// SQLite), which — because `prepare()`'s `Err` is deliberately swallowed into
+/// an empty result just below, matching the "fail closed, not open" discipline
+/// AGENTS.md asks for everywhere claims are read — silently disabled the entire
+/// lexical half of `search` rather than surfacing as a startup error. Prefer the
+/// real name here over the alias precisely because that failure mode is silent.
 fn fts_matches(
     conn: &Connection,
     query: &str,
@@ -230,7 +246,7 @@ fn fts_matches(
                AND (?2 IS NULL OR c.subject = ?2) \
                AND (?3 IS NULL OR c.claim_type = ?3) \
                AND (?4 IS NULL OR c.scope = ?4) \
-               ORDER BY bm25(f) \
+               ORDER BY bm25(claims_fts) \
                LIMIT ?5";
     let Ok(mut stmt) = conn.prepare(sql) else {
         return Vec::new();
@@ -683,6 +699,51 @@ mod tests {
             8,
         );
         assert_eq!(hits.len(), 1, "cosine alone must surface the row: {hits:?}");
+        assert_eq!(hits[0].claim_id, "c1");
+    }
+
+    /// The mirror of the cosine-alone test above: a claim only findable through
+    /// FTS5, with the `claim` text sharing zero tokens with the query so cosine
+    /// (which falls back to `hash_embedding(claim)` with no stored embedding)
+    /// scores exactly 0.0. Only `subject` — which `claims_fts` also indexes —
+    /// carries the query's words, so this can only pass if the FTS5 `MATCH`
+    /// actually runs. This is the regression test for the `bm25(f)` vs.
+    /// `bm25(claims_fts)` bug: before that fix, `conn.prepare()` failed on the
+    /// bad alias, `fts_matches` swallowed the error into `Vec::new()`, and this
+    /// claim was invisible to `search` no matter what the query said.
+    #[test]
+    fn lexical_alone_can_surface_a_claim_cosine_would_never_find() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oxidant").join("snapshot.bin");
+        let claim = FixtureClaim::promoted(
+            "c1",
+            "unrelated wording entirely, no shared tokens here",
+            "hypothesis",
+            "distinctive network glitch signature",
+        );
+        write_snapshot(&path, &[claim]);
+        let conn = open(dir.path(), "oxidant").unwrap();
+
+        // Sanity check this test's own premise: cosine over the claim text must
+        // score exactly 0.0 against this query, or a pass here would prove
+        // nothing about the lexical path.
+        let query_vec = hash_embedding("distinctive network glitch signature");
+        let claim_vec = hash_embedding("unrelated wording entirely, no shared tokens here");
+        assert_eq!(
+            cosine(&query_vec, &claim_vec),
+            0.0,
+            "test premise broken: cosine must contribute nothing here"
+        );
+
+        let hits = search(
+            &conn,
+            "distinctive network glitch signature",
+            None,
+            None,
+            None,
+            8,
+        );
+        assert_eq!(hits.len(), 1, "FTS5 alone must surface the row: {hits:?}");
         assert_eq!(hits[0].claim_id, "c1");
     }
 

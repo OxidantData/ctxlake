@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// docs/memory.md's three tiers, selected by name. `None` still runs Tier 0
 /// (structural digests) — there is no way to turn *that* off, since it costs no LLM
 /// call and derives entirely from captured events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum SummarizeMode {
     /// Tiers 0 and 1 only. The belief layer stays empty; nothing else changes.
@@ -66,7 +66,11 @@ impl std::fmt::Display for SummarizeMode {
 /// A separate type rather than reusing `ctxlake_maint`'s directly: this crate's
 /// `Config` is `ctxlake.toml`'s serde shape, and a config crate should not need
 /// to change just because `ctxlake-maint` reshapes its own internal enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+// `clap::ValueEnum` alongside serde so `--llm openrouter` and `provider =
+// "openrouter"` are spelled identically — clap's derive is kebab-case by default,
+// the same convention `#[serde(rename_all)]` applies here. Two spellings for one
+// value is a support question waiting to happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     #[default]
@@ -79,6 +83,9 @@ pub enum ProviderKind {
     /// `contents`/`systemInstruction`, not a `messages` array — see
     /// `ctxlake_maint::extract::GeminiProvider`.
     Gemini,
+    /// The `claude` CLI already on this machine, on its existing subscription —
+    /// no API key. Spelled `claude-cli` in `ctxlake.toml`.
+    ClaudeCli,
 }
 
 impl From<ProviderKind> for ctxlake_maint::extract::ProviderKind {
@@ -89,6 +96,7 @@ impl From<ProviderKind> for ctxlake_maint::extract::ProviderKind {
             ProviderKind::Ollama => Self::Ollama,
             ProviderKind::Openrouter => Self::Openrouter,
             ProviderKind::Gemini => Self::Gemini,
+            ProviderKind::ClaudeCli => Self::ClaudeCli,
         }
     }
 }

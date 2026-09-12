@@ -14,6 +14,55 @@ pub struct InitArgs<'a> {
     pub fleet_id: &'a str,
     pub agent_id: Option<&'a str>,
     pub force: bool,
+    /// The Tier 2 model, if the operator is setting one up now.
+    ///
+    /// Configuring a model used to mean hand-editing `ctxlake.toml` after `init`,
+    /// which is a strange thing to ask of the one command whose whole job is writing
+    /// that file — and it meant the mistakes (a provider that needs a `base_url`, an
+    /// env var nobody exported) were found later, by a daemon, in a log.
+    pub llm: Option<LlmArgs<'a>>,
+}
+
+/// What `ctxlake init --llm ...` was given.
+pub struct LlmArgs<'a> {
+    pub provider: crate::config::ProviderKind,
+    pub model: Option<&'a str>,
+    pub api_key_env: Option<&'a str>,
+    pub base_url: Option<&'a str>,
+    pub mode: crate::config::SummarizeMode,
+}
+
+/// The model each provider gets when `--llm-model` is omitted.
+///
+/// Extraction is a small, highly structured job over a transcript — the cheapest
+/// capable model is the right default, and picking one for the operator is most of
+/// the value of having this flag at all.
+fn default_model_for(p: crate::config::ProviderKind) -> &'static str {
+    use crate::config::ProviderKind as P;
+    match p {
+        P::Anthropic => "claude-haiku-4-5",
+        P::Openrouter => "anthropic/claude-haiku-4.5",
+        P::Gemini => "gemini-2.0-flash",
+        P::Ollama => "llama3.1",
+        P::OpenaiCompatible => "gpt-4o-mini",
+        // An alias rather than a pinned name, so it follows whatever the installed
+        // CLI considers current.
+        P::ClaudeCli => "haiku",
+    }
+}
+
+/// The env var each provider conventionally reads, so `--llm-key-env` is optional.
+fn default_key_env_for(p: crate::config::ProviderKind) -> &'static str {
+    use crate::config::ProviderKind as P;
+    match p {
+        P::Anthropic => "ANTHROPIC_API_KEY",
+        P::Openrouter => "OPENROUTER_API_KEY",
+        P::Gemini => "GEMINI_API_KEY",
+        P::OpenaiCompatible => "OPENAI_API_KEY",
+        // Neither needs one: ollama is a local endpoint, and the claude CLI uses the
+        // subscription it is already signed in to.
+        P::Ollama | P::ClaudeCli => "",
+    }
 }
 
 /// A stable, host-derived fallback when `--agent-id` is omitted. AGENTS.md's own
@@ -68,7 +117,7 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => default_agent_id(),
     };
-    let cfg = Config::new(args.store, args.fleet_id, agent_id);
+    let mut cfg = Config::new(args.store, args.fleet_id, agent_id);
 
     // "Verify the store is reachable" — a real round trip, not just that the URL
     // parses. This is deliberately lighter than `doctor`'s full CAS matrix: init's
@@ -102,6 +151,55 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
     // anything now — `ctxlake maint`'s work is idempotent by content — so there is no
     // key to seed and `init`'s only remaining job against the store is proving it is
     // reachable and writable, which the probe above just did.
+    // The model, if one was asked for — written into the same file, in the same
+    // command, and *verified* before it is written. A config that names a provider
+    // nobody can reach is worse than no config: it makes `ctxlake maint` fail on
+    // every cycle, into a log, long after whoever typed it has moved on.
+    if let Some(llm) = &args.llm {
+        let batch = config::BatchConfig {
+            provider: llm.provider,
+            model: llm
+                .model
+                .unwrap_or_else(|| default_model_for(llm.provider))
+                .to_string(),
+            api_key_env: llm
+                .api_key_env
+                .unwrap_or_else(|| default_key_env_for(llm.provider))
+                .to_string(),
+            base_url: llm.base_url.map(str::to_string),
+            use_batch_api: true,
+            max_sessions_per_run: 50,
+            max_input_tokens: 8000,
+        };
+        cfg.summarize = config::SummarizeConfig {
+            mode: llm.mode,
+            batch: Some(batch),
+        };
+
+        let extract_cfg: ctxlake_maint::extract::SummarizeConfig = (&cfg.summarize).into();
+        if let Some(b) = extract_cfg.batch.as_ref() {
+            let provider = ctxlake_maint::extract::build_provider(b).with_context(|| {
+                format!(
+                    "the {:?} provider is not usable on this machine",
+                    llm.provider
+                )
+            })?;
+            // One real call, one word back. Everything that can be wrong about a
+            // model configuration — a revoked key, a name that does not exist, an
+            // endpoint pointing at nothing, an account over quota — resolves an env
+            // var perfectly and only shows up here.
+            let req = ctxlake_maint::extract::CompletionRequest {
+                system_prompt: "Reply with the single word: ok".to_string(),
+                user_prompt: "ok".to_string(),
+                model: b.model.clone(),
+            };
+            provider
+                .complete(&req)
+                .await
+                .with_context(|| format!("{:?} did not answer a test request", llm.provider))?;
+        }
+    }
+
     config::save(config_path, &cfg)?;
     Ok(cfg)
 }
@@ -127,6 +225,38 @@ fn create_local_store_dir(store_url: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_provider_has_a_default_model_and_a_key_convention() {
+        // The point of `--llm <provider>` is that it is the whole command. A
+        // provider with no default model would force a second flag and put the
+        // decision back on someone who just wanted it to work.
+        use crate::config::ProviderKind as P;
+        for p in [
+            P::Anthropic,
+            P::Openrouter,
+            P::Gemini,
+            P::Ollama,
+            P::OpenaiCompatible,
+            P::ClaudeCli,
+        ] {
+            assert!(
+                !default_model_for(p).is_empty(),
+                "{p:?} needs a default model"
+            );
+        }
+        // Exactly the two that authenticate some other way: ollama is a local
+        // endpoint, and the claude CLI uses the subscription it is signed in to.
+        assert_eq!(default_key_env_for(P::Ollama), "");
+        assert_eq!(default_key_env_for(P::ClaudeCli), "");
+        for p in [P::Anthropic, P::Openrouter, P::Gemini, P::OpenaiCompatible] {
+            assert!(
+                default_key_env_for(p).ends_with("_API_KEY"),
+                "{p:?} must name an env var, never carry a key"
+            );
+        }
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -142,6 +272,7 @@ mod tests {
                 fleet_id: "myteam",
                 agent_id: Some("cc-01"),
                 force: false,
+                llm: None,
             },
             &config_path,
         )
@@ -182,6 +313,7 @@ mod tests {
                 fleet_id: "myteam",
                 agent_id: Some("cc-01"),
                 force: false,
+                llm: None,
             },
             &config_path,
         )
@@ -213,6 +345,7 @@ mod tests {
                 fleet_id: "myteam",
                 agent_id: Some("cc-01"),
                 force: true,
+                llm: None,
             },
             &config_path,
         )
@@ -237,6 +370,7 @@ mod tests {
                 fleet_id: "myteam",
                 agent_id: Some("cc-01"),
                 force: false,
+                llm: None,
             },
             &config_path,
         )

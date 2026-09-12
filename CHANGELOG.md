@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.1.4
+
+`ctxlake init` configures the model, Tier 2 can run on a Claude Code subscription
+with no API key, and two bugs from v0.1.3.
+
+### `init --llm` sets up extraction, and checks it
+
+Configuring a model meant hand-editing `ctxlake.toml` after running the one command
+whose job is writing that file — and the mistakes showed up later, in a daemon log.
+
+```sh
+ctxlake init --store s3://bucket/ctxlake --fleet myteam --llm claude-cli
+ctxlake init --store s3://bucket/ctxlake --fleet myteam --llm openrouter
+```
+
+Picks a sensible default model and key variable per provider, and **makes a real
+call before writing anything**. A model name that does not exist, a key that is
+unset or revoked, an endpoint pointing at nothing: all refuse, and no config is
+written. Override with `--llm-model`, `--llm-key-env`, `--llm-base-url`,
+`--summarize-mode` (default `shadow`).
+
+### `--llm claude-cli` — no API key
+
+Anyone running ctxlake already runs a coding agent. For Claude Code users that
+means a `claude` binary already signed in, so asking them to create an API key to
+summarise their own sessions is a second bill and a second secret. This provider
+shells out to `claude -p --output-format json`.
+
+Verified end to end: a session captured through the real hook yielded 4 claims, 3
+promoted by the gate, on the subscription alone. Needs `claude` on `PATH` and
+**no** `ANTHROPIC_API_KEY` set — the CLI prefers a key over the subscription, so
+`init` refuses rather than writing a config that 401s later.
+
+### Fixes
+
+- **Redaction over-matched.** `Bearer `, `hf_`, `npm_` and `SG.` were added as bare
+  literals in v0.1.3 and quarantined ordinary English and ordinary code — "the API
+  wants a Bearer token", `let hf_size = 32;`, `npm_config_prefix`, and `MSG.`
+  (which contains `SG.`). They now require a credential-shaped token after the
+  prefix, and redact just that token rather than withholding the whole value.
+- **The docs site had not updated in 12 hours.** The deploy invalidated `/docs/*`
+  while the site is served at the root, so CloudFront kept serving stale pages —
+  ones still documenting a command removed that morning. Every deploy reported
+  success throughout.
+
 ## v0.1.3
 
 A redaction audit, and the Homebrew install path that never worked.

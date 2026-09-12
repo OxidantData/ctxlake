@@ -86,20 +86,36 @@ Everything so far runs with no model and no API key: capture, compaction, sessio
 history, friction digests, briefings. **A model buys exactly one thing** — durable
 *claims* extracted across sessions. Skip this step and the rest still works.
 
-```toml
-# ctxlake.toml
-[summarize]
-mode = "shadow"              # extract and gate, but show agents nothing yet
+`init` sets it up and **verifies it with a real call before writing anything**:
 
-[summarize.batch]
-provider    = "openrouter"   # anthropic · openrouter · gemini · openai-compatible · ollama
-model       = "anthropic/claude-haiku-4.5"
-api_key_env = "OPENROUTER_API_KEY"    # the NAME of a variable, never the key itself
+```sh
+# already have Claude Code? use its subscription — no API key at all
+ctxlake init --store s3://my-bucket/ctxlake --fleet myteam --llm claude-cli
+
+# or a provider key
+export OPENROUTER_API_KEY=...
+ctxlake init --store s3://my-bucket/ctxlake --fleet myteam --llm openrouter
 ```
 
-`ollama` with a `base_url` keeps every transcript on the machine. Start in `shadow`:
-claims accumulate and the gates report, but nothing reaches a context window until you
-have read a couple of weeks of them and decided. See [memory.md](memory.md).
+| `--llm` | Key needed | Default model |
+|---|---|---|
+| `claude-cli` | **none** — uses the `claude` binary's own subscription | `haiku` |
+| `anthropic` | `ANTHROPIC_API_KEY` | `claude-haiku-4-5` |
+| `openrouter` | `OPENROUTER_API_KEY` | `anthropic/claude-haiku-4.5` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-2.0-flash` |
+| `openai-compatible` | `OPENAI_API_KEY` + `--llm-base-url` | `gpt-4o-mini` |
+| `ollama` | none — local, nothing leaves the machine | `llama3.1` |
+
+Override any of it with `--llm-model`, `--llm-key-env`, `--llm-base-url`. The config
+stores the **name** of the environment variable, never a key.
+
+The default is `--summarize-mode shadow`: claims accumulate and the gates report, but
+nothing reaches a context window until you have read a couple of weeks of them and
+decided. See [memory.md](memory.md).
+
+> **`claude-cli` and `ANTHROPIC_API_KEY` don't mix.** The CLI prefers the key over the
+> subscription, so a stale one makes every call fail with a 401 that says nothing about
+> ctxlake. `init` refuses rather than writing a config that will fail later.
 
 ## 7. Check the host before you install anything
 

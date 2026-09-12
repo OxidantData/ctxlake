@@ -28,6 +28,8 @@ Every subcommand accepts `--config <path>` to point at a `ctxlake.toml` elsewher
 
 ```sh
 ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force] [--daemon]
+             [--llm <provider>] [--llm-model <m>] [--llm-key-env <VAR>]
+             [--llm-base-url <url>] [--summarize-mode <mode>]
 ```
 
 | Flag | Meaning |
@@ -37,6 +39,9 @@ ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force] [--daemon]
 | `--agent-id` | Defaults to a sanitized hostname, stable across re-runs on the same host |
 | `--force` | Required to overwrite an existing config; without it `init` refuses and changes nothing |
 | `--daemon` | Also install and start the sync daemon as a service, so it survives a reboot — equivalent to `ctxlake sync install` afterwards |
+| `--llm` | Configure Tier 2 with `claude-cli`, `anthropic`, `openrouter`, `gemini`, `openai-compatible` or `ollama`, and **verify it with a real call before writing the config**. `claude-cli` needs no key: it uses the `claude` binary's own subscription |
+| `--llm-model` / `--llm-key-env` / `--llm-base-url` | Override the provider's defaults. The config stores the env var's *name*, never a key |
+| `--summarize-mode` | `none` · `agent` · `batch` · `both` · `shadow`. Defaults to `shadow` |
 
 ### `ctxlake doctor`
 
@@ -320,7 +325,7 @@ of this setting. `[summarize.batch]` is ignored under `none` and `agent`:
 
 | Field | Meaning | Default |
 |---|---|---|
-| `provider` | `anthropic`, `openai-compatible`, `ollama`, `openrouter`, or `gemini` | required |
+| `provider` | `anthropic`, `openai-compatible`, `ollama`, `openrouter`, `gemini`, or `claude-cli` | required |
 | `model` | Model name for the batch provider | required |
 | `api_key_env` | **Name** of the environment variable holding the API key | required |
 | `base_url` | Override for a self-hosted, `ollama`, `openrouter`, or `gemini` endpoint | provider default |
@@ -334,6 +339,7 @@ of this setting. `[summarize.batch]` is ignored under `none` and `agent`:
 | `openai-compatible` | `/chat/completions` | Yes — any self-hosted gateway speaking it |
 | `ollama` | `/api/chat` | No — defaults to `localhost:11434` |
 | `openrouter` | `/chat/completions` (OpenAI-shaped) | No — defaults to `openrouter.ai`; value is not needing to know the URL |
+| `claude-cli` | Shells out to `claude -p --output-format json` | No — uses the subscription that CLI is signed in to. Needs `claude` on `PATH`, and **no** `ANTHROPIC_API_KEY` set, since the CLI prefers a key over the subscription |
 | `gemini` | `generateContent`, structured output via `responseSchema` | No — defaults to `generativelanguage.googleapis.com` |
 
 Running entirely locally, so no transcript leaves the host — a first-class path, not a

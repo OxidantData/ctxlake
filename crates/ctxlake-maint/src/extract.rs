@@ -63,6 +63,10 @@ pub enum ProviderKind {
     /// structured output via `generationConfig.responseSchema`) — see
     /// [`GeminiProvider`].
     Gemini,
+    /// The `claude` CLI already installed on this machine, in print mode — no API
+    /// key, billed to whatever subscription that CLI is signed in to. See
+    /// [`ClaudeCliProvider`].
+    ClaudeCli,
 }
 
 /// `[summarize.batch]`, mirroring `docs/memory.md`'s table field-for-field,
@@ -169,6 +173,14 @@ pub fn build_provider(cfg: &BatchConfig) -> Result<Box<dyn Provider>, ExtractErr
                 Some(key),
                 cfg.base_url.clone(),
             )))
+        }
+        ProviderKind::ClaudeCli => {
+            // No key: that is the whole point. A key in the environment would be
+            // used *instead* of the subscription by the CLI itself, so `probe`
+            // reports it rather than letting a 401 surface as a parse failure much
+            // later, in a maintenance log.
+            ClaudeCliProvider::probe().map_err(ExtractError::Provider)?;
+            Ok(Box::new(ClaudeCliProvider::new(cfg.model.clone())))
         }
         ProviderKind::Gemini => {
             let key = api_key.ok_or_else(|| missing_api_key(cfg))?;
@@ -388,6 +400,145 @@ pub fn parse_batch_jsonl(raw: &str) -> HashMap<String, Result<String, String>> {
         out.insert(custom_id.to_string(), outcome);
     }
     out
+}
+
+/// Tier 2 through the `claude` CLI you already have, on the subscription it is
+/// already signed in to.
+///
+/// The cheapest extraction is the one you are not separately billed for. Anyone
+/// running ctxlake is by definition running a coding agent, and for Claude Code users
+/// that means a `claude` binary already authenticated against a subscription — so
+/// asking them to go create an API key to summarise their own sessions is asking for
+/// a second bill and a second secret to manage.
+///
+/// Shells out to `claude -p --output-format json`, which is the documented scriptable
+/// mode, and reads `.result` out of the envelope. Verified against 2.1.78.
+///
+/// Three honest caveats, each of which shows up as a plain error rather than a silent
+/// no-op:
+///
+/// - **`ANTHROPIC_API_KEY` in the environment wins over the subscription.** The CLI
+///   prefers it, so a stale or dummy key makes every call fail with a 401 that says
+///   nothing about ctxlake. [`probe`] reports it.
+/// - **`claude` must be on `PATH`.** A supervised daemon has a minimal one; the unit
+///   inherits the user's login PATH, not an interactive shell's.
+/// - **Subscription rate limits apply**, and they are not the API's. Extraction is
+///   batch work that retries, so a limit costs a later pass, not lost sessions.
+pub struct ClaudeCliProvider {
+    model: String,
+}
+
+impl ClaudeCliProvider {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+
+    /// Whether this machine can actually run it — for `ctxlake doctor`.
+    pub fn probe() -> Result<(), String> {
+        if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
+            return Err(
+                "ANTHROPIC_API_KEY is set, and the claude CLI prefers it over the \
+                 subscription — unset it, or use provider = \"anthropic\" with that key"
+                    .to_string(),
+            );
+        }
+        match std::process::Command::new("claude")
+            .arg("--version")
+            .output()
+        {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(format!(
+                "`claude --version` failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(e) => Err(format!("`claude` is not on PATH: {e}")),
+        }
+    }
+}
+
+impl Provider for ClaudeCliProvider {
+    fn complete<'a>(
+        &'a self,
+        req: &'a CompletionRequest,
+    ) -> BoxFuture<'a, Result<String, ExtractError>> {
+        Box::pin(async move {
+            let model = if self.model.is_empty() {
+                "haiku".to_string()
+            } else {
+                self.model.clone()
+            };
+            let user = req.user_prompt.clone();
+            let system = req.system_prompt.clone();
+
+            // The CLI is blocking and can take seconds; keep it off the async
+            // executor's threads.
+            let out = tokio::task::spawn_blocking(move || {
+                use std::io::Write as _;
+                use std::process::{Command, Stdio};
+                let mut child = Command::new("claude")
+                    .args([
+                        "-p",
+                        "--output-format",
+                        "json",
+                        "--model",
+                        &model,
+                        "--append-system-prompt",
+                        &system,
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin was piped")
+                    .write_all(user.as_bytes())?;
+                child.wait_with_output()
+            })
+            .await
+            .map_err(|e| ExtractError::Provider(format!("claude CLI task panicked: {e}")))?
+            .map_err(|e| ExtractError::Provider(format!("running the claude CLI: {e}")))?;
+
+            if !out.status.success() {
+                return Err(ExtractError::Provider(format!(
+                    "claude CLI exited {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+                ExtractError::MalformedResponse(format!("claude CLI envelope: {e}"))
+            })?;
+            // `is_error` is where an auth failure or a refusal surfaces; the process
+            // still exits 0, so trusting the exit code alone would turn a 401 into a
+            // parse error about text that is really an error message.
+            if envelope
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return Err(ExtractError::Provider(format!(
+                    "claude CLI: {}",
+                    envelope
+                        .get("result")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown error")
+                )));
+            }
+            envelope
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    ExtractError::MalformedResponse(
+                        "claude CLI envelope has no string `result`".to_string(),
+                    )
+                })
+        })
+    }
 }
 
 /// `anthropic` — real HTTP, via `reqwest`; no Anthropic Rust SDK exists.
@@ -2219,6 +2370,64 @@ mod tests {
     /// environment) sets, and always removes it again — a leaked var here
     /// would make some *other* test's "is it unset" assertion flaky depending
     /// on run order.
+    #[test]
+    fn the_claude_cli_provider_needs_no_api_key() {
+        // The entire point: anyone running ctxlake already runs a coding agent, and
+        // for Claude Code users that binary is already signed in. Requiring an API
+        // key to summarise their own sessions means a second bill and a second
+        // secret. If this ever starts demanding a key, that value is gone.
+        let cfg = BatchConfig {
+            provider: ProviderKind::ClaudeCli,
+            model: "haiku".to_string(),
+            api_key_env: String::new(),
+            ..Default::default()
+        };
+        // Only assert the key requirement, not that `claude` is installed — CI has
+        // no Claude Code, and a test that needs one would be skipped everywhere that
+        // matters.
+        match build_provider(&cfg) {
+            Ok(_) => {}
+            Err(e) => {
+                let m = e.to_string();
+                assert!(
+                    !m.contains("is not set"),
+                    "must never fail for a missing API key: {m}"
+                );
+                assert!(
+                    m.contains("PATH") || m.contains("ANTHROPIC_API_KEY") || m.contains("claude"),
+                    "the only acceptable failures are about the CLI itself: {m}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_claude_cli_error_envelope_is_an_error_not_a_parse_failure() {
+        // The CLI exits 0 and reports failure inside the JSON. Trusting the exit
+        // code alone turns a 401 into "malformed structured-output response", which
+        // sends someone debugging the prompt instead of their auth.
+        let envelope = serde_json::json!({
+            "type": "result",
+            "is_error": true,
+            "result": "Failed to authenticate. API Error: 401",
+        });
+        assert_eq!(
+            envelope
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the field this provider keys off must keep its name"
+        );
+    }
+
+    #[test]
+    fn a_fenced_payload_from_the_claude_cli_still_parses() {
+        // Observed from a real `claude -p --model haiku` call: it returns its JSON
+        // inside a ```json fence, the same wrapper OpenRouter's models add.
+        let raw = "```json\n{\"claims\":[]}\n```";
+        assert!(parse_claims_response(raw).is_ok());
+    }
+
     #[test]
     fn build_provider_fails_with_a_clear_message_naming_the_unset_env_var() {
         let var = "CTXLAKE_TEST_MISSING_KEY_ANTHROPIC";

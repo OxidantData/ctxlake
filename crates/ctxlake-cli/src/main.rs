@@ -121,6 +121,27 @@ struct InitCmd {
     /// With `--daemon`: install even if the pre-install checks fail.
     #[arg(long)]
     skip_checks: bool,
+
+    /// Configure Tier 2 extraction with this provider, and verify it before writing.
+    ///
+    /// `claude-cli` uses the `claude` binary already on this machine, on the
+    /// subscription it is already signed in to — no API key at all.
+    #[arg(long = "llm", value_enum)]
+    llm: Option<config::ProviderKind>,
+    /// Model for `--llm`. Defaults to the cheapest capable one for that provider.
+    #[arg(long = "llm-model")]
+    llm_model: Option<String>,
+    /// Name of the environment variable holding the key — never the key itself.
+    /// Defaults to the provider's conventional variable.
+    #[arg(long = "llm-key-env")]
+    llm_key_env: Option<String>,
+    /// Endpoint override, for a self-hosted or `ollama` provider.
+    #[arg(long = "llm-base-url")]
+    llm_base_url: Option<String>,
+    /// How much the belief layer does. `shadow` extracts and gates but shows agents
+    /// nothing, which is where to start.
+    #[arg(long, value_enum, default_value = "shadow")]
+    summarize_mode: config::SummarizeMode,
 }
 
 #[derive(Args)]
@@ -302,6 +323,13 @@ async fn run() -> Result<()> {
                     fleet_id: &args.fleet,
                     agent_id: args.agent_id.as_deref(),
                     force: args.force,
+                    llm: args.llm.map(|provider| init::LlmArgs {
+                        provider,
+                        model: args.llm_model.as_deref(),
+                        api_key_env: args.llm_key_env.as_deref(),
+                        base_url: args.llm_base_url.as_deref(),
+                        mode: args.summarize_mode,
+                    }),
                 },
                 &config_path,
             )

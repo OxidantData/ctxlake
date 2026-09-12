@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased
+## v0.1.7
+
+> **Upgrading: run `ctxlake sync install` once on every host after updating.**
+>
+> This release partitions `live/` by fleet, so every host has to be on it before the
+> roster means anything — a host still on v0.1.6 writes to the old location and is
+> invisible to upgraded ones, and vice versa. Nothing is lost either way: `live/` is
+> disposable state that rebuilds within one heartbeat.
+>
+> `ctxlake sync install` is also what pins `PATH` into the unit, which is what makes
+> `provider = "claude-cli"` and `provider = "ollama"` resolvable to a daemon. From
+> v0.1.7 on, `ctxlake update` re-renders the unit itself and this step disappears.
+>
+> Once every host is upgraded, `ctxlake maint --prune --dry-run` shows the old `live/`
+> keys, and without the flag removes them.
+
 
 ### `--fleet` was not actually a boundary
 

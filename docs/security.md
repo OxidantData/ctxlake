@@ -1,6 +1,6 @@
 # Security — redaction, quarantine, injection, IAM
 
-## Redaction: three layers, cheapest first
+## Redaction: four layers, cheapest first
 
 Redaction runs inside `ctxlake-hook`, before the spool, on every path including
 `ctxlake import` — never as a later pass. Bronze is immutable, so the only place
@@ -8,12 +8,27 @@ scrubbing can happen is before the first write, once.
 
 | Layer | What it catches | Scope |
 |---|---|---|
-| **1. Literal prefixes** | A fixed table of markers — `sk-`, `AKIA`, `ghp_`, PEM headers, `Authorization:` — in one Aho-Corasick pass | Every field, whole length |
-| **2. Entropy** | Runs of ≥32 base64/hex-charset characters scoring ≥4.5 bits/char | **Tool output only** |
-| **3. Path denylist** | `~/.aws/credentials`, `~/.ssh/id_*`, `~/.netrc`, `~/.hermes/.env`, `~/.kube/config` and similar | The *result* is dropped entirely, regardless of content |
+| **1. Literal markers** | `sk-`, `AKIA`, `ghp_`, `gsk_`, `hf_`, `npm_`, `xai-`, `SG.`, `ya29.`, PEM headers, `Bearer `, Slack/Discord webhook hosts, and the env-var names secrets sit next to | Every field, whole length |
+| **2. Structural** | `scheme://user:password@host` URIs, Luhn-valid card numbers, dashed US SSNs | Every field |
+| **3. Path denylist** | any `.env`, `~/.aws/credentials`, `~/.ssh/id_*`, `*.pem`/`*.key`/`*.p12`, `~/.git-credentials`, `terraform.tfstate`, `~/.gnupg/`, gcloud ADC and similar | The *result* is dropped entirely, regardless of content |
+| **4. Entropy** | Runs of ≥32 base64/hex-charset characters scoring ≥4.5 bits/char | **Tool output only** |
+
+A **marker** says a credential is nearby but not where it ends, so layer 1 withholds the
+whole value — guessing a secret's extent is how redactors leak. A **structural** match
+knows its own extent exactly (a URI password ends at the `@`), so layer 2 replaces just
+that span: dropping a 5,000-line log because one line held a card number teaches people
+to switch redaction off, which protects nothing.
+
+> **These layers were audited against real inputs, and the audit found gaps.** Before it,
+> `.env` was not on the denylist at all — while this page said it was — so the most common
+> secret file in existence was captured in full unless its contents happened to contain a
+> recognisable marker. A Postgres URL with an inline password, a Slack webhook, Groq /
+> HuggingFace / npm tokens, card numbers and SSNs all reached the spool untouched. All are
+> covered now, each with a test. The lesson generalises: a redactor's coverage is whatever
+> its tests exercise, never what its documentation claims.
 
 Layer 1 catches most accidental leaks: pasted keys, printed env vars, curl commands that
-echo their own headers. Layer 2 is restricted to tool output because prose
+echo their own headers. Layer 4 is restricted to tool output because prose
 false-positives gut the content that makes a briefing useful; for calibration, base64
 random data sits near 6.0 bits/char while English prose and hex digests both sit near 4.0,
 so a digest survives entropy alone. Layer 3 still records the call — "an agent read

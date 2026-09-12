@@ -5,7 +5,9 @@
     "cwd": "/Users/dev/projects/ctxlake",
     "hook_event_name": "PostToolUse",
     "tool_name": "Read",
-    "tool_input": {"file_path": "/Users/dev/projects/ctxlake/.env"},
+    "tool_input": {
+      "file_path": "/Users/dev/projects/ctxlake/.env"
+    },
     "tool_use_id": "tu-101",
     "tool_result": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
   },
@@ -14,8 +16,15 @@
     "message_id": "tu-101",
     "tool": {
       "name": "Read",
-      "paths": ["/Users/dev/projects/ctxlake/.env"]
+      "paths": [
+        "/Users/dev/projects/ctxlake/.env"
+      ]
     },
-    "redaction": {"status": "quarantined", "rules_fired": ["aws_access_key_id"]}
+    "redaction": {
+      "status": "quarantined",
+      "rules_fired": [
+        "denied_path"
+      ]
+    }
   }
 }

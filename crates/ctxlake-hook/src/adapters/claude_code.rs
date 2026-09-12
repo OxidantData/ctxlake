@@ -273,6 +273,36 @@ mod tests {
     }
 
     #[test]
+    fn a_dotenv_read_is_withheld_even_when_nothing_in_it_looks_like_a_key() {
+        // The golden fixture for this event happens to contain `AKIA...`, so it
+        // passed even while `.env` was absent from the deny list — the marker layer
+        // caught it by luck. Most `.env` files hold things like
+        // `DATABASE_PASSWORD=hunter2`, which no marker matches and no entropy check
+        // flags, and those were spooled in full.
+        let v = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "cwd": "/home/alice/app",
+            "tool_name": "Read",
+            "tool_use_id": "t1",
+            "tool_input": {"file_path": "/home/alice/app/.env"},
+            "tool_result": "DATABASE_PASSWORD=hunter2\nFEATURE_FLAG=true"
+        });
+        let env = normalize("PostToolUse", &v).expect("adapter must accept this");
+        let tool = env.tool.expect("a tool call");
+        let result = tool.result.unwrap_or_default();
+        assert!(
+            !result.contains("hunter2"),
+            "a .env read must never carry its contents to the spool: {result}"
+        );
+        assert!(
+            env.redaction.rules_fired.iter().any(|r| r == "denied_path"),
+            "it must be withheld by path, not by luck: {:?}",
+            env.redaction.rules_fired
+        );
+    }
+
+    #[test]
     fn a_leaked_secret_in_tool_output_is_quarantined_before_it_reaches_the_envelope() {
         let env = normalize(
             "PostToolUse",

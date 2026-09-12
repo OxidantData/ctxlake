@@ -65,7 +65,7 @@ Three things move data, and only one of them is automatic.
 | Stage | Moved by | Automatic? |
 |---|---|---|
 | Agent event → local spool | **hook** | **Yes** — `ctxlake install` wires it |
-| spool ⇄ object storage | **`ctxlake sync`** daemon | No — you start it |
+| spool ⇄ object storage | **`ctxlake sync`** daemon | No — `ctxlake sync install` |
 | storage → digests, memories | **`ctxlake maint`** | No — cron or a timer |
 
 **The hook never touches the network**, in either direction. It appends one line and

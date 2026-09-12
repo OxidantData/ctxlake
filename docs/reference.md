@@ -14,7 +14,7 @@ exceptions are flagged inline — `ctxlake mcp` and `ctxlake install hermes`.
 | `ctxlake uninstall` | Remove exactly what `install` added |
 | `ctxlake status` | Who is active, on what |
 | `ctxlake config` | Print the resolved config |
-| `ctxlake sync` | Run (or check, or stop) the daemon |
+| `ctxlake sync` | Run the daemon, or install it as a service so it survives a reboot |
 | `ctxlake maint` | Run the maintenance chain — safe from any number of hosts at once |
 | `ctxlake claims` | Review candidate / contested / promoted claims |
 | `ctxlake quarantine` | Stop one agent's claims from promoting |
@@ -27,7 +27,7 @@ Every subcommand accepts `--config <path>` to point at a `ctxlake.toml` elsewher
 ### `ctxlake init`
 
 ```sh
-ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force]
+ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force] [--daemon]
 ```
 
 | Flag | Meaning |
@@ -36,6 +36,7 @@ ctxlake init --store <url> --fleet <id> [--agent-id <id>] [--force]
 | `--fleet` | Required. The boundary of who sees whom |
 | `--agent-id` | Defaults to a sanitized hostname, stable across re-runs on the same host |
 | `--force` | Required to overwrite an existing config; without it `init` refuses and changes nothing |
+| `--daemon` | Also install and start the sync daemon as a service, so it survives a reboot — equivalent to `ctxlake sync install` afterwards |
 
 ### `ctxlake doctor`
 
@@ -125,22 +126,47 @@ than printing an empty roster that looks like "nobody is here."
 ### `ctxlake sync`
 
 ```sh
-ctxlake sync                          # daemonize (the default)
-ctxlake sync --foreground             # run attached, e.g. under systemd/launchd
-ctxlake sync --status
-ctxlake sync --stop
+ctxlake sync run                      # daemonize (bare `ctxlake sync` does the same)
+ctxlake sync run --foreground         # stay attached — what a service unit invokes
+ctxlake sync start | stop | restart | status
+ctxlake sync install [--no-start]     # survive reboots
+ctxlake sync delete                   # remove exactly what install added
 ```
 
 Runs three loops in one process: spool → `sessions/`, store → local cache, and this
 agent's heartbeat. Without it running somewhere, sessions sit in the spool and never reach
-the lake. The bare form daemonizes (detached child, own process group, stdio to
-`~/.ctxlake/run/<fleet_id>.log`). `--status`/`--stop` check liveness against the pidfile
-with `kill -0` rather than trusting a stale file; `--stop` sends `SIGTERM`, waits 5
-seconds, and reports what happened.
+the lake — and because the hook only ever writes locally, nothing tells you it stopped.
+That is why `install` exists.
 
-> **There is no `setsid`** — a bare `ctxlake sync` can still receive a `SIGHUP` when its
-> controlling terminal's session ends. For a host you care about, run
-> `ctxlake sync --foreground` under a real service manager.
+`start`/`stop`/`restart`/`status` mean the same thing either way: with a service
+installed they drive systemd or launchd, without one they drive a detached child process
+(own process group, stdio to `~/.ctxlake/run/<fleet_id>.log`). Liveness is checked with
+`kill -0` against the pidfile rather than by trusting the file; `stop` sends `SIGTERM`,
+waits 5 seconds, and reports what actually happened.
+
+| | Linux | macOS |
+|---|---|---|
+| Written to | `~/.config/systemd/user/ctxlake-sync.service` | `~/Library/LaunchAgents/com.oxidantdata.ctxlake-sync.plist` |
+| Scope | systemd **user** unit | **LaunchAgent** |
+| Starts at | login, and on `install` | login, and on `install` |
+| Survives reboot | **only with lingering** (below) | yes |
+
+Both are user-scoped deliberately: the daemon reads *your* spool and writes with *your*
+store credentials. A system unit or LaunchDaemon runs as root and would reach neither.
+
+> **Linux: `sudo loginctl enable-linger $USER`.** Without lingering, systemd stops your
+> user manager at logout and does not bring it back after a reboot — on a headless host,
+> where a fleet agent actually runs, that means the daemon silently never returns.
+> `ctxlake sync install` checks for it and `ctxlake sync status` reports it, but only you
+> can set it.
+
+`ctxlake init --daemon` does init, install and start in one step.
+
+> **A missing or unusable `ctxlake.toml` exits 78** (`EX_CONFIG`), not 1 — no number of
+> restarts writes a config file, so the unit carries `RestartPreventExitStatus=78` and
+> systemd gives up immediately instead of relaunching every five seconds forever.
+> Everything else exits 1, so a genuinely transient failure (an unreachable store) is
+> still retried.
 
 ### `ctxlake maint`
 
@@ -198,7 +224,6 @@ subcommand reads it.
 store             = "s3://my-bucket/ctxlake"
 fleet_id          = "myteam"
 agent_id          = "cc-01"
-collision_policy  = "warn"
 
 [summarize]
 mode = "agent"
@@ -221,7 +246,6 @@ Everything below `agent_id` is optional and defaults exactly as shown. A file wi
 | `store` — required | `s3://bucket/prefix`, `gs://…`, `az://…` (also `abfs://`/`abfss://`), or `file:///absolute/path`. Credentials are never part of this line — every backend but `file://` reads them the way its own SDK does |
 | `fleet_id` — required | The boundary of who sees whom. Map it to a team genuinely collaborating, not to a company |
 | `agent_id` — required | A stable logical identity — not a hostname, and not something that changes across restarts |
-| `collision_policy` — `"warn"` | What happens when two agents' declared intents overlap. `warn` notes it in the briefing and `ctxlake status`; `block` additionally lets the hook decline to let *its own* agent proceed. Either way it is advisory — it cannot stop another agent from writing |
 
 ### `[summarize]`
 

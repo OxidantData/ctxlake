@@ -81,12 +81,23 @@ re-running changes nothing. Preview with `--dry-run`; reverse with `ctxlake unin
 ## 6. Start the daemon
 
 ```sh
-ctxlake sync
+ctxlake sync install       # systemd user unit (Linux) or LaunchAgent (macOS)
+ctxlake sync status
 ```
 
 The piece that moves bytes: spool → store, store → the local cache your hooks read, and
-this agent's heartbeat. **Nothing above starts it for you.** Run it once per host, or
-point a `systemd`/`launchd` unit at `ctxlake sync --foreground`.
+this agent's heartbeat. **Nothing above starts it for you.**
+
+`install` hands it to the machine's own supervisor so it comes back after a reboot.
+`ctxlake sync start` alone runs it until the machine restarts — and because capture keeps
+working regardless (the hook only writes locally), the first symptom of a daemon that
+never came back is a briefing that quietly stops updating.
+
+> **Linux: run `sudo loginctl enable-linger $USER` too**, or systemd stops your user
+> manager at logout and the daemon does not return after a reboot. `install` and `status`
+> both tell you whether it is set.
+
+`ctxlake init --daemon` does steps 2 and 6 together.
 
 ## 7. See the fleet
 

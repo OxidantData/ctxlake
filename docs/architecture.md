@@ -158,7 +158,9 @@ duckdb -c "SELECT runtime, event_type, count(*) FROM 's3://bucket/ctxlake/sessio
 
 | Symptom | First thing to check | Why |
 |---|---|---|
-| Empty briefing at session start | Is `ctxlake sync` running? Then the mtime of `cache/<fleet_id>/briefing.json` | The hook only reads the local cache. Without a daemon the file may not exist — the hook fails *open* rather than blocking the session |
+| Empty briefing at session start | `ctxlake sync status`, then the mtime of `cache/<fleet_id>/briefing.json` | The hook only reads the local cache. Without a daemon the file may not exist — the hook fails *open* rather than blocking the session |
+| Everything worked until a reboot | `ctxlake sync status` — is a service installed, and on Linux is lingering on? | An un-supervised daemon does not come back. Capture keeps working (the hook writes locally), so the only symptom is a briefing going stale |
+| Service `active` but no pidfile | the daemon log in `~/.ctxlake/run/` | It is crash-looping faster than it can write one. Exit 78 means the config is missing or unusable, and systemd will have stopped retrying |
 | Peers invisible / roster empty | That your own `live/agents/<id>.json` exists and has not passed `expires_at`; the cache's refresh timestamp | A peer whose heartbeat lapsed is legitimately gone — a stale local cache looks identical for a peer that is still there |
 | Local spool keeps growing | `ctxlake status` for the daemon, `ctxlake doctor` for connectivity | A line is removed only after its write is confirmed. A crashed daemon, a partition, and a store outage all present this way |
 | Hook adds noticeable latency | Time `ctxlake-hook` against a captured payload; check for an unusually large tool output | Budget is 5ms p99. Almost always a huge payload meeting `MAX_SCAN_BYTES`, a full disk, or — as a real bug — network I/O in the hook path |

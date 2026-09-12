@@ -1,0 +1,17 @@
+{
+  "event": "beforeReadFile",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "file_path": "/Users/dev/.aws/credentials",
+    "content": "[default]\naws_access_key_id=AKIAIOSFODNN7EXAMPLE",
+    "attachments": []
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "read",
+      "paths": ["/Users/dev/.aws/credentials"]
+    },
+    "redaction": {"status": "quarantined", "rules_fired": ["denied_path"]}
+  }
+}

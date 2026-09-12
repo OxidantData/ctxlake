@@ -1,0 +1,14 @@
+{
+  "event": "sessionEnd",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "reason": "completed",
+    "duration_ms": 120000,
+    "is_background_agent": false,
+    "final_status": "completed"
+  },
+  "expect": {
+    "event_type": "session_end",
+    "session_id": "cur-sess-001"
+  }
+}

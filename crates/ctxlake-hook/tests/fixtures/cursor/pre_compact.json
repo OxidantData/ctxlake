@@ -1,0 +1,17 @@
+{
+  "event": "preCompact",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "trigger": "auto",
+    "context_usage_percent": 92,
+    "context_tokens": 180000,
+    "context_window_size": 200000,
+    "message_count": 340,
+    "messages_to_compact": 120,
+    "is_first_compaction": true
+  },
+  "expect": {
+    "event_type": "compact",
+    "session_id": "cur-sess-001"
+  }
+}

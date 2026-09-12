@@ -1,0 +1,16 @@
+{
+  "event": "beforeShellExecution",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "command": "rm -rf target",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "sandbox": false
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "shell",
+      "input": "rm -rf target"
+    }
+  }
+}

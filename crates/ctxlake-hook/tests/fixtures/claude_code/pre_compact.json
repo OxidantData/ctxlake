@@ -1,0 +1,12 @@
+{
+  "event": "PreCompact",
+  "payload": {
+    "session_id": "cc-sess-001",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "hook_event_name": "PreCompact"
+  },
+  "expect": {
+    "event_type": "compact",
+    "session_id": "cc-sess-001"
+  }
+}

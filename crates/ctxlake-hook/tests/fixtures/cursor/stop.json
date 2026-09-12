@@ -1,0 +1,13 @@
+{
+  "event": "stop",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "status": "completed",
+    "loop_count": 3
+  },
+  "expect": {
+    "event_type": "assistant",
+    "role": "assistant",
+    "session_id": "cur-sess-001"
+  }
+}

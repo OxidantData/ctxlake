@@ -1,0 +1,18 @@
+{
+  "event": "beforeSubmitPrompt",
+  "payload": {
+    "conversation_id": "cur-sess-001",
+    "generation_id": "gen-1",
+    "prompt": "refactor the redactor to cap scan bytes",
+    "attachments": [],
+    "hook_event_name": "beforeSubmitPrompt",
+    "cursor_version": "1.4.0",
+    "workspace_roots": ["/Users/dev/projects/ctxlake"]
+  },
+  "expect": {
+    "event_type": "prompt",
+    "role": "user",
+    "content": "refactor the redactor to cap scan bytes",
+    "session_id": "cur-sess-001"
+  }
+}

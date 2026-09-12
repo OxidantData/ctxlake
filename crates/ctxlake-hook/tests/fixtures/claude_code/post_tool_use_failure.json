@@ -1,0 +1,20 @@
+{
+  "event": "PostToolUseFailure",
+  "payload": {
+    "session_id": "cc-sess-001",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "hook_event_name": "PostToolUseFailure",
+    "tool_name": "Bash",
+    "tool_input": {"command": "cargo test --nonexistent-flag"},
+    "tool_use_id": "tu-102",
+    "tool_result": "error: unrecognized option '--nonexistent-flag'"
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "Bash",
+      "result": "error: unrecognized option '--nonexistent-flag'",
+      "exit_code": 1
+    }
+  }
+}

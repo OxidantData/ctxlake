@@ -1,0 +1,13 @@
+{
+  "event": "afterAgentResponse",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "text": "I added the rotation test and it passes."
+  },
+  "expect": {
+    "event_type": "assistant",
+    "role": "assistant",
+    "content": "I added the rotation test and it passes.",
+    "session_id": "cur-sess-001"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "event": "PreToolUse",
+  "payload": {
+    "session_id": "cc-sess-001",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_input": {"command": "cargo test -p ctxlake-hook"},
+    "tool_use_id": "tu-100"
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "message_id": "tu-100",
+    "tool": {
+      "name": "Bash",
+      "input": "{\"command\":\"cargo test -p ctxlake-hook\"}"
+    },
+    "redaction": {"status": "clean"}
+  }
+}

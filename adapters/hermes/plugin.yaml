@@ -1,0 +1,22 @@
+# ctxlake capture plugin for Hermes.
+#
+# Layout and this file's shape mirror ~/.hermes/plugins/orca-status/ — the only
+# in-process plugin convention observed on a live Hermes install. Unlike orca-status,
+# this plugin never leaves the process: it writes straight to the local spool (see
+# _spool.py) instead of POSTing to a companion daemon over HTTP.
+name: ctxlake
+version: 0.1.0
+description: "Captures Hermes agent lifecycle events into the ctxlake spool."
+author: "OxidantData"
+kind: standalone
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - pre_approval_request
+  - post_approval_response
+  - on_session_end
+  - on_session_finalize
+  - on_session_reset

@@ -1,0 +1,17 @@
+{
+  "event": "beforeMCPExecution",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "tool_name": "search",
+    "tool_input": {"query": "ctxlake redaction"},
+    "mcp_server_name": "web",
+    "cwd": "/Users/dev/projects/ctxlake"
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "mcp:web",
+      "input": "{\"query\":\"ctxlake redaction\"}"
+    }
+  }
+}

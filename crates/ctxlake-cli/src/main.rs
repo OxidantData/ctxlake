@@ -12,6 +12,7 @@ mod config;
 mod config_cmd;
 mod doctor;
 mod hooks;
+mod import;
 mod init;
 mod maint_cmd;
 mod nudge;
@@ -52,6 +53,8 @@ enum Command {
     Doctor,
     /// Merge ctxlake's hooks into a runtime's config.
     Install(InstallCmd),
+    /// Backfill the history a runtime already has on disk. See docs/import.md.
+    Import(ImportCmd),
     /// Remove exactly what `install` added.
     Uninstall(InstallCmd),
     /// Show who is active, on what branch, holding what.
@@ -122,6 +125,28 @@ impl clap::ValueEnum for HookRuntime {
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
         Some(clap::builder::PossibleValue::new(self.name()))
     }
+}
+
+#[derive(Args)]
+struct ImportCmd {
+    /// `claude-code`, `cursor`, or `hermes`. Only `hermes` has a reader today —
+    /// the other two are refused by name rather than accepted and quietly
+    /// importing nothing (see `import/mod.rs`).
+    #[arg(long)]
+    runtime: Option<HookRuntime>,
+    /// Every runtime, skipping the ones with no history on this host.
+    #[arg(long)]
+    all: bool,
+    /// Only sessions whose last activity is at or after this point: a window
+    /// (`90d`, `36h`, `45m`, `30s`) or a date (`2026-01-01`, or full RFC 3339).
+    #[arg(long)]
+    since: Option<String>,
+    /// Count and classify, write nothing — neither the spool nor the dedup ledger.
+    #[arg(long)]
+    dry_run: bool,
+    /// Read this file instead of the runtime's default state location.
+    #[arg(long)]
+    source: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -246,6 +271,23 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Install(args) => run_install(&config_path, args, true).await,
+        // Synchronous on purpose: import reads a local SQLite file and appends to
+        // the local spool. `ctxlake sync` is what carries those events to the
+        // store, so nothing here touches the network (AGENTS.md invariant 1's
+        // separation, applied to the import path too).
+        Command::Import(args) => {
+            let cfg = load_config(&config_path)?;
+            import::run(
+                &cfg,
+                import::ImportRequest {
+                    runtime: args.runtime,
+                    all: args.all,
+                    since: args.since,
+                    dry_run: args.dry_run,
+                    source: args.source,
+                },
+            )
+        }
         Command::Uninstall(args) => run_install(&config_path, args, false).await,
         Command::Status => {
             let cfg = load_config(&config_path)?;

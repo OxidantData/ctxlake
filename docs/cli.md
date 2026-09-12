@@ -11,6 +11,7 @@ ctxlake init        point at a store, write ctxlake.toml
 ctxlake doctor      the trust-building command — run this before install
 ctxlake install     merge hooks into a runtime, never clobber
 ctxlake uninstall   remove exactly what install added
+ctxlake import      backfill the history a runtime already has on disk
 ctxlake status      who's active, on what, holding what
 ctxlake claim       acquire a lease on a resource
 ctxlake release     give one back
@@ -291,6 +292,55 @@ table above — the runtime's own vocabulary for that event, matching the contra
 > [runtimes/hermes.md](runtimes/hermes.md).
 
 
+
+## `ctxlake import`
+
+```sh
+ctxlake import --runtime hermes [--since 90d] [--dry-run] [--source <path>]
+ctxlake import --all [--since 90d]
+```
+
+Backfills the sessions a runtime already recorded before ctxlake existed on this
+machine. Import builds the same envelopes the hook builds, runs them through the same
+redactor, and appends them to the same spool `ctxlake sync` drains — it is not a second
+capture pipeline, and it never touches the object store itself.
+
+```text
+hermes: imported from /Users/you/.hermes/state.db
+  source schema_version: 7
+  sessions: 22 seen, 21 imported, 0 outside --since, 1 with no messages
+  events:   17362 built, 17362 imported, 0 already imported (content-hash dedup)
+  redaction: 4 redacted, 2 quarantined
+  ledger:   17362 event(s) known
+```
+
+**Only `--runtime hermes` has a reader today.** `--runtime claude-code` and
+`--runtime cursor` are refused by name and exit non-zero. That is deliberate: a command
+that accepts the flag and cheerfully reports importing nothing is the silent-failure
+shape AGENTS.md's "how these were found" section exists to prevent. `--all` skips a
+runtime with nothing to read and says so, because most hosts run one or two of the
+three.
+
+- **`--since`** takes a window (`90d`, `36h`, `45m`, `30s`) or a date (`2026-01-01`, or
+  full RFC 3339). It selects **whole sessions by last activity**, never individual
+  messages — half a session produces a digest whose duration and turn count are
+  arithmetic over a truncated transcript.
+- **`--dry-run`** counts and classifies and writes neither the spool nor the ledger, so
+  a later real run still imports everything.
+- **`--source`** points at a state file somewhere other than the runtime's default.
+
+Re-running is a no-op. Each event's identity — runtime, session, kind, instant, source
+row id, post-redaction content hash, tool input hash — is hashed into a dedup key, and
+the keys already emitted are kept in `~/.ctxlake/import/<runtime>.ledger`. The ledger
+deliberately does not live in the spool: `ctxlake sync` deletes spool files once they
+are uploaded, so a ledger there would be erased by its own success and the next import
+would replay every event into immutable bronze a second time.
+
+> **Hermes's database is opened read-only and lock-free**
+> (`file:<path>?mode=ro&immutable=1`), because `~/.hermes/state.db` belongs to a process
+> that may be running right now. ctxlake will not contend with your agent for its own
+> state. See [import.md](import.md) for the full mapping, the compaction marker import
+> recovers that live capture cannot, and what happens when Hermes's schema moves.
 
 ## `ctxlake status`
 

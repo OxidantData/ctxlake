@@ -15,6 +15,15 @@ path = "src/main.rs"
 [dependencies]
 ctxlake-core = { path = "../ctxlake-core" }
 ctxlake-store = { path = "../ctxlake-store" }
+# `ctxlake import` appends to the exact same spool `ctxlake-hook` writes and
+# `ctxlake sync` drains (`import/mod.rs`'s module doc). Reusing that crate's
+# `spool::append_event_at` and its `adapters::common` redaction helpers — rather
+# than growing a second spool writer and a second scrubber here — is AGENTS.md
+# invariant 7 taken literally. This is a path dependency on a workspace member,
+# not a new third-party crate, and it does not touch ctxlake-hook's own dependency
+# tree, which is what invariant 2 and CI's `hook-deps` job govern. It was already
+# a dev-dependency of this crate for the briefing round-trip test.
+ctxlake-hook = { path = "../ctxlake-hook" }
 ctxlake-maint = { path = "../ctxlake-maint" }
 ctxlake-mcp = { path = "../ctxlake-mcp" }
 # The daemon library behind `ctxlake sync` (upload/cache/presence loops) — see
@@ -40,6 +49,12 @@ time.workspace = true
 object_store.workspace = true
 url.workspace = true
 futures.workspace = true
+# `ctxlake import --runtime hermes` reads Hermes's own `~/.hermes/state.db`. Not a
+# new workspace dependency (ctxlake-maint and ctxlake-mcp already carry it, so it
+# is already in this binary's tree via them); named here because this crate now
+# uses it directly, and `bundled` keeps the read-only/URI open flags this importer
+# depends on independent of whatever libsqlite3 the host happens to ship.
+rusqlite.workspace = true
 # `object_store::path::Path` percent-encodes a dynamic segment on write
 # (`PathPart`'s `join`/`child`) but exposes no public way to decode one back —
 # `Path::filename()`/`Path::parts()` both return the raw, still-encoded segment.
@@ -65,10 +80,9 @@ serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile.workspace = true
-# The briefing's writer lives in this crate and its reader lives in ctxlake-hook.
-# The round-trip test needs both halves, or neither notices the other changing shape —
-# which is precisely the failure this whole link was added to close.
-ctxlake-hook = { path = "../ctxlake-hook" }
+# ctxlake-hook is a normal dependency now (see above); the briefing round-trip test
+# that first pulled it in as a dev-dependency still needs both halves in one binary,
+# or neither notices the other changing shape.
 # Test-only: the concurrent-first-claim regression test wraps a real `ObjectStore`
 # to force the exact interleaving `ensure_provisioned` (claim.rs) must survive.
 # `object_store::ObjectStore` is itself defined with `#[async_trait]`

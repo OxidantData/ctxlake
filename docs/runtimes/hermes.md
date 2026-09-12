@@ -15,6 +15,12 @@ second spool writer, and so no chance of the two drifting apart.
 > `adapters::hermes` (in `crates/ctxlake-hook`) does normalize exactly the payload shape
 > described below, through the same binary every other runtime uses.
 >
+> The **import** half of this page ("History imports in full", below) has a different
+> and narrower basis: `~/.hermes/state.db`'s schema as read from *one* live install with
+> `PRAGMA table_info`. That is enough to build against and not enough to call frozen,
+> which is why the importer refuses to run at all when a column it maps has moved. See
+> [../import.md](../import.md).
+>
 > What is **not** yet true: the `command:` lines in the config block below are the
 > target invocation, not what `ctxlake install hermes` writes (that installer command
 > is a later wave). `ctxlake-hook`'s own contract (`main.rs`) takes the event name and
@@ -110,7 +116,7 @@ typo fails visibly rather than silently capturing nothing.
 | `tool_call` (post) | `post_tool_call` | Carries `result` and `duration_ms` |
 | `assistant` | `post_llm_call` | |
 | `session_end` | `on_session_end` | Also `on_session_finalize`, `on_session_reset` |
-| `compact` | — | **No equivalent.** See the gap below. |
+| `compact` | — | **No hook equivalent.** Import recovers it from `state.db`; see the gap below. |
 
 ## The payload
 
@@ -160,7 +166,7 @@ response is later work, not something this page can claim is live today.
 | Block a colliding edit | yes, mechanically | `pre_tool_call` returning `{"action": "block", "message": ...}`, or `exit 2` — **not yet sent**; see above |
 | Claude Code response format | yes | `{"decision": "modify", "tool_input": {...}}` is normalized internally |
 | Fail closed on hook crash | yes | `fail_closed: true`, `pre_tool_call` only |
-| Compaction marker | **no** | no hook exists |
+| Compaction marker | **no** | no hook exists — `ctxlake import` recovers it from `state.db` instead |
 | MCP client | yes | |
 
 ### Injection lands in the user message, by design
@@ -176,16 +182,25 @@ in front of it. Injecting into the system prompt would invalidate the cache on e
 When several plugins inject, their contributions are joined with blank lines in
 alphabetical order of directory name.
 
-## The compaction gap
+## The compaction gap — in *live capture*, and only there
 
-Hermes has no `pre_compact` equivalent, so a Hermes session has no marker for the moment
-its context was discarded. Claude Code and Cursor both emit one.
+Hermes has no `pre_compact` equivalent, so a **live-captured** Hermes session has no
+marker for the moment its context was discarded. Claude Code and Cursor both emit one.
+`adapters::hermes` never synthesizes one: there is no event to synthesize it from, and
+nothing infers it.
 
-The consequence is narrow but real: for a Hermes session you cannot reconstruct what the
-agent could still see at a given point. Tool calls, outcomes, and digests are unaffected.
-There is a `session:compress` event on the *gateway* hook surface, but that fires for
-messaging-platform sessions rather than the agent's own tool-calling loop, so it is not a
-substitute.
+The consequence is narrow but real: from live capture alone you cannot reconstruct what
+the agent could still see at a given point. Tool calls, outcomes, and digests are
+unaffected. There is a `session:compress` event on the *gateway* hook surface, but that
+fires for messaging-platform sessions rather than the agent's own tool-calling loop, so
+it is not a substitute.
+
+**Import closes this gap, which is the one place a backfill beats live capture.**
+`~/.hermes/state.db` marks compacted messages with `compacted = 1` after the fact, so
+`ctxlake import --runtime hermes` emits a `compact` event where the data shows one — one
+marker per contiguous run of compacted rows, at the run's last message. A hook can only
+see what it is called for; a database can be read afterwards. See
+[../import.md](../import.md).
 
 The transcript itself has a separate, narrower gap worth stating plainly rather than
 folding into "unaffected": `pre_llm_call`/`post_llm_call` envelopes are captured with
@@ -194,10 +209,35 @@ name for the prompt/assistant text has been verified against a live payload capt
 this adapter would rather leave a field empty than spool a guessed key). So today a
 Hermes session's bronze record has one `Prompt` and one `Assistant` envelope per turn,
 correctly ordered and timestamped, but without the actual text — fix this the same way
-`cursor.rs`'s fields were corrected, by diffing against a live capture.
+`cursor.rs`'s fields were corrected, by diffing against a live capture. Import does not
+have this gap either: `messages.content` is right there in the database.
 
-ctxlake records the gap rather than papering over it: Hermes sessions simply have no
-`compact` events, and nothing infers one.
+## History imports in full
+
+Hermes keeps a complete SQLite state database at `~/.hermes/state.db` — sessions,
+every user/assistant/tool message, the structured `tool_calls` an assistant asked for,
+per-session token and cost accounting, and the titles Hermes generates for its own UI.
+
+That makes Hermes a **high-fidelity import source, comparable to Claude Code**, not the
+"live capture only, nothing to backfill" runtime an earlier version of
+[../import.md](../import.md) claimed it was. `ctxlake import --runtime hermes` backfills
+sessions that predate ctxlake entirely.
+
+```sh
+ctxlake import --runtime hermes --since 90d
+```
+
+Three properties worth knowing before you run it against a machine with a live agent on
+it, each covered in full by [../import.md](../import.md):
+
+- **The database is opened read-only and lock-free** — `file:<path>?mode=ro&immutable=1`
+  with `SQLITE_OPEN_READ_ONLY`. ctxlake never contends with your running agent for its
+  own state.
+- **Every imported event goes through the same redactor as live capture.** A historical
+  transcript is the likeliest place an un-redacted `cat .env` already sits.
+- **A changed schema fails loudly.** Hermes carries a `schema_version` table because its
+  shape can move; the importer requires each column it maps by name and refuses with the
+  missing ones listed, rather than importing nothing and calling it success.
 
 ## Coexistence
 

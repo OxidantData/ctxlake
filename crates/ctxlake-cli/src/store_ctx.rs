@@ -34,7 +34,7 @@ pub fn connect(cfg: &Config, caller_id: &str) -> Result<StoreCtx> {
         .with_context(|| format!("connecting to {}", cfg.store))?;
     // The local filesystem backend has no remote clock to distrust (see
     // `ctxlake_store::clock`'s module doc) — everywhere else, trusting our own
-    // wall clock for lease expiry is exactly what AGENTS.md invariant 6 forbids.
+    // wall clock for expiry decisions is exactly what AGENTS.md invariant 6 forbids.
     let clock: Arc<dyn Clock> = if url.scheme() == "file" {
         Arc::new(SystemClock)
     } else {

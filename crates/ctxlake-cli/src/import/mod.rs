@@ -214,7 +214,8 @@ impl Ledger {
 ///
 /// So the key hashes the event's *identity*: runtime, session, kind, instant, the
 /// source's own row id (`message_id`), the post-redaction content hash, and the tool
-/// input hash. Fields are NUL-separated for the reason `hash::resource_key` gives —
+/// input hash. Fields are NUL-separated for the reason `ctxlake_core::hash`'s own
+/// `a_nul_separator_keeps_two_fields_from_colliding` test gives —
 /// a plain concatenation makes `("ab","c")` and `("a","bc")` the same key.
 pub fn dedup_key(env: &Envelope) -> String {
     let event_type = serde_json::to_string(&env.event_type).unwrap_or_default();

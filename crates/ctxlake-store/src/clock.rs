@@ -1,9 +1,10 @@
 //! The store's own clock — never the caller's wall clock.
 //!
-//! AGENTS.md invariant 6: lease expiry must compare against a timestamp the object
+//! AGENTS.md invariant 6: expiry must compare against a timestamp the object
 //! store itself produced, never `SystemTime::now()` on the calling host. Hosts in a
 //! fleet are distributed and their clocks skew; a laptop with a fast clock must not
-//! be able to decide a lease held by a live agent elsewhere has expired.
+//! be able to decide that a live agent's presence entry, written elsewhere, has
+//! aged out.
 //!
 //! Honesty about what we can actually get here: every S3-, GCS- and
 //! Azure-compatible HTTP response carries a `Date` header stating the server's
@@ -19,7 +20,7 @@
 //! reads back the `last_modified` the store assigns to *that write*. That value is
 //! still computed by the store, not by us — the exact property invariant 6 is
 //! protecting — it is just obtained via a write-then-read instead of a header we
-//! can't reach. The cost is one extra `put` + `head` per reading. Lease operations
+//! can't reach. The cost is one extra `put` + `head` per reading. Expiry checks
 //! are never on the hook path (invariant 1), so this is not a latency-sensitive
 //! path; it runs at daemon/maintenance cadence, not per tool call.
 //!
@@ -38,9 +39,9 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use crate::error::StoreError;
 use crate::layout;
 
-/// A reading of "now" for lease expiry decisions.
+/// A reading of "now" for expiry decisions.
 ///
-/// Implementations must return a timestamp every contender for a given lease would
+/// Implementations must return a timestamp every host reading a given key would
 /// agree on (to within normal network latency) — that is the whole contract. A
 /// timestamp only one process can see is exactly what this trait exists to rule
 /// out.

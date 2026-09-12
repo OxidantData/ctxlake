@@ -392,10 +392,65 @@ def check_hermes_import_fidelity() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# The Tier 2 wiring gap.
+#
+# `extract` and `gate` are complete, tested modules that `run::run` does not
+# call. That is a defensible place to stop — the belief layer is the highest-
+# stakes path in the project and half-wiring it promotes wrong claims into every
+# agent's context — but it is NOT a defensible thing to leave undocumented,
+# because the failure is silent: an operator configures a model, sets
+# `mode = "shadow"`, runs `ctxlake maint`, and gets an empty claims list that
+# looks exactly like "extraction found nothing worth claiming."
+#
+# So this check reads the code and requires the page to match it, in BOTH
+# directions. Wire the chain up and the check flips: it then fails until the
+# "not wired end-to-end yet" warning is removed.
+# ---------------------------------------------------------------------------
+
+MAINT_RUN = ROOT / "crates" / "ctxlake-maint" / "src" / "run.rs"
+TIER2_GAP_MARKER = "Not wired end-to-end yet"
+
+
+def check_tier2_wiring_matches_the_docs() -> None:
+    if not MAINT_RUN.exists():
+        fail(f"{MAINT_RUN.relative_to(ROOT)} is gone — update this check")
+        return
+
+    # Only the production half; the test module names these freely.
+    src = MAINT_RUN.read_text(encoding="utf-8").split("#[cfg(test)]", 1)[0]
+    wired = "gate::run(" in src and "extract::run(" in src
+
+    memory_md = read("memory.md")
+    documented_as_gap = TIER2_GAP_MARKER in memory_md
+
+    if wired and documented_as_gap:
+        fail(
+            "memory.md still carries the "
+            f"{TIER2_GAP_MARKER!r} warning, but ctxlake-maint's run::run now calls "
+            "both extract::run and gate::run. Delete the warning — a doc that "
+            "under-promises a shipped feature keeps people from using it."
+        )
+    if not wired and not documented_as_gap:
+        fail(
+            "ctxlake-maint's run::run does not call extract::run and gate::run, but "
+            f"memory.md no longer says so. Tier 2 failing silently looks identical "
+            f"to Tier 2 finding nothing; restore the {TIER2_GAP_MARKER!r} warning."
+        )
+
+    reference_md = read("reference.md")
+    if not wired and "does **not** yet run Tier 2" not in reference_md:
+        fail(
+            "reference.md's `ctxlake maint` section does not say the chain skips "
+            "Tier 2 extraction and the gate, which is what the code actually does"
+        )
+
+
 def main() -> int:
     check_scaling_arithmetic()
     check_runtime_verification_honesty()
     check_hermes_import_fidelity()
+    check_tier2_wiring_matches_the_docs()
 
     if failures:
         print(f"FAIL — {len(failures)} regression check(s) failed:\n")

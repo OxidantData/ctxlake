@@ -2,7 +2,7 @@
 
 Three things move data, and only one of them is automatic.
 
-<svg viewBox="0 0 720 250" role="img" aria-label="Hooks write to a local spool; the sync daemon ships it to object storage and refreshes a local cache; the hook reads that cache. Maintenance derives digests and memories." style="width:100%;height:auto">
+<svg viewBox="0 0 720 236" role="img" aria-label="Hooks write to a local spool; the sync daemon ships it to object storage and refreshes a local cache; the hook reads that cache. Maintenance derives digests and memories." style="width:100%;height:auto">
   <defs>
     <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M0 0 L8 4 L0 8 z" fill="var(--oxidant-text-muted)"/>
@@ -56,10 +56,10 @@ Three things move data, and only one of them is automatic.
 
   <path class="l" d="M542 128 H580"/>
   <path class="l dash" d="M580 145 H546"/>
-  <text x="560" y="240" class="s">derives digests + memories</text>
+  <text x="712" y="176" class="s" text-anchor="end">derives digests + memories</text>
 
   <path class="l dash" d="M208 128 V90 H140"/>
-  <text x="150" y="104" class="s">briefing, on session start</text>
+  <text x="216" y="86" class="s">briefing, on session start</text>
 </svg>
 
 | Stage | Moved by | Automatic? |

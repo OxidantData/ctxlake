@@ -64,6 +64,15 @@ fn scan_dir(dir: &Path, violations: &mut Vec<String>) {
     }
 }
 
+/// Scoped to the three engine crates on purpose, not the whole workspace.
+///
+/// `ctxlake-cli` and `ctxlake-mcp` deliberately contain these tokens *inside their own
+/// regression assertions* — `status.rs` asserts its output never contains "lease",
+/// `init.rs` asserts no `live/leases/` prefix is ever created — so a token scan there
+/// would flag the very guards that prove the removal stuck. Those crates are covered
+/// by behaviour instead, which is the stronger check: the tools catalog, the JSON-RPC
+/// method list, `ctxlake status`'s output and the hook's PreToolUse response are each
+/// asserted lease-free directly.
 #[test]
 fn no_lease_module_or_live_leases_path_remains_in_the_engine_crates() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));

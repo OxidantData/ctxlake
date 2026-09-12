@@ -40,20 +40,26 @@ No key is appended to by two processes. There is no cross-key atomicity on any b
 so every operation is single-object-atomic or log-then-derive. A change that needs a
 two-key transaction is a request to add a database — escalate, do not improvise.
 
-**4. Leases are CAS-only, never put-if-absent.**
-MinIO rejects `If-None-Match: *` (minio/minio#20346, closed "working as intended"). A
-lease object always exists; its *contents* say free or held. Acquire = read, then
-`PutMode::Update(version)` from the version you read. This is the only form that works on
-S3, GCS, MinIO, R2 and local FS alike.
+**4. Shared mutable state is CAS, never put-if-absent.**
+MinIO rejects `If-None-Match: *` (minio/minio#20346, closed "working as intended"), so
+anything that must be *updated* by more than one writer — the roster, the snapshot
+pointer — reads the object and then `PutMode::Update(version)` from the version it read.
+`PutMode::Create` is correct only where "someone got here first" is the answer you
+wanted: idempotency markers, which have no holder and nothing to steal.
 
-**5. Leases are advisory and the docs must say so.**
-A stalled process can wake after expiry and write; no resource here rejects a stale
-fencing token. For code, git is the arbiter. For irreversible external actions the target
-must enforce an idempotency key. Never write a doc sentence implying stronger guarantees.
+**5. There is no lease, and nothing may reintroduce one.**
+Every unit of batch work is idempotent *by content*: compaction writes to a directory
+named for the hash of its inputs, digests are claimed per session with a create-if-absent
+marker, the snapshot is content-addressed and published by a pointer swap. That is a
+stronger property than mutual exclusion and it needs no coordination, so two hosts
+running `ctxlake maint` at the same minute is fine and supported.
+`crates/ctxlake-store/tests/no_lease_regression.rs` fails the build if a `lease` module,
+a `live/leases/` key, or the surrounding vocabulary comes back. If you think you need a
+lock, you have found work that is not idempotent — fix that instead.
 
-**6. Lease expiry uses the store's `Date` response header, never a local clock.**
-Hosts are distributed and clocks skew. A skewed laptop must not be able to expire a live
-agent.
+**6. Expiry uses the store's `Date` response header, never a local clock.**
+Hosts are distributed and clocks skew. A skewed laptop must not be able to decide that a
+live agent's presence entry has aged out.
 
 **7. Redaction runs before the spool, on every path including import.**
 Bronze is immutable; a leaked key in bronze is permanent. Historical transcripts are the

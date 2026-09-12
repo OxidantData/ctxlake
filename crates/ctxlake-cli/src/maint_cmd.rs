@@ -1,49 +1,47 @@
-//! `ctxlake maint [--once]` — run the maintenance chain under the fleet-wide
-//! maintenance lease (`ctxlake_store::layout::lease_maintenance`).
+//! `ctxlake maint [--once]` — compact, digest, and publish the snapshot.
 //!
-//! **What this command is, honestly.** `ctxlake-maint` — the crate that will own
-//! compaction, Tier 0 digests, Tier 2 extraction, the four promotion gates, and
-//! snapshot publish (docs/summarization.md) — is an empty scaffold as of this
-//! wave, built by a separate wave-3 track (this wiring wave's task brief: "Do not
-//! touch crates/ctxlake-maint internals — other agents own those"). This command
-//! cannot call a chain that does not exist yet.
+//! **This used to be a lease, wrapped around nothing.** The command acquired a
+//! fleet-wide maintenance lease, reported "held elsewhere" and exited if it lost the
+//! race, and then — because `ctxlake-maint` was still a scaffold when this module was
+//! written — printed that there was no chain to run. Both halves are now wrong: the
+//! chain exists, and the lease does not.
 //!
-//! What it delivers instead is the coordination half, which *is* ready and is the
-//! part most worth getting right first: acquire the lease so at most one host
-//! ever runs maintenance at a time, exit 0 quietly when another host already holds
-//! it (AGENTS.md invariant 5 — advisory, and the fleet should never see this as an
-//! error), run whatever chain exists, release, and optionally repeat on an
-//! interval. That "exit 0 quietly on contention" is exactly what makes a cron
-//! entry or systemd timer *optional* rather than required, per docs/cli.md: point
-//! one at every host, or none at all, and nothing breaks either way — see
-//! docs/summarization.md's own framing of Tier 2 as batch, not latency-sensitive.
+//! The lease is gone because every step the chain takes is idempotent **by content**,
+//! which is a stronger guarantee than mutual exclusion and needs no coordination at
+//! all:
 //!
-//! Wiring in the real chain, once `ctxlake-maint` ships one, is a one-line change
-//! to [`run_chain`] — replacing its honest "nothing to run yet" report with an
-//! actual call — not a redesign of this module.
+//! - **Compaction** writes into a directory named for the hash of its input set. Two
+//!   hosts compacting the same sealed sessions write identical bytes to the same path;
+//!   different input sets land in different directories and cannot collide.
+//! - **Digests** are claimed per session with a create-if-absent marker, so exactly
+//!   one host does each session's work — a marker, not a lock: no holder, no TTL,
+//!   nothing to steal or expire.
+//! - **The snapshot** is content-addressed and published by swapping a CAS pointer.
+//!
+//! So `ctxlake maint` on every host in the fleet, from cron, at the same minute, is
+//! fine. That was already the *intent* behind the lease's quiet exit-0 on contention;
+//! removing the lease keeps the property and deletes the concept.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ctxlake_store::layout;
-use ctxlake_store::lease::{self, AcquireOutcome};
 
-use crate::config::Config;
+use crate::config::{Config, SummarizeMode};
 use crate::store_ctx;
 
-/// Independent of `ctxlake_sync::presence::MAINTENANCE_LEASE_TTL` on purpose: that
-/// constant governs the daemon's own opportunistic background heartbeat cadence,
-/// while this one governs a human- or cron-triggered run of the actual chain,
-/// which may legitimately take longer than a 60s heartbeat interval to finish.
-/// Both lease the exact same key (`layout::lease_maintenance`), so whichever
-/// caller acquires it first simply holds it until its own TTL or `release`.
-const MAINT_LEASE_TTL: Duration = Duration::from_secs(300);
-
-/// How long between chain runs when not `--once`. Generous on purpose:
-/// maintenance is definitionally not latency-sensitive (docs/summarization.md's
-/// Tier 2 section calls batch extraction "half the price" of a live call
-/// specifically because nothing is waiting on it).
+/// How long between chain runs when not `--once`. Generous on purpose: maintenance is
+/// definitionally not latency-sensitive — nothing is waiting on it.
 const MAINT_LOOP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Whether promoted claims may reach an agent's context window.
+///
+/// `shadow` is the whole point of this mapping: it runs extraction and the gates in
+/// full so their output can be read and judged, while keeping every promoted claim out
+/// of every session. `none` runs no belief layer at all, so there is nothing to serve
+/// either way. Everything else serves normally.
+fn agent_reads_enabled(mode: SummarizeMode) -> bool {
+    !matches!(mode, SummarizeMode::Shadow | SummarizeMode::None)
+}
 
 pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     loop {
@@ -57,135 +55,130 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
 
 async fn run_one_cycle(cfg: &Config) -> Result<()> {
     let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
-    let key = store_ctx::full_path(&ctx, &layout::lease_maintenance());
+    let store = store_ctx::prefixed_store(&ctx);
 
-    match lease::acquire(
-        ctx.store.as_ref(),
-        ctx.clock.as_ref(),
-        &key,
-        &cfg.agent_id,
-        Some("ctxlake maint"),
-        MAINT_LEASE_TTL,
+    let report = ctxlake_maint::run::run(
+        store.as_ref(),
+        &cfg.fleet_id,
+        agent_reads_enabled(cfg.summarize.mode),
     )
     .await
-    .with_context(|| "acquiring the maintenance lease")?
-    {
-        AcquireOutcome::NotAcquired { holder, .. } => {
-            // AGENTS.md invariant 5: another host holding this lease is the
-            // expected, common case in a fleet — never an error, never a nonzero
-            // exit, never a loud message. This is the behavior that lets an
-            // operator run `ctxlake maint` from cron on *every* host without ever
-            // seeing a spurious failure on the ones that lost the race.
-            println!(
-                "maintenance lease held by {} — nothing to do",
-                holder.as_deref().unwrap_or("someone else")
-            );
-            Ok(())
-        }
-        AcquireOutcome::Acquired(handle) => {
-            let result = run_chain(cfg).await;
-            // Release even if the chain returned an error — an error mid-chain
-            // must not wedge the lease for its whole TTL when the next attempt
-            // (this host or another) could otherwise retry immediately.
-            let _ = lease::release(ctx.store.as_ref(), handle).await;
-            result
-        }
-    }
-}
+    .context("running the maintenance chain")?;
 
-/// The actual chain: compaction, Tier 0 digests, Tier 2 extraction, the four
-/// promotion gates, snapshot publish. See this module's doc for why there is
-/// nothing to call yet, and why that is reported honestly (the same house rule
-/// `ctxlake-mcp`'s `memory_search` already applies to its own sibling gap:
-/// `enabled: false` with a plain reason, never a fabricated result) rather than
-/// silently no-op'd.
-async fn run_chain(_cfg: &Config) -> Result<()> {
     println!(
-        "maintenance lease acquired, but ctxlake-maint has no chain to run yet \
-         (compaction/extraction/gates/snapshot — see docs/summarization.md); \
-         releasing the lease"
+        "compacted {} date(s) · {} digest(s) written, {} already done · snapshot {}",
+        report.dates_compacted.len(),
+        report.digests_written,
+        report.digests_skipped,
+        describe_snapshot(&report.snapshot),
     );
     Ok(())
+}
+
+/// One line an operator can read, rather than the struct's `Debug`.
+///
+/// The distinction that matters here is "published" vs "already current": on a fleet
+/// running `ctxlake maint` from cron on every host, *most* runs legitimately publish
+/// nothing, because another host already produced byte-identical output. Printing
+/// that as a normal outcome rather than a warning is what makes running it everywhere
+/// feel correct instead of alarming.
+fn describe_snapshot(o: &ctxlake_maint::snapshot::SnapshotOutcome) -> String {
+    let short = o.content_hash.get(..12).unwrap_or(&o.content_hash);
+    let state = match (o.blob_written, o.pointer_updated) {
+        (_, true) => "published",
+        (true, false) => "written, pointer already current",
+        (false, false) => "already current",
+    };
+    let reads = if o.agent_reads_enabled {
+        ""
+    } else {
+        " · shadow: not served to agents"
+    };
+    format!("{short} ({} claim(s), {state}){reads}", o.claim_count)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ctxlake_store::lease::LeaseState;
 
     fn cfg(dir: &std::path::Path, fleet: &str, agent: &str) -> Config {
         Config::new(format!("file://{}", dir.display()), fleet, agent)
     }
 
-    #[tokio::test]
-    async fn once_with_the_lease_already_held_exits_ok_and_does_no_work() {
-        let dir = tempfile::tempdir().unwrap();
-        let holder_cfg = cfg(dir.path(), "myteam", "cc-holder");
-        let ctx = store_ctx::connect(&holder_cfg, "cc-holder").unwrap();
-        let key = store_ctx::full_path(&ctx, &layout::lease_maintenance());
-        lease::provision(ctx.store.as_ref(), &key).await.unwrap();
-        let handle = match lease::acquire(
-            ctx.store.as_ref(),
-            ctx.clock.as_ref(),
-            &key,
-            "cc-holder",
-            Some("holding it for the test"),
-            Duration::from_secs(300),
-        )
-        .await
-        .unwrap()
-        {
-            AcquireOutcome::Acquired(h) => h,
-            AcquireOutcome::NotAcquired { .. } => panic!("expected to win an uncontended lease"),
+    #[test]
+    fn shadow_and_none_are_the_only_modes_that_withhold_claims_from_agents() {
+        // This boolean is the entire enforcement point for shadow mode: it is
+        // checked where claims are *read*, not where config is parsed, so getting it
+        // backwards would silently serve claims into every session in the fleet
+        // while `ctxlake config` still printed `mode = "shadow"`.
+        assert!(!agent_reads_enabled(SummarizeMode::Shadow));
+        assert!(!agent_reads_enabled(SummarizeMode::None));
+        for mode in [
+            SummarizeMode::Agent,
+            SummarizeMode::Batch,
+            SummarizeMode::Both,
+        ] {
+            assert!(agent_reads_enabled(mode), "{mode} must serve claims");
+        }
+    }
+
+    #[test]
+    fn the_snapshot_summary_distinguishes_published_from_already_current() {
+        use ctxlake_maint::snapshot::SnapshotOutcome;
+        let base = SnapshotOutcome {
+            content_hash: "03b40624c5b99ee754e344c426cfe919".into(),
+            claim_count: 7,
+            agent_reads_enabled: true,
+            blob_written: true,
+            pointer_updated: true,
         };
+        assert!(describe_snapshot(&base).contains("published"));
+        assert!(describe_snapshot(&base).contains("03b40624c5b9"));
 
-        let contender_cfg = cfg(dir.path(), "myteam", "cc-contender");
-        // Must return Ok — contention is advisory and expected, not an error.
-        run(&contender_cfg, true).await.unwrap();
+        // The common case on a fleet running maint from cron everywhere: another
+        // host already published byte-identical output. It must not read as failure.
+        let noop = SnapshotOutcome {
+            blob_written: false,
+            pointer_updated: false,
+            ..base.clone()
+        };
+        let text = describe_snapshot(&noop);
+        assert!(text.contains("already current"), "{text}");
+        assert!(!text.to_lowercase().contains("fail"), "{text}");
 
-        // And must genuinely have done nothing: the lease is still held by the
-        // original holder, unchanged.
-        let state: LeaseState = lease::read(ctx.store.as_ref(), &key).await.unwrap();
-        assert_eq!(state.holder.as_deref(), Some("cc-holder"));
-        assert_eq!(
-            state.epoch, handle.epoch,
-            "a contender that lost the race must not have touched the lease at all"
-        );
+        // Shadow mode is visible in the line, because a silent shadow is the one way
+        // an operator can believe claims are reaching agents when they are not.
+        let shadow = SnapshotOutcome {
+            agent_reads_enabled: false,
+            ..base
+        };
+        assert!(describe_snapshot(&shadow).contains("shadow"));
     }
 
     #[tokio::test]
-    async fn once_with_no_contention_acquires_runs_and_releases() {
+    async fn a_run_on_an_empty_store_succeeds_and_needs_no_initialization() {
+        // The lease this command used to take had to be *provisioned* by `ctxlake
+        // init` first, so a store nobody had run `init` against made `ctxlake maint`
+        // fail with a message about provisioning. With the lease gone there is
+        // nothing to provision and nothing to fail on: an empty store simply has no
+        // work in it.
         let dir = tempfile::tempdir().unwrap();
-        let cfg_a = cfg(dir.path(), "myteam", "cc-01");
-        let ctx = store_ctx::connect(&cfg_a, "cc-01").unwrap();
-        let key = store_ctx::full_path(&ctx, &layout::lease_maintenance());
-        lease::provision(ctx.store.as_ref(), &key).await.unwrap();
-
-        run(&cfg_a, true).await.unwrap();
-
-        let state: LeaseState = lease::read(ctx.store.as_ref(), &key).await.unwrap();
-        assert_eq!(
-            state.holder, None,
-            "a completed --once run must release the lease, not hold it until TTL"
-        );
-        assert_eq!(state.epoch, 1, "exactly one acquire/release cycle happened");
+        run(&cfg(dir.path(), "myteam", "cc-01"), true)
+            .await
+            .expect("an un-initialized store has no work, not an error");
     }
 
     #[tokio::test]
-    async fn a_never_initialized_store_fails_clearly_rather_than_hanging_or_panicking() {
-        // `ctxlake init` provisions `lease_maintenance` once, single-writer,
-        // before any contender exists (`init.rs`'s own
-        // `writes_config_and_provisions_the_maintenance_lease` test covers that
-        // half). A store nobody has ever run `init` against is a real, reachable
-        // operator mistake — `run` must report it plainly, not hang waiting on a
-        // lease that will never materialize itself.
+    async fn two_hosts_running_at_once_both_succeed() {
+        // The property that replaced the lease, asserted at the level the lease used
+        // to live at. `ctxlake-maint`'s own suite proves the chain is idempotent by
+        // content; this proves the CLI no longer gates on anything that would make
+        // one of these two report "held elsewhere" and skip its work.
         let dir = tempfile::tempdir().unwrap();
-        let cfg_a = cfg(dir.path(), "myteam", "cc-01"); // deliberately never provisioned
-        let err = run(&cfg_a, true).await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("provision"),
-            "expected a pointer to provisioning/`ctxlake init`, got: {msg}"
-        );
+        let a = cfg(dir.path(), "myteam", "cc-01");
+        let b = cfg(dir.path(), "myteam", "cc-02");
+        let (ra, rb) = tokio::join!(run(&a, true), run(&b, true));
+        ra.expect("host A");
+        rb.expect("host B");
     }
 }

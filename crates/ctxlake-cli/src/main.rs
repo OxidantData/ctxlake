@@ -75,7 +75,7 @@ enum Command {
     /// Run (or check, or stop) the daemon: hook spool -> store, store -> local
     /// cache, and this agent's own presence.
     Sync(SyncCmd),
-    /// Run the maintenance chain under the fleet-wide maintenance lease.
+    /// Compact, digest, and publish the snapshot. Safe to run on every host at once.
     Maint(MaintCmd),
     /// Review candidate, contested, and promoted claims.
     Claims(ClaimsCmd),

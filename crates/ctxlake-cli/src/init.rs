@@ -1,5 +1,5 @@
-//! `ctxlake init` — write `ctxlake.toml`, provision the maintenance lease key, and
-//! verify the store actually answers before declaring success.
+//! `ctxlake init` — write `ctxlake.toml`, and prove the store actually answers
+//! before declaring success.
 
 use std::path::Path;
 
@@ -97,16 +97,11 @@ pub async fn run(args: InitArgs<'_>, config_path: &Path) -> Result<Config> {
         .with_context(|| format!("store at {} is not reachable", cfg.store))?;
     let _ = ctx.store.delete(&probe_key).await; // best-effort scratch cleanup
 
-    // The maintenance lease key this crate provisions up front, single-writer,
-    // before any contender exists — see `ctxlake_store::lease::provision`'s doc for
-    // why that precondition matters. `ctxlake maint` (crates/ctxlake-maint) is the
-    // only thing that ever acquires it; provisioning it here, once, is `init`'s
-    // entire involvement with that mechanism.
-    let maintenance_key = full_path(&ctx, &ctxlake_store::layout::lease_maintenance());
-    ctxlake_store::lease::provision(ctx.store.as_ref(), &maintenance_key)
-        .await
-        .context("provisioning the maintenance lease")?;
-
+    // `init` used to pre-provision a maintenance lease key here, because a lease
+    // object had to exist before anyone could compare-and-swap it. Nothing leases
+    // anything now — `ctxlake maint`'s work is idempotent by content — so there is no
+    // key to seed and `init`'s only remaining job against the store is proving it is
+    // reachable and writable, which the probe above just did.
     config::save(config_path, &cfg)?;
     Ok(cfg)
 }
@@ -157,12 +152,16 @@ mod tests {
         assert_eq!(cfg.agent_id, "cc-01");
         assert!(config_path.exists());
 
-        let ctx = store_ctx::connect(&cfg, "cc-01").unwrap();
-        let key = full_path(&ctx, &ctxlake_store::layout::lease_maintenance());
-        let state = ctxlake_store::lease::read(ctx.store.as_ref(), &key)
-            .await
-            .unwrap();
-        assert_eq!(state.holder, None, "provisioned lease must read back free");
+        // `init` used to seed a maintenance lease object here, and this test used to
+        // assert it read back free. The inverse is what is worth guarding now: no
+        // lease key exists, because nothing leases anything. A lease creeping back in
+        // would show up as a `live/leases/` prefix appearing under the store root.
+        let leases = store_dir.path().join("live").join("leases");
+        assert!(
+            !leases.exists(),
+            "init must create no lease objects; found {}",
+            leases.display()
+        );
     }
 
     #[tokio::test]

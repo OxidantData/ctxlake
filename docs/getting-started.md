@@ -11,21 +11,23 @@ the standard chain. ctxlake manages no cloud credentials of its own.
 
 ## 1. Install
 
-> **No release has been cut yet.** `cargo install --git` is the only path that works
-> today; the rest describes what the release workflow will produce once a tag is pushed.
-
 ```sh
-cargo install --git https://github.com/OxidantData/ctxlake ctxlake-cli
-cargo install --git https://github.com/OxidantData/ctxlake ctxlake-hook
-
-# once released:
-brew install oxidantdata/tap/ctxlake
 curl --proto '=https' --tlsv1.2 -sSf \
   https://raw.githubusercontent.com/OxidantData/ctxlake/main/packaging/install.sh | sh
+
+brew install oxidantdata/tap/ctxlake        # macOS
+
+cargo install --git https://github.com/OxidantData/ctxlake ctxlake-cli   # from source
+cargo install --git https://github.com/OxidantData/ctxlake ctxlake-hook
 ```
 
+Two binaries land: `ctxlake` and `ctxlake-hook`. They are separate because the hook fires
+on every tool call under a 5ms budget and links no network stack at all — see
+[architecture.md](architecture.md). Set `CTXLAKE_INSTALL_DIR` to choose where the script
+puts them; it defaults to `~/.local/bin` and tells you if that is not on your `PATH`.
+
 Prebuilt `.tar.xz` archives for `{aarch64,x86_64}-apple-darwin` and
-`{x86_64,aarch64}-unknown-linux-gnu` land on the
+`{x86_64,aarch64}-unknown-linux-gnu` are on the
 [Releases page](https://github.com/OxidantData/ctxlake/releases).
 
 ## 2. Point it at a store

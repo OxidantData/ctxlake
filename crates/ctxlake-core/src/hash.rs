@@ -18,13 +18,6 @@ pub fn host_id(hostname: &str) -> String {
     content_hash(hostname)
 }
 
-/// Key for a lease on a repo-relative path. Deterministic, so two agents derive the
-/// same key for the same resource without coordinating.
-pub fn resource_key(repo: &str, resource: &str) -> String {
-    let h = content_hash(format!("{repo}\u{0}{resource}"));
-    h.trim_start_matches("sha256:").to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,16 +30,15 @@ mod tests {
     }
 
     #[test]
-    fn resource_key_is_collision_resistant_across_field_boundary() {
-        // A naive `repo + resource` concatenation would make ("ab", "c") and
-        // ("a", "bc") the same lease — two unrelated resources sharing a lock.
-        assert_ne!(resource_key("ab", "c"), resource_key("a", "bc"));
-    }
-
-    #[test]
-    fn resource_key_has_no_prefix_and_is_path_safe() {
-        let k = resource_key("github.com/OxidantData/ctxlake", "crates/**");
-        assert!(!k.contains(':'), "lease keys become object keys: {k}");
-        assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
+    fn a_nul_separator_keeps_two_fields_from_colliding() {
+        // The property `resource_key` existed to hold, kept here because every
+        // multi-field hash in this workspace depends on it: a naive `a + b`
+        // concatenation makes ("ab", "c") and ("a", "bc") the same digest.
+        // `import/mod.rs` points at this test for exactly that reason.
+        assert_ne!(
+            content_hash("ab\u{0}c"),
+            content_hash("a\u{0}bc"),
+            "NUL-separated fields must not collide across the boundary"
+        );
     }
 }

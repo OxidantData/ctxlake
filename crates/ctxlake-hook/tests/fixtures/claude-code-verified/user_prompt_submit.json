@@ -1,9 +1,9 @@
 {
-  "cwd": "/tmp/-Users-vamsi-projects-oxidandata/31ace0a6-1ce6-4039-8ec4-9d18d645c4d8/scratchpad/e2e/work",
+  "cwd": "/tmp/-home-alice-project/31ace0a6-1ce6-4039-8ec4-9d18d645c4d8/scratchpad/e2e/work",
   "hook_event_name": "UserPromptSubmit",
   "permission_mode": "bypassPermissions",
   "prompt": "say hi",
   "prompt_id": "dedf67c5-12d2-4f5b-af03-1059f5515ed0",
   "session_id": "a5bff258-a6d6-4fe3-81bc-8951edbf19fc",
-  "transcript_path": "/tmp/-Users-vamsi-projects-oxidandata/31ace0a6-1ce6-4039-8ec4-9d18d645c4d8/scratchpad/e2e/home/.claude/projects/-private-tmp-claude-501--Users-vamsi-projects-oxidandata-31ace0a6-1ce6-4039-8ec4-9d18d645c4d8-scratchpad-e2e-work/a5bff258-a6d6-4fe3-81bc-8951edbf19fc.jsonl"
+  "transcript_path": "/tmp/-home-alice-project/31ace0a6-1ce6-4039-8ec4-9d18d645c4d8/scratchpad/e2e/home/.claude/projects/-private-tmp-scratch/a5bff258-a6d6-4fe3-81bc-8951edbf19fc.jsonl"
 }

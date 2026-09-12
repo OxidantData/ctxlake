@@ -45,6 +45,16 @@ Not yet captured: `afterFileEdit`, `beforeReadFile`, `beforeSubmitPrompt`, `stop
 inferred, and anything built on them should be treated as unverified until captured the
 same way.
 
+## Sanitizing these correctly
+
+Paths appear in more than one encoding. Claude Code's `transcript_path` embeds the
+working directory as a *slug* (`-Users-alice-projects-thing`), so a scrub that only
+replaces `/Users/alice` leaves the username sitting in the slug. That happened here: a
+fixture was pushed to a public repo with the operator's username still in it, caught by
+a grep afterwards rather than before.
+
+Scrub both forms, then grep before committing.
+
 ## Also worth knowing
 
 - `hook_event_name` uses the same key as Claude Code, so event dispatch is shared.

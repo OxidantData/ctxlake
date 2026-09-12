@@ -325,10 +325,10 @@ mod tests {
     #[test]
     fn denied_paths_are_recognized() {
         let r = Redactor::new();
-        assert!(r.is_denied_path("/Users/vamsi/.aws/credentials"));
+        assert!(r.is_denied_path("/home/alice/.aws/credentials"));
         assert!(r.is_denied_path("/home/x/.ssh/id_ed25519"));
         assert!(r.is_denied_path("/etc/secrets/token"));
-        assert!(!r.is_denied_path("/Users/vamsi/projects/ctxlake/README.md"));
+        assert!(!r.is_denied_path("/home/alice/projects/ctxlake/README.md"));
     }
 
     #[test]

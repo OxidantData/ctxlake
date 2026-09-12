@@ -56,10 +56,14 @@ Everything else still exits 1.
 
 ### Docs
 
-Twenty pages became nine, 2,975 lines became 1,780. Rationale that explained rejected
-alternatives moved out of the user-facing pages; what is left is tables, diagrams and
-commands. Three hand-authored SVG diagrams replace prose walls, and mermaid diagrams
-render instead of shipping their source.
+Twenty pages became nine plus an index; 3,823 lines became 1,857, a little over half.
+Rationale explaining rejected alternatives moved out of the user-facing pages, so what is
+left is tables, diagrams and commands. Three hand-authored SVG diagrams replace prose
+walls, and mermaid diagrams render instead of shipping their source as plain text.
+
+Every `docs/<page>.md` pointer in the codebase was repointed — 104 of them across 37
+files, including two in `ctxlake --help` and the `Documentation=` line in the systemd
+unit.
 
 ### Also
 

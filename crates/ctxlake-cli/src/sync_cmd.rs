@@ -99,6 +99,14 @@ fn build_daemon_config(
     daemon_cfg
 }
 
+/// How often the daemon runs the maintenance chain.
+///
+/// Generous because nothing waits on it: the chain is batch work, and every step is
+/// idempotent by content, so a fleet of hosts all running it five minutes apart
+/// produces the same lake as one host would — just with some duplicated effort that
+/// the content addressing discards.
+const MAINT_INTERVAL: Duration = Duration::from_secs(300);
+
 fn write_pid_file(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -121,6 +129,12 @@ pub async fn run_foreground_until(
     cache_root: PathBuf,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    // Before anything starts: if Tier 2 is configured, prove the provider can
+    // actually be built. A daemon that comes up healthy and then fails the same way
+    // on every maintenance tick, into a log file nobody reads, is the failure mode
+    // this whole project keeps re-learning.
+    crate::maint_cmd::validate_tier2(cfg)?;
+
     let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
     let store = store_ctx::prefixed_store(&ctx);
     let daemon_cfg = build_daemon_config(cfg, runtime, spool_root, cache_root);
@@ -129,11 +143,52 @@ pub async fn run_foreground_until(
     write_pid_file(&pid_path)?;
 
     let daemon = Daemon::spawn(store, ctx.clock.clone(), daemon_cfg);
+    let (maint_stop_tx, maint_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let maint_handle = tokio::spawn(maintenance_loop(cfg.clone(), maint_stop_rx));
+
     shutdown.await;
+
+    let _ = maint_stop_tx.send(());
+    let _ = maint_handle.await;
     daemon.shutdown().await;
 
     let _ = std::fs::remove_file(&pid_path);
     Ok(())
+}
+
+/// The fourth loop: compaction, digests, extraction, the gates, and the snapshot.
+///
+/// This used to be the user's problem. `docs/getting-started.md` had a step telling
+/// you to point a cron entry or a systemd timer at `ctxlake maint` — on a machine
+/// where ctxlake had just installed a supervised daemon of its own. Asking someone to
+/// schedule a second thing next to the thing we scheduled for them is a design gap,
+/// not documentation.
+///
+/// It belongs here rather than in `ctxlake-sync` because that crate cannot depend on
+/// `ctxlake-maint` — `ctxlake-maint` already depends on `ctxlake-sync` for the
+/// envelope codec, so the edge would be a cycle. The CLI is the one place that
+/// already has both, plus the resolved config the chain needs.
+///
+/// **A failed cycle logs and continues.** Maintenance is batch work that nothing is
+/// waiting on; a store that is briefly unreachable should cost a skipped pass, not a
+/// dead daemon that also stops shipping the spool. The one failure that *is* fatal —
+/// an unbuildable Tier 2 provider — is caught before this loop ever starts.
+async fn maintenance_loop(cfg: Config, mut stop: tokio::sync::oneshot::Receiver<()>) {
+    let interval = interval_override("CTXLAKE_SYNC_MAINT_INTERVAL_MS", MAINT_INTERVAL);
+    loop {
+        // The first cycle waits a full interval on purpose: a daemon that has just
+        // started has an empty spool and nothing new to compact, and a burst of
+        // maintenance from every host at once every time a fleet restarts is exactly
+        // the redundant work the content-addressing makes harmless but not free.
+        tokio::select! {
+            _ = &mut stop => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        match crate::maint_cmd::run_one_cycle(&cfg).await {
+            Ok(summary) => println!("maint: {summary}"),
+            Err(e) => eprintln!("maint: cycle failed, will retry in {interval:?}: {e:#}"),
+        }
+    }
 }
 
 #[cfg(unix)]

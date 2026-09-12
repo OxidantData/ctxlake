@@ -82,6 +82,14 @@ pub struct RuntimeReport {
 pub struct LlmReport {
     pub env_var: String,
     pub resolves: bool,
+    /// Whether the configured provider actually answered a real request.
+    ///
+    /// `resolves` alone is a much weaker check than it looks: a revoked key, a
+    /// typo'd model name, a base URL pointing at nothing, and an account over its
+    /// quota all resolve an env var perfectly well and then fail at extraction time,
+    /// hours later, inside a maintenance log. `None` when no call was attempted
+    /// (nothing to call, or the key was missing so there was no point).
+    pub reachable: Option<Result<(), String>>,
 }
 
 pub struct CacheReport {
@@ -105,6 +113,49 @@ impl Report {
     /// not broken capture, so the exit code stays 0.
     pub fn breaks_capture(&self) -> bool {
         !self.reachable
+    }
+
+    /// Why this host is not fit to run a supervised daemon yet, or empty if it is.
+    ///
+    /// `ctxlake sync install` refuses on a non-empty list. Installing a service that
+    /// cannot reach the store, or that is configured for a model it cannot call,
+    /// produces a daemon that looks healthy in `systemctl status` and silently
+    /// achieves nothing — and because capture keeps working regardless (the hook only
+    /// writes locally), nobody finds out until a briefing goes stale days later.
+    ///
+    /// Deliberately narrower than "everything `doctor` printed". Missing runtime hooks
+    /// are a warning, not a blocker: wiring a runtime after installing the daemon is a
+    /// perfectly ordinary order to do things in, and a fleet host that only ships
+    /// other machines' spools may never have a runtime at all.
+    pub fn blocks_service_install(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if !self.reachable {
+            reasons.push(format!(
+                "the store is unreachable: {}",
+                self.reachable_detail
+            ));
+        } else {
+            for p in self.probes.iter().filter(|p| !p.passed) {
+                reasons.push(format!(
+                    "{} failed — {}",
+                    display_name(p.name),
+                    meaning(p.name)
+                ));
+            }
+        }
+        if let Some(llm) = &self.llm {
+            match &llm.reachable {
+                Some(Ok(())) => {}
+                Some(Err(e)) => reasons.push(format!(
+                    "[summarize.batch] is configured but the provider rejected a test call: {e}"
+                )),
+                None => reasons.push(format!(
+                    "[summarize.batch] is configured but {} is not set",
+                    llm.env_var
+                )),
+            }
+        }
+        reasons
     }
 
     pub fn print(&self) {
@@ -148,11 +199,19 @@ impl Report {
         }
 
         if let Some(llm) = &self.llm {
-            println!(
-                "\nllm     {} resolves: {}",
-                llm.env_var,
-                if llm.resolves { "yes" } else { "no" }
-            );
+            match &llm.reachable {
+                Some(Ok(())) => println!("\nllm     {} resolves, provider answered", llm.env_var),
+                Some(Err(e)) => println!(
+                    "\nllm     {} resolves, but the provider FAILED: {e}",
+                    llm.env_var
+                ),
+                None => println!("\nllm     {} does not resolve", llm.env_var),
+            }
+            if !llm.resolves {
+                println!(
+                    "      -> export it, or point api_key_env at the variable that holds the key"
+                );
+            }
         }
 
         println!("\ndaemon");
@@ -287,6 +346,34 @@ fn meaning(probe: &str) -> &'static str {
     }
 }
 
+/// Ask the configured provider to answer one trivial request.
+///
+/// The smallest call that still exercises everything that can be wrong: credentials,
+/// the endpoint, the model name, and the account's standing. A structural check of
+/// the config cannot tell you any of those, and every one of them surfaces otherwise
+/// as "extraction quietly produced no claims".
+///
+/// The error is returned as a plain string rather than propagated, because this is a
+/// *report* — `doctor` prints every finding and then decides, and one unreachable
+/// provider must not stop it reporting the store and the runtimes too.
+async fn probe_provider(b: &crate::config::BatchConfig) -> Result<(), String> {
+    let batch: ctxlake_maint::extract::BatchConfig = b.into();
+    let provider = ctxlake_maint::extract::build_provider(&batch).map_err(|e| e.to_string())?;
+    let req = ctxlake_maint::extract::CompletionRequest {
+        // Deliberately not the extraction prompt: this is a liveness check, and
+        // sending a real transcript to prove the endpoint answers would put session
+        // content on the wire for a command the user ran to check their config.
+        system_prompt: "Reply with the single word: ok".to_string(),
+        user_prompt: "ok".to_string(),
+        model: batch.model.clone(),
+    };
+    provider
+        .complete(&req)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 pub async fn run(cfg: &Config) -> Result<Report> {
     // Connecting at all can fail before any request is made — `file://`'s backend
     // canonicalizes its root directory up front, for instance. That is exactly as
@@ -362,10 +449,24 @@ pub async fn run(cfg: &Config) -> Result<Report> {
         .collect();
 
     let llm = if cfg.summarize.mode.needs_batch() {
-        cfg.summarize.batch.as_ref().map(|b| LlmReport {
-            resolves: std::env::var(&b.api_key_env).is_ok(),
-            env_var: b.api_key_env.clone(),
-        })
+        match cfg.summarize.batch.as_ref() {
+            Some(b) => {
+                let resolves = std::env::var(&b.api_key_env).is_ok();
+                // Only worth a network round trip once the key is there; without it
+                // the failure is already known and named.
+                let reachable = if resolves {
+                    Some(probe_provider(b).await)
+                } else {
+                    None
+                };
+                Some(LlmReport {
+                    resolves,
+                    env_var: b.api_key_env.clone(),
+                    reachable,
+                })
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -622,6 +723,124 @@ mod tests {
                 "mode {mode:?} makes no read-path promise to caveat"
             );
         }
+    }
+
+    /// A report from a real, reachable `file://` store with nothing configured — the
+    /// baseline the install gate should let through. Built by actually running
+    /// `doctor` rather than hand-constructing a `Report`, so these tests cannot drift
+    /// from what the real command produces as fields are added.
+    async fn healthy_report() -> (tempfile::TempDir, Report) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(
+            format!("file://{}", dir.path().display()),
+            "myteam",
+            "cc-01",
+        );
+        let report = run(&cfg).await.unwrap();
+        assert!(
+            report.blocks_service_install().is_empty(),
+            "the baseline must be unblocked or every test below proves nothing"
+        );
+        (dir, report)
+    }
+
+    /// The install gate is the one check whose *failure* has to be loud, so each of
+    /// its three blocking reasons is asserted independently — a gate that returns
+    /// non-empty for the wrong reason still blocks, and would pass a single
+    /// "is it non-empty" test while reporting nonsense to the user.
+    #[tokio::test]
+    async fn a_healthy_host_is_not_blocked_from_installing_the_service() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(
+            format!("file://{}", store_dir.path().display()),
+            "myteam",
+            "cc-01",
+        );
+        let report = run(&cfg).await.unwrap();
+        assert!(
+            report.blocks_service_install().is_empty(),
+            "a reachable store with no model configured is ready: {:?}",
+            report.blocks_service_install()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_store_blocks_the_service_install() {
+        // A path that cannot be created, so the store is genuinely unreachable
+        // rather than merely empty.
+        let cfg = Config::new(
+            "file:///dev/null/not-a-directory".to_string(),
+            "myteam",
+            "cc-01",
+        );
+        let report = run(&cfg).await.unwrap();
+        let blockers = report.blocks_service_install();
+        assert!(
+            blockers.iter().any(|b| b.contains("unreachable")),
+            "expected an unreachable-store blocker, got: {blockers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_model_with_no_key_blocks_the_service_install() {
+        // Built directly rather than through `run`, because `run` would have to
+        // mutate the process environment to simulate an unset variable and this
+        // crate's tests run in parallel threads (see paths.rs's module doc).
+        let (_dir, mut report) = healthy_report().await;
+        report.llm = Some(LlmReport {
+            env_var: "CTXLAKE_TEST_KEY_NOT_SET".to_string(),
+            resolves: false,
+            reachable: None,
+        });
+        let blockers = report.blocks_service_install();
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(
+            blockers[0].contains("CTXLAKE_TEST_KEY_NOT_SET") && blockers[0].contains("not set"),
+            "the blocker must name the variable: {blockers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_that_resolves_but_a_provider_that_rejects_it_still_blocks() {
+        // The case `resolves: true` alone would wave through, and the reason this
+        // check exists: a revoked key, a typo'd model, or an account over quota all
+        // resolve an env var perfectly and fail hours later inside a maint log.
+        let (_dir, mut report) = healthy_report().await;
+        report.llm = Some(LlmReport {
+            env_var: "OPENROUTER_API_KEY".to_string(),
+            resolves: true,
+            reachable: Some(Err("401 Unauthorized".to_string())),
+        });
+        let blockers = report.blocks_service_install();
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("401"), "{blockers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_working_provider_does_not_block() {
+        let (_dir, mut report) = healthy_report().await;
+        report.llm = Some(LlmReport {
+            env_var: "OPENROUTER_API_KEY".to_string(),
+            resolves: true,
+            reachable: Some(Ok(())),
+        });
+        assert!(report.blocks_service_install().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_hooks_are_a_warning_not_a_blocker() {
+        // Installing the daemon before wiring a runtime is an ordinary order to do
+        // things in, and a host that only ships other machines' spools may never
+        // have a runtime at all.
+        let (_dir, mut report) = healthy_report().await;
+        report.runtimes = vec![RuntimeReport {
+            runtime: HookRuntime::ClaudeCode,
+            path: std::path::PathBuf::from("/home/alice/.claude/settings.json"),
+            exists: false,
+            wired: false,
+            foreign_entries: 0,
+        }];
+        assert!(report.blocks_service_install().is_empty());
     }
 
     #[tokio::test]

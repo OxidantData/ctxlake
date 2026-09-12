@@ -129,14 +129,19 @@ than printing an empty roster that looks like "nobody is here."
 ctxlake sync run                      # daemonize (bare `ctxlake sync` does the same)
 ctxlake sync run --foreground         # stay attached — what a service unit invokes
 ctxlake sync start | stop | restart | status
-ctxlake sync install [--no-start]     # survive reboots
+ctxlake sync install [--no-start] [--skip-checks]   # survive reboots
 ctxlake sync delete                   # remove exactly what install added
 ```
 
-Runs three loops in one process: spool → `sessions/`, store → local cache, and this
-agent's heartbeat. Without it running somewhere, sessions sit in the spool and never reach
-the lake — and because the hook only ever writes locally, nothing tells you it stopped.
-That is why `install` exists.
+Runs four loops in one process: spool → `sessions/`, store → local cache, this agent's
+heartbeat, and the **maintenance chain** every 5 minutes. Without it running somewhere,
+sessions sit in the spool and never reach the lake — and because the hook only ever writes
+locally, nothing tells you it stopped. That is why `install` exists.
+
+A maintenance cycle that fails is logged and retried next tick: a briefly unreachable
+store should cost a skipped pass, not a dead daemon that also stops shipping the spool.
+The one failure that is fatal — a `[summarize.batch]` whose key cannot be resolved — is
+caught before the daemon starts, so it exits 78 and the unit declines to restart it.
 
 `start`/`stop`/`restart`/`status` mean the same thing either way: with a service
 installed they drive systemd or launchd, without one they drive a detached child process
@@ -160,7 +165,20 @@ store credentials. A system unit or LaunchDaemon runs as root and would reach ne
 > `ctxlake sync install` checks for it and `ctxlake sync status` reports it, but only you
 > can set it.
 
-`ctxlake init --daemon` does init, install and start in one step.
+`install` runs the `ctxlake doctor` checks first and **refuses** on any of these:
+
+| Blocks the install | Why |
+|---|---|
+| The store is unreachable | The daemon would come up `active` and ship nothing |
+| A CAS or conditional-GET probe fails | No roster fan-in, no snapshot publish |
+| `[summarize.batch]` is set but its `api_key_env` is not | Every maintenance cycle would fail identically, in a log nobody reads |
+| The key resolves but the provider rejects a live call | A revoked key or typo'd model resolves fine and fails hours later |
+
+Missing runtime hooks are a warning, not a blocker — wiring a runtime after the daemon is
+an ordinary order to do things in. `--skip-checks` overrides the whole gate for an
+air-gapped host; the daemon will then start and fail at whatever you skipped.
+
+`ctxlake init --daemon` does init, install and start in one step, with the same checks.
 
 > **A missing or unusable `ctxlake.toml` exits 78** (`EX_CONFIG`), not 1 — no number of
 > restarts writes a config file, so the unit carries `RestartPreventExitStatus=78` and
@@ -172,7 +190,7 @@ store credentials. A system unit or LaunchDaemon runs as root and would reach ne
 
 ```sh
 ctxlake maint             # loop forever, one cycle every 5 minutes
-ctxlake maint --once      # one cycle and exit — what cron/systemd should call
+ctxlake maint --once      # one cycle and exit — the daemon already does this for you
 ```
 
 One chain, in order:

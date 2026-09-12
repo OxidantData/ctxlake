@@ -80,28 +80,70 @@ ctxlake install claude-code    # or one at a time
 Installs **merge**: existing hooks are preserved, a `.bak` is written first, and
 re-running changes nothing. Preview with `--dry-run`; reverse with `ctxlake uninstall`.
 
-## 6. Start the daemon
+## 6. Configure a model — or decide not to
+
+Everything so far runs with no model and no API key: capture, compaction, session
+history, friction digests, briefings. **A model buys exactly one thing** — durable
+*claims* extracted across sessions. Skip this step and the rest still works.
+
+```toml
+# ctxlake.toml
+[summarize]
+mode = "shadow"              # extract and gate, but show agents nothing yet
+
+[summarize.batch]
+provider    = "openrouter"   # anthropic · openrouter · gemini · openai-compatible · ollama
+model       = "anthropic/claude-haiku-4.5"
+api_key_env = "OPENROUTER_API_KEY"    # the NAME of a variable, never the key itself
+```
+
+`ollama` with a `base_url` keeps every transcript on the machine. Start in `shadow`:
+claims accumulate and the gates report, but nothing reaches a context window until you
+have read a couple of weeks of them and decided. See [memory.md](memory.md).
+
+## 7. Check the host before you install anything
+
+```sh
+export OPENROUTER_API_KEY=...
+ctxlake doctor
+```
+
+```text
+store   s3://my-bucket/ctxlake   (region us-west-2)
+  put-if-absent / compare-and-swap / conflict detection / conditional GET / list   ok
+
+llm     OPENROUTER_API_KEY resolves, provider answered
+```
+
+**`doctor` calls the provider for real**, with a one-word request. That matters because a
+revoked key, a typo'd model name, a base URL pointing at nothing and an account over its
+quota all resolve an environment variable perfectly well — and then fail hours later,
+inside a maintenance log, looking exactly like "extraction found nothing worth claiming."
+
+## 8. Install the daemon
 
 ```sh
 ctxlake sync install       # systemd user unit (Linux) or LaunchAgent (macOS)
 ctxlake sync status
 ```
 
-The piece that moves bytes: spool → store, store → the local cache your hooks read, and
-this agent's heartbeat. **Nothing above starts it for you.**
+One process does all of it: spool → store, store → the local cache your hooks read, this
+agent's heartbeat, **and the maintenance chain** — compaction, digests, extraction, the
+gates, the snapshot. There is no cron entry to add and no timer to schedule.
 
-`install` hands it to the machine's own supervisor so it comes back after a reboot.
-`ctxlake sync start` alone runs it until the machine restarts — and because capture keeps
-working regardless (the hook only writes locally), the first symptom of a daemon that
-never came back is a briefing that quietly stops updating.
+`install` re-runs the step 7 checks and **refuses** if the store is unreachable or a
+configured model cannot be called, because a supervised daemon that cannot do its job
+comes up `active` and achieves nothing — and capture keeps working regardless, so the
+first symptom is a briefing going stale days later with nothing in `systemctl status` to
+explain it. `--skip-checks` overrides it for an air-gapped host.
 
 > **Linux: run `sudo loginctl enable-linger $USER` too**, or systemd stops your user
 > manager at logout and the daemon does not return after a reboot. `install` and `status`
 > both tell you whether it is set.
 
-`ctxlake init --daemon` does steps 2 and 6 together.
+`ctxlake init --daemon` does steps 2 through 8 in one command, with the same checks.
 
-## 7. See the fleet
+## 9. See the fleet
 
 ```sh
 ctxlake status
@@ -116,22 +158,13 @@ fleet myteam · 2 agents active · roster 4s old
            "writing tests for oxidant-pipelines expectations"
 ```
 
-Start a session in that repo and it opens with the same information in context.
-
-## 8. Schedule maintenance
-
-`ctxlake maint --once` does every batch job there is — compaction, Tier 0 digests,
-snapshot building, and (once you configure a model) claim extraction and the promotion
-gates. **Nothing runs it for you**, and nothing needs to coordinate it: point a cron entry
-or systemd timer at it on one host or all of them. If nobody ever runs it, capture keeps
-working; the lake just stays as fresh as the last pass.
+Start a session in that repo and it opens with the same information in context. How a
+prompt becomes that context is one diagram in
+[how-it-works.md](how-it-works.md#one-prompt-end-to-end).
 
 > **Tier 1 is not wired yet.** No hook fires the turn-end nudge today, so
 > `ctxlake doctor` reporting `tier 1 nudges fired: 0` is expected, not a fault in your
 > install. Tier 0 digests and Tier 2 extraction both work.
-
-Nothing so far needs a model. Durable *memories* are the one part that does, and they stay
-invisible to agents until you deliberately turn them on — see [memory.md](memory.md).
 
 ## Next steps
 

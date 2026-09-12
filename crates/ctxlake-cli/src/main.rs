@@ -107,14 +107,20 @@ struct InitCmd {
     /// same "never clobber silently" reasoning applies to this file too).
     #[arg(long)]
     force: bool,
-    /// Also install the sync daemon as a service (systemd user unit on Linux, a
+    /// Install the sync daemon as a service (systemd user unit on Linux, a
     /// LaunchAgent on macOS) and start it, so it comes back after a reboot.
+    ///
+    /// Runs the `ctxlake doctor` checks first and refuses if the store is
+    /// unreachable or a configured model cannot be called.
     ///
     /// Without this, `ctxlake sync start` runs a daemon that dies with the machine —
     /// and because capture keeps working regardless (the hook only writes locally),
     /// nothing tells you it is gone until the briefings quietly go stale.
     #[arg(long)]
     daemon: bool,
+    /// With `--daemon`: install even if the pre-install checks fail.
+    #[arg(long)]
+    skip_checks: bool,
 }
 
 #[derive(Args)]
@@ -206,6 +212,13 @@ enum SyncAction {
         /// Install the unit without starting it.
         #[arg(long)]
         no_start: bool,
+        /// Install even if the pre-install checks fail.
+        ///
+        /// For an air-gapped host, or a store that is only reachable later. The
+        /// daemon will start and then fail at whatever the check was warning about,
+        /// so you are choosing to find out the hard way.
+        #[arg(long)]
+        skip_checks: bool,
     },
     /// Remove exactly what `install` added.
     #[command(alias = "uninstall")]
@@ -305,7 +318,7 @@ async fn run() -> Result<()> {
                 // After the config is written, so the unit's --config points at a
                 // file that exists — install refuses otherwise, since the unit would
                 // otherwise start a daemon that exits EX_CONFIG immediately.
-                service::install(&cfg, &config_path, true)?;
+                service::install(&cfg, &config_path, true, args.skip_checks).await?;
             }
             println!("\nNext: ctxlake doctor");
             Ok(())
@@ -360,7 +373,10 @@ async fn run() -> Result<()> {
                 SyncAction::Stop => service::stop(&cfg),
                 SyncAction::Restart => service::restart(&cfg, &config_path, runtime),
                 SyncAction::Status => service::status(&cfg),
-                SyncAction::Install { no_start } => service::install(&cfg, &config_path, !no_start),
+                SyncAction::Install {
+                    no_start,
+                    skip_checks,
+                } => service::install(&cfg, &config_path, !no_start, skip_checks).await,
                 SyncAction::Delete => service::uninstall(),
             }
         }

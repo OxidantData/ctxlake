@@ -10,7 +10,7 @@ is the map.
 |---|---|---|---|---|
 | `ctxlake-hook` | A binary invoked once per hook event, exits after one event | The payload on stdin; the local **cache** | The local **spool** (one NDJSON line) | **Never** |
 | `ctxlake sync` | The daemon. Long-running, one per host | The local **spool**; the object **store** | The **store** (bronze appends, `live/` CAS); the local **cache** | Yes |
-| `ctxlake maint` | A subcommand run periodically by cron or a timer | `sessions/`, `claims/events/` | `sessions/compacted/`, `claims/fleet/`, `snapshot/` | Yes |
+| `ctxlake maint` | The same chain the daemon runs every 5 min; the subcommand forces a cycle now | `sessions/`, `claims/events/` | `sessions/compacted/`, `claims/fleet/`, `snapshot/` | Yes |
 | `ctxlake-mcp` | The MCP tool server, a stdio child of the agent, one per session | The local **cache** only | The local **spool** | Never |
 
 **The hook and the MCP server never touch the network.** Everything that touches the
@@ -81,7 +81,7 @@ waits on the network.
 
 ```mermaid
 flowchart LR
-    Cron["cron / systemd timer\n(any host, any number of hosts)"] -->|invokes| Maint["ctxlake maint"]
+    Cron["ctxlake sync daemon · maintenance loop\n(any host, any number of hosts)"] -->|runs| Maint["the maintenance chain"]
     Maint -->|"1. compact"| Sessions["sessions/compacted/gen=<hash>/\nmany small files -> fewer larger files"]
     Maint -->|"2. run promotion gate"| Claims["claims/events/* -> claims/fleet/*\n(only the gate writes here)"]
     Maint -->|"3. publish"| Snapshot["snapshot/\ncontent-addressed blob + CAS pointer swap"]
@@ -165,7 +165,7 @@ duckdb -c "SELECT runtime, event_type, count(*) FROM 's3://bucket/ctxlake/sessio
 | Local spool keeps growing | `ctxlake status` for the daemon, `ctxlake doctor` for connectivity | A line is removed only after its write is confirmed. A crashed daemon, a partition, and a store outage all present this way |
 | Hook adds noticeable latency | Time `ctxlake-hook` against a captured payload; check for an unusually large tool output | Budget is 5ms p99. Almost always a huge payload meeting `MAX_SCAN_BYTES`, a full disk, or — as a real bug — network I/O in the hook path |
 | `412 Precondition Failed` storms | Whether failures concentrate on one key or spread across many | A 412 is CAS working. Concentrated means a genuinely hot object; spread means clock skew or a retry loop missing its backoff |
-| Claims never promote | Is `ctxlake maint` scheduled? Compare `claims/events/` against `claims/fleet/` | Only the gate writes `claims/fleet/`. A missing cron entry and an unmet promotion rule look identical from outside |
+| Claims never promote | `ctxlake sync status`, then compare `claims/events/` against `claims/fleet/` | Only the gate writes `claims/fleet/`. A daemon that is not running and an unmet promotion rule look identical from outside |
 | `doctor` reports a backend failing CAS | Which primitive failed, against which backend | Backends genuinely differ ([storage.md](storage.md)). MinIO rejecting `If-None-Match: *` is permanent vendor behaviour, not a transient fault |
 | `quarantine/` growing fast | Which `rules_fired` values dominate | A flood of one rule (commonly `high_entropy_run`) usually means a false-positive source — a build emitting long hashes — not a leak |
 

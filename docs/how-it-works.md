@@ -65,8 +65,8 @@ Three things move data, and only one of them is automatic.
 | Stage | Moved by | Automatic? |
 |---|---|---|
 | Agent event → local spool | **hook** | **Yes** — `ctxlake install` wires it |
-| spool ⇄ object storage | **`ctxlake sync`** daemon | No — `ctxlake sync install` |
-| storage → digests, memories | **`ctxlake maint`** | No — cron or a timer |
+| spool ⇄ object storage | **`ctxlake sync`** daemon | No — `ctxlake sync install` wires it |
+| storage → digests, memories | the same daemon, every 5 min | **Yes** — once the daemon runs |
 
 **The hook never touches the network**, in either direction. It appends one line and
 exits; its dependency tree contains no HTTP client and no object store, and CI fails if
@@ -127,6 +127,85 @@ Secrets are scrubbed in the hook process, before the line reaches the spool — 
 and not in the daemon. Object storage is append-only here, so a leaked key would be
 permanent. The same scrubber runs on imported history, which is the likeliest place an
 old `cat .env` is already sitting.
+
+## One prompt, end to end
+
+<svg viewBox="0 0 720 322" role="img" aria-label="A prompt becomes memory in three bands. Capture: you type a prompt, the hook redacts it and appends it to the local spool in under five milliseconds without touching the network, and the sync daemon ships it to immutable session storage. Maintenance, which flows right to left: compaction, then a Tier 0 structural digest, then Tier 2 claim extraction, then the four promotion gates. Only extraction needs a model, and the whole band is idempotent by content so any number of hosts may run it at once. Serving: the folded snapshot is pulled into the local cache as a briefing, and the hook injects it at the next session start." style="width:100%;height:auto">
+  <defs>
+    <marker id="pa" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="var(--oxidant-text-muted)"/>
+    </marker>
+    <style>
+      .pb { fill: var(--oxidant-surface); stroke: var(--oxidant-border-strong); stroke-width: 1; rx: 6 }
+      .pt { fill: var(--oxidant-text); font: 500 13px var(--oxidant-font-ui) }
+      .ps { fill: var(--oxidant-text-muted); font: 400 11px var(--oxidant-font-ui) }
+      .pm { fill: var(--oxidant-text-muted); font: 400 10.5px var(--oxidant-font-mono, monospace) }
+      .pl { stroke: var(--oxidant-text-muted); stroke-width: 1.25; fill: none; marker-end: url(#pa) }
+    </style>
+  </defs>
+
+  <rect class="pb" x="8" y="40" width="170" height="46"/>
+  <text x="22" y="61" class="pt">your prompt</text>
+  <text x="22" y="77" class="ps">or a tool call</text>
+
+  <path class="pl" d="M178 63 H271"/>
+  <text x="184" y="56" class="ps">hook · ≤5ms</text>
+
+  <rect class="pb" x="275" y="40" width="170" height="46"/>
+  <text x="289" y="61" class="pt">local spool</text>
+  <text x="289" y="77" class="pm">redacted already</text>
+
+  <path class="pl" d="M445 63 H538"/>
+  <text x="451" y="56" class="ps">daemon</text>
+
+  <rect class="pb" x="552" y="40" width="150" height="46"/>
+  <text x="566" y="61" class="pt">sessions/</text>
+  <text x="566" y="77" class="pm">immutable</text>
+
+  <path class="pl" d="M627 86 V136"/>
+
+  <text x="8" y="128" class="ps">MAINTENANCE — idempotent by content: any host, any number of them, at once</text>
+
+  <rect class="pb" x="552" y="140" width="150" height="46"/>
+  <text x="566" y="161" class="pt">compact</text>
+  <text x="566" y="177" class="pm">gen=&lt;hash&gt;/</text>
+
+  <path class="pl" d="M552 163 H526"/>
+
+  <rect class="pb" x="372" y="140" width="150" height="46"/>
+  <text x="386" y="161" class="pt">Tier 0 digest</text>
+  <text x="386" y="177" class="pm">digest.json</text>
+
+  <path class="pl" d="M372 163 H344"/>
+
+  <rect class="pb" x="190" y="140" width="150" height="46"/>
+  <text x="204" y="161" class="pt">Tier 2 extract</text>
+  <text x="204" y="177" class="pm">proposed</text>
+
+  <path class="pl" d="M190 163 H162"/>
+
+  <rect class="pb" x="8" y="140" width="150" height="46"/>
+  <text x="22" y="161" class="pt">four gates</text>
+  <text x="22" y="177" class="pm">promoted | contested</text>
+
+  <text x="190" y="208" class="ps">the only step that needs a model</text>
+
+  <path class="pl" d="M83 186 V262"/>
+
+  <rect class="pb" x="8" y="266" width="150" height="46"/>
+  <text x="22" y="287" class="pt">snapshot/</text>
+  <text x="22" y="303" class="pm">&lt;hash&gt;.sqlite</text>
+
+  <path class="pl" d="M158 289 H188"/>
+
+  <rect class="pb" x="202" y="266" width="180" height="46"/>
+  <text x="216" y="287" class="pt">local cache</text>
+  <text x="216" y="303" class="pm">briefing.json</text>
+
+  <path class="pl" d="M382 289 H422"/>
+  <text x="436" y="283" class="ps">the hook injects it at</text>
+  <text x="436" y="299" class="ps">the next session start</text>
+</svg>
 
 ## Next steps
 

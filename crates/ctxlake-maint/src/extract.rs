@@ -1086,13 +1086,32 @@ pub async fn is_already_extracted(
 /// job, not this listing's — keeping "what exists" and "what's claimed" as
 /// separate questions avoids a stale listing racing a marker that landed a
 /// moment ago.
-pub async fn list_sealed_sessions(store: &dyn ObjectStore) -> Result<Vec<SessionRef>, StoreError> {
+/// Scoped to `fleet_id`, like every other discovery function in this crate.
+///
+/// This used to list all of `sessions/` with no filter, while
+/// `digest::discover_sealed_sessions` and `compact::discover_dates` were both
+/// fleet-scoped. In a store holding one fleet that is invisible; in a store holding
+/// two, it meant one team's transcripts were read into another team's extraction
+/// prompts and became evidence for another team's claims. `fleet_id` is documented
+/// as "the boundary of who sees whom", so crossing it here contradicted the one
+/// guarantee the setting makes.
+pub async fn list_sealed_sessions(
+    store: &dyn ObjectStore,
+    fleet_id: &str,
+) -> Result<Vec<SessionRef>, StoreError> {
     use futures::StreamExt;
     let prefix = object_store::path::Path::from("sessions");
     let mut out = Vec::new();
     let mut stream = store.list(Some(&prefix));
     while let Some(meta) = stream.next().await {
         let Ok(meta) = meta else { continue };
+        // The fleet comes from the partition path, not from the envelopes inside:
+        // a session directory that decodes to zero readable envelopes still belongs
+        // to exactly one fleet, and must not fall through to "everyone's".
+        match crate::partition::parse_session_partition(&meta.location) {
+            Some(p) if p.fleet_id == fleet_id => {}
+            _ => continue,
+        }
         let loc = meta.location.to_string();
         let Some(dir) = loc.strip_suffix("/_SEALED") else {
             continue;
@@ -1248,6 +1267,7 @@ pub struct ExtractRunSummary {
 /// false — no listing, no HTTP client, nothing.
 pub async fn run(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     cfg: &SummarizeConfig,
     provider: &dyn Provider,
 ) -> Result<ExtractRunSummary, ExtractError> {
@@ -1259,7 +1279,7 @@ pub async fn run(
         .as_ref()
         .map(|b| b.max_sessions_per_run)
         .unwrap_or(0);
-    let sealed = list_sealed_sessions(store).await?;
+    let sealed = list_sealed_sessions(store, fleet_id).await?;
     let mut summary = ExtractRunSummary::default();
     // `list_sealed_sessions` returns every sealed session, oldest first, with no
     // notion of "already extracted" baked in (`mark_extracted_if_new`'s job, not
@@ -2185,7 +2205,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = run(&store, &shadow_cfg(), &TriggerSensitiveProvider)
+        let summary = run(&store, "oxidant", &shadow_cfg(), &TriggerSensitiveProvider)
             .await
             .unwrap();
         assert_eq!(summary.sessions_processed, 1);
@@ -2222,6 +2242,69 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn sealed_session_listing_never_crosses_a_fleet_boundary() {
+        // `fleet_id` is documented as "the boundary of who sees whom". This listing
+        // used to ignore it while `digest::discover_sealed_sessions` and
+        // `compact::discover_dates` both honoured it — invisible in a store holding
+        // one fleet, and in a store holding two it meant one team's transcripts were
+        // read into another team's extraction prompts and became evidence for another
+        // team's claims.
+        let store = object_store::memory::InMemory::new();
+        seal_one_session_for(&store, "2026-09-11", "ours", "alpha").await;
+        seal_one_session_for(&store, "2026-09-11", "theirs", "beta").await;
+
+        let ours = list_sealed_sessions(&store, "alpha").await.unwrap();
+        let ids: Vec<_> = ours.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["ours"],
+            "a second fleet's sessions must not be listed"
+        );
+
+        let theirs = list_sealed_sessions(&store, "beta").await.unwrap();
+        assert_eq!(theirs.len(), 1, "the other fleet still sees its own");
+
+        // And a fleet with nothing in the store sees nothing, rather than everything.
+        assert!(list_sealed_sessions(&store, "gamma")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// [`seal_one_session`], with the fleet spelled out — the cross-fleet test needs
+    /// two fleets in one store, which the fixed-fleet helper cannot express.
+    async fn seal_one_session_for(
+        store: &dyn ObjectStore,
+        dt: &str,
+        session_id: &str,
+        fleet_id: &str,
+    ) {
+        let content = format!("{TRIGGER_PHRASE} session-marker:{session_id}");
+        let envelope = env_with(session_id, "m1", &content, 0);
+        let bytes = ctxlake_sync::codec::encode(&[envelope]).unwrap();
+        let seg_path = ctxlake_store::layout::session_segment(
+            dt,
+            fleet_id,
+            Runtime::ClaudeCode,
+            "cc-01",
+            session_id,
+            0,
+        );
+        store
+            .put(&seg_path, object_store::PutPayload::from(bytes))
+            .await
+            .unwrap();
+        let sealed = object_store::path::Path::from(format!(
+            "{}/_SEALED",
+            seg_path.as_ref().rsplit_once('/').unwrap().0
+        ));
+        store
+            .put(&sealed, object_store::PutPayload::from_static(b"{}"))
+            .await
+            .unwrap();
     }
 
     /// Seal one session (write its one segment plus its `_SEALED` marker) under
@@ -2275,7 +2358,9 @@ mod tests {
                 ..BatchConfig::default()
             }),
         };
-        let summary = run(&store, &cfg, &SessionMarkerProvider).await.unwrap();
+        let summary = run(&store, "oxidant", &cfg, &SessionMarkerProvider)
+            .await
+            .unwrap();
 
         assert_eq!(
             summary.sessions_processed, 1,

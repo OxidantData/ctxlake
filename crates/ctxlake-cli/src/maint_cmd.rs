@@ -46,7 +46,7 @@ fn agent_reads_enabled(mode: SummarizeMode) -> bool {
 
 pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     loop {
-        run_one_cycle(cfg).await?;
+        println!("{}", run_one_cycle(cfg).await?);
         if once {
             return Ok(());
         }
@@ -54,7 +54,13 @@ pub async fn run(cfg: &Config, once: bool) -> Result<()> {
     }
 }
 
-async fn run_one_cycle(cfg: &Config) -> Result<()> {
+/// Run the chain once and return the one-line summary, rather than printing it.
+///
+/// Returned rather than printed because there are two callers with different output
+/// channels: `ctxlake maint` writes to stdout for a human, and the sync daemon's
+/// maintenance loop (`sync_cmd.rs`) writes to its log file. Printing here would put
+/// the daemon's cycle reports on a stdout nobody reads.
+pub(crate) async fn run_one_cycle(cfg: &Config) -> Result<String> {
     let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
     let store = store_ctx::prefixed_store(&ctx);
 
@@ -99,7 +105,7 @@ async fn run_one_cycle(cfg: &Config) -> Result<()> {
     .await
     .context("running the maintenance chain")?;
 
-    println!(
+    Ok(format!(
         "compacted {} date(s) · {} digest(s) written, {} already done · snapshot {} · {} · {}",
         report.dates_compacted.len(),
         report.digests_written,
@@ -107,7 +113,28 @@ async fn run_one_cycle(cfg: &Config) -> Result<()> {
         describe_snapshot(&report.snapshot),
         describe_extraction(&report.extraction),
         describe_gate(&report.gate),
-    );
+    ))
+}
+
+/// Build the Tier 2 provider and throw it away, purely to find out whether it *can*
+/// be built.
+///
+/// The sync daemon calls this once before it starts, so a `[summarize.batch]` naming
+/// an env var nobody exported fails at startup — loudly, with `EX_CONFIG`, which the
+/// service unit declines to restart — instead of failing identically on every
+/// maintenance tick forever inside a log file nobody is reading. `ctxlake sync
+/// install` runs the same check ahead of writing a unit at all.
+pub(crate) fn validate_tier2(cfg: &Config) -> Result<()> {
+    let extract_cfg: ctxlake_maint::extract::SummarizeConfig = (&cfg.summarize).into();
+    if !ctxlake_maint::extract::tier2_enabled(&extract_cfg) {
+        return Ok(());
+    }
+    let batch_cfg = extract_cfg
+        .batch
+        .as_ref()
+        .expect("tier2_enabled just confirmed cfg.batch.is_some()");
+    ctxlake_maint::extract::build_provider(batch_cfg)
+        .context("resolving the Tier 2 provider from [summarize.batch]")?;
     Ok(())
 }
 

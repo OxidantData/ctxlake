@@ -419,7 +419,20 @@ def check_tier2_wiring_matches_the_docs() -> None:
 
     # Only the production half; the test module names these freely.
     src = MAINT_RUN.read_text(encoding="utf-8").split("#[cfg(test)]", 1)[0]
-    wired = "gate::run(" in src and "extract::run(" in src
+
+    # Deliberately NOT a match on `extract::run(` / `gate::run(` exactly. An earlier
+    # version of this check did that, and it rejected a better implementation: one
+    # that loaded each sealed session's transcript once and shared it between
+    # extraction and the gate inputs, instead of letting `extract::run` load them a
+    # second time. A doc-sync guard has no business dictating call structure, so it
+    # now keys off the observable contract instead — the report cannot carry a gate
+    # summary without the gate having run.
+    wired = (
+        "gate::" in src
+        and "extract::" in src
+        and "pub gate:" in src
+        and "pub extraction:" in src
+    )
 
     memory_md = read("memory.md")
     documented_as_gap = TIER2_GAP_MARKER in memory_md

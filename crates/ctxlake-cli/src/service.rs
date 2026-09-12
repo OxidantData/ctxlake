@@ -248,7 +248,39 @@ fn write_unit(path: &Path, contents: &str) -> Result<bool> {
 /// Idempotent: re-running against an unchanged host rewrites nothing and re-loads the
 /// same unit, which is what makes it safe to call from `ctxlake init --daemon` and
 /// again by hand.
-pub fn install(cfg: &Config, config_path: &Path, start: bool) -> Result<()> {
+pub async fn install(
+    cfg: &Config,
+    config_path: &Path,
+    start: bool,
+    skip_checks: bool,
+) -> Result<()> {
+    // Before writing a unit: prove this host can actually do the job. A supervised
+    // daemon that cannot reach the store, or that is pointed at a model it cannot
+    // call, comes up `active` and achieves nothing — and capture keeps working
+    // regardless, because the hook only writes locally, so the first symptom is a
+    // briefing going stale days later with nothing in `systemctl status` to explain
+    // it. Refusing now is the whole point.
+    if skip_checks {
+        println!("skipping pre-install checks (--skip-checks)");
+    } else {
+        let report = crate::doctor::run(cfg)
+            .await
+            .context("running pre-install checks")?;
+        let blockers = report.blocks_service_install();
+        if !blockers.is_empty() {
+            let mut msg = String::from("this host is not ready to run the sync daemon:\n");
+            for b in &blockers {
+                msg.push_str(&format!("  - {b}\n"));
+            }
+            msg.push_str(
+                "\nRun `ctxlake doctor` for the full report. Fix these and re-run, or \
+                 pass --skip-checks\nto install anyway (the daemon will start and fail \
+                 at whatever you skipped).",
+            );
+            anyhow::bail!(msg);
+        }
+    }
+
     let manager = Manager::detect()?;
     let home = home_dir();
     let exec = exec_path()?;

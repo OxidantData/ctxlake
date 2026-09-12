@@ -146,14 +146,14 @@ pub async fn run(
     }
 
     let extraction = match &tier2 {
-        Some(t) => Some(extract::run(store, t.cfg, t.provider).await?),
+        Some(t) => Some(extract::run(store, fleet_id, t.cfg, t.provider).await?),
         None => None,
     };
 
     // Every sealed session's transcript, for the gate's context inputs — see
     // the module doc for why this is a separate pass from whatever extraction
     // just did, rather than a list `extract::run` hands back.
-    let session_refs = extract::list_sealed_sessions(store).await?;
+    let session_refs = extract::list_sealed_sessions(store, fleet_id).await?;
     let mut transcripts = Vec::with_capacity(session_refs.len());
     for session_ref in &session_refs {
         transcripts.push(extract::load_transcript(store, session_ref).await?);

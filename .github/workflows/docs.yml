@@ -59,6 +59,11 @@ jobs:
           role-to-assume: ${{ vars.AWS_DOCS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-1
       - run: aws s3 sync dist "s3://${{ vars.DOCS_S3_BUCKET }}" --delete
-      - run: |
+
+      # Conditional because the bucket can be publishing correctly before a
+      # distribution is pointed at it. An unset id would otherwise fail the deploy
+      # on an `--distribution-id ""` call and hide a successful sync.
+      - if: vars.DOCS_CLOUDFRONT_ID != ''
+        run: |
           aws cloudfront create-invalidation \
-            --distribution-id "${{ vars.DOCS_CLOUDFRONT_ID }}" --paths "/*"
+            --distribution-id "${{ vars.DOCS_CLOUDFRONT_ID }}" --paths "/docs/*"

@@ -1,0 +1,19 @@
+{
+  "event": "preToolUse",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "tool_name": "Shell",
+    "tool_input": {"command": "cargo build"},
+    "tool_use_id": "tu-200",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "agent_message": "building the project"
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "message_id": "tu-200",
+    "tool": {
+      "name": "Shell",
+      "input": "{\"command\":\"cargo build\"}"
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "event": "SessionStart",
+  "payload": {
+    "session_id": "cc-sess-001",
+    "transcript_path": "/Users/dev/.claude/projects/ctxlake/cc-sess-001.jsonl",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "permission_mode": "default",
+    "hook_event_name": "SessionStart"
+  },
+  "expect": {
+    "event_type": "session_start",
+    "session_id": "cc-sess-001",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "runtime": "claude_code",
+    "redaction": {"status": "clean"}
+  }
+}

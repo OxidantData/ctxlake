@@ -1,0 +1,14 @@
+{
+  "event": "Stop",
+  "payload": {
+    "session_id": "cc-sess-001",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "hook_event_name": "Stop",
+    "transcript_path": "/Users/dev/.claude/projects/ctxlake/cc-sess-001.jsonl"
+  },
+  "expect": {
+    "event_type": "assistant",
+    "role": "assistant",
+    "session_id": "cc-sess-001"
+  }
+}

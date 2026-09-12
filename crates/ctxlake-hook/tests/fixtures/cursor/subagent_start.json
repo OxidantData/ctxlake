@@ -1,0 +1,21 @@
+{
+  "event": "subagentStart",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "subagent_id": "sub-1",
+    "subagent_type": "explore",
+    "task": "find every caller of Redactor::scrub",
+    "parent_conversation_id": "cur-sess-001",
+    "tool_call_id": "tu-300",
+    "subagent_model": "auto",
+    "is_parallel_worker": true
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "message_id": "tu-300",
+    "tool": {
+      "name": "subagent:explore",
+      "input": "find every caller of Redactor::scrub"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "event": "SessionEnd",
+  "payload": {
+    "session_id": "cc-sess-001",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "hook_event_name": "SessionEnd"
+  },
+  "expect": {
+    "event_type": "session_end",
+    "session_id": "cc-sess-001"
+  }
+}

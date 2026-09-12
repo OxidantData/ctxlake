@@ -1,0 +1,15 @@
+{
+  "event": "UserPromptSubmit",
+  "payload": {
+    "session_id": "cc-sess-001",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "hook_event_name": "UserPromptSubmit",
+    "user_input": "add a test for the spool rotation"
+  },
+  "expect": {
+    "event_type": "prompt",
+    "role": "user",
+    "content": "add a test for the spool rotation",
+    "session_id": "cc-sess-001"
+  }
+}

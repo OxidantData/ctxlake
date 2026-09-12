@@ -1,0 +1,21 @@
+{
+  "event": "postToolUseFailure",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "tool_name": "Shell",
+    "tool_input": {"command": "cargo build --bogus"},
+    "tool_use_id": "tu-201",
+    "cwd": "/Users/dev/projects/ctxlake",
+    "error_message": "error: unexpected argument '--bogus'",
+    "failure_type": "error",
+    "duration": 40
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "Shell",
+      "result": "error: unexpected argument '--bogus'",
+      "duration_ms": 40
+    }
+  }
+}

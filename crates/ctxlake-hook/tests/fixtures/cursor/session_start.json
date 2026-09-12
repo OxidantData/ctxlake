@@ -1,0 +1,16 @@
+{
+  "event": "sessionStart",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "is_background_agent": false,
+    "composer_mode": "agent",
+    "hook_event_name": "sessionStart",
+    "cursor_version": "1.4.0",
+    "workspace_roots": ["/Users/dev/projects/ctxlake"]
+  },
+  "expect": {
+    "event_type": "session_start",
+    "session_id": "cur-sess-001",
+    "runtime": "cursor"
+  }
+}

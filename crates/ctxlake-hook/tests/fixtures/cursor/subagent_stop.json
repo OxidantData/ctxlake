@@ -1,0 +1,24 @@
+{
+  "event": "subagentStop",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "subagent_type": "explore",
+    "status": "completed",
+    "task": "find every caller of Redactor::scrub",
+    "description": "codebase search",
+    "summary": "3 call sites, all in ctxlake-hook adapters",
+    "duration_ms": 4200,
+    "message_count": 5,
+    "tool_call_count": 2,
+    "loop_count": 1,
+    "modified_files": []
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "subagent:explore",
+      "result": "3 call sites, all in ctxlake-hook adapters",
+      "duration_ms": 4200
+    }
+  }
+}

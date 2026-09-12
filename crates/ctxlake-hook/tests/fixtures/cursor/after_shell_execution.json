@@ -1,0 +1,19 @@
+{
+  "event": "afterShellExecution",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "command": "cat .env",
+    "output": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+    "duration": 12,
+    "sandbox": false
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "shell",
+      "input": "cat .env",
+      "duration_ms": 12
+    },
+    "redaction": {"status": "quarantined", "rules_fired": ["aws_access_key_id"]}
+  }
+}

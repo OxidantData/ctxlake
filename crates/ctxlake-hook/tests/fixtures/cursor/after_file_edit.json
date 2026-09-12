@@ -1,0 +1,15 @@
+{
+  "event": "afterFileEdit",
+  "payload": {
+    "session_id": "cur-sess-001",
+    "file_path": "/Users/dev/projects/ctxlake/README.md",
+    "edits": [{"old_string": "pre-alpha", "new_string": "alpha"}]
+  },
+  "expect": {
+    "event_type": "tool_call",
+    "tool": {
+      "name": "edit",
+      "paths": ["/Users/dev/projects/ctxlake/README.md"]
+    }
+  }
+}

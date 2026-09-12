@@ -19,6 +19,12 @@ bytes.workspace = true
 futures.workspace = true
 url.workspace = true
 time.workspace = true
+# object_store's `ObjectStore` trait is defined with #[async_trait]; any impl of it
+# (local_cas's CasLocalFileSystem, which adds the real PutMode::Update object_store
+# 0.14's own LocalFileSystem lacks — see that module's doc) needs the same macro.
+# Already in the tree transitively via object_store itself, so this adds no new
+# dependency, only a direct name for one that's already compiled.
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

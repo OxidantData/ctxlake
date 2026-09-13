@@ -230,8 +230,21 @@ pub fn claim_event(date: &str, agent: &str, ulid: &str) -> Path {
 
 /// Claims already extracted out of a given session, so re-running extraction is
 /// idempotent instead of re-proposing the same claim twice.
-pub fn claims_extracted(session_id: &str) -> Path {
-    Path::from("claims").join("extracted").join(session_id)
+pub fn claims_extracted(fleet_id: &str, session_id: &str) -> Path {
+    Path::from("claims")
+        .join("extracted")
+        .join(fleet_id)
+        .join(session_id)
+}
+
+/// The pre-fleet-scoping marker prefix, for `ctxlake maint --prune` to clean up.
+///
+/// Scoped for the same reason the roster and the snapshot pointer were: two fleets
+/// sharing a bucket shared these, so one fleet extracting a session id marked it done
+/// for the other. Session ids are runtime-generated UUIDs, so a collision is unlikely
+/// rather than impossible — but "unlikely" is not the guarantee `--fleet` advertises.
+pub fn legacy_claims_extracted_prefix() -> Path {
+    Path::from("claims").join("extracted")
 }
 
 /// The `claims/fleet/` prefix — promoted (and later contested/retired) claims,
@@ -352,8 +365,8 @@ mod tests {
             "claims/events/dt=2026-09-11/agent=cc-01/01J000000000000000000000.json"
         );
         assert_eq!(
-            claims_extracted("sess-1").as_ref(),
-            "claims/extracted/sess-1"
+            claims_extracted("myteam", "sess-1").as_ref(),
+            "claims/extracted/myteam/sess-1"
         );
         assert_eq!(claims_fleet_prefix().as_ref(), "claims/fleet");
         assert_eq!(
@@ -458,14 +471,14 @@ mod tests {
         );
 
         let evil_session = "a/b/../c";
-        let cp = claims_extracted(evil_session);
+        let cp = claims_extracted("myteam", evil_session);
         assert!(
-            cp.as_ref().starts_with("claims/extracted/"),
+            cp.as_ref().starts_with("claims/extracted/myteam/"),
             "escaped its directory: {cp}"
         );
         assert_eq!(
             cp.as_ref().matches('/').count(),
-            2,
+            3,
             "an extra path separator survived encoding: {cp}"
         );
     }

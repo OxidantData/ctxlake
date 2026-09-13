@@ -222,6 +222,17 @@ fn describe_snapshot(o: &ctxlake_maint::snapshot::SnapshotOutcome) -> String {
 /// is a configuration, not a failure.
 fn describe_extraction(o: &Option<ctxlake_maint::extract::ExtractRunSummary>) -> String {
     match o {
+        // `kept/returned` rather than one number: they diverge exactly when the model
+        // answered and `claim_from_raw` discarded it — an unparseable claim_type, or a
+        // citation resolving to no captured message. One number made a prompt problem
+        // and a parser bug indistinguishable.
+        Some(e) if e.claims_returned != e.claims_proposed => format!(
+            "tier 2: {} session(s) extracted, {} of {} claim(s) kept ({} DROPPED)",
+            e.sessions_processed,
+            e.claims_proposed,
+            e.claims_returned,
+            e.claims_returned.saturating_sub(e.claims_proposed),
+        ),
         Some(e) => format!(
             "tier 2: {} session(s) extracted, {} claim(s) proposed",
             e.sessions_processed, e.claims_proposed
@@ -311,6 +322,7 @@ mod tests {
     fn describe_extraction_distinguishes_disabled_from_a_real_run() {
         assert_eq!(describe_extraction(&None), "tier 2: disabled");
         let summary = ctxlake_maint::extract::ExtractRunSummary {
+            claims_returned: 0,
             sessions_processed: 3,
             claims_proposed: 5,
         };

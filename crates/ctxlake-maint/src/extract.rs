@@ -1289,8 +1289,8 @@ pub struct SessionTranscript {
 /// returning a more useful error to the caller, and a failure to clean up costs one
 /// session's claims, not correctness. The next run simply finds the marker and skips —
 /// the same outcome as before this existed.
-async fn release_extraction_marker(store: &dyn ObjectStore, session_id: &str) {
-    let key = ctxlake_store::layout::claims_extracted(session_id);
+async fn release_extraction_marker(store: &dyn ObjectStore, fleet_id: &str, session_id: &str) {
+    let key = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
     if let Err(e) = store.delete(&key).await {
         tracing::warn!(
             session_id,
@@ -1302,21 +1302,66 @@ async fn release_extraction_marker(store: &dyn ObjectStore, session_id: &str) {
 
 pub async fn mark_extracted_if_new(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     session_id: &str,
 ) -> Result<bool, StoreError> {
-    let path = ctxlake_store::layout::claims_extracted(session_id);
+    let path = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
+    // Create-if-absent is still what makes two hosts extract a session exactly once.
+    // The body is what makes a *later build* able to revisit it — see
+    // `is_already_extracted`.
+    let body = serde_json::json!({ "extractor_version": EXTRACTOR_VERSION });
+    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     match store
         .put_opts(
             &path,
-            PutPayload::from_static(b"{}"),
+            PutPayload::from(bytes.clone()),
             PutMode::Create.into(),
         )
         .await
     {
         Ok(_) => Ok(true),
-        Err(OsError::AlreadyExists { .. }) => Ok(false),
+        Err(OsError::AlreadyExists { .. }) => {
+            // Present, but possibly from an older extractor. `is_already_extracted`
+            // has already decided whether this session is due for a re-run; if it let
+            // us get here, the marker is stale and claiming it means overwriting.
+            //
+            // A plain overwrite rather than CAS: two hosts racing to re-extract the
+            // same stale session both do the work and both append proposals, which
+            // `find_existing_claim_id` already folds onto the same `claim_id`. The
+            // cost is a duplicated model call, not a corrupted lake.
+            if stored_extractor_version(store, fleet_id, session_id).await < EXTRACTOR_VERSION {
+                store.put(&path, PutPayload::from(bytes)).await?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Which extractor produced the claims for this session, or 0 when unknown.
+///
+/// 0 covers both "no marker" and "a marker from before markers carried a version",
+/// which are the same thing for this purpose: older than anything current.
+async fn stored_extractor_version(
+    store: &dyn ObjectStore,
+    fleet_id: &str,
+    session_id: &str,
+) -> u32 {
+    let path = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
+    let Ok(res) = store.get(&path).await else {
+        return 0;
+    };
+    let Ok(bytes) = res.bytes().await else {
+        return 0;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("extractor_version")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0) as u32
 }
 
 /// Read-only: has `session_id` already been extracted? A cheap existence check
@@ -1330,15 +1375,45 @@ pub async fn mark_extracted_if_new(
 /// correctness.
 pub async fn is_already_extracted(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     session_id: &str,
 ) -> Result<bool, StoreError> {
-    let path = ctxlake_store::layout::claims_extracted(session_id);
+    let path = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
     match store.get(&path).await {
-        Ok(_) => Ok(true),
+        Ok(res) => {
+            // **Done by *which* extractor**, not merely done.
+            //
+            // Existence alone meant a session was finished forever. A successful
+            // `{"claims": []}` writes the marker just as a productive run does, so 37
+            // sessions on a live lake were permanently marked done having produced
+            // nothing — and no improvement to the prompt, the transcript, or the
+            // provider could ever have been measured against them. Short of deleting
+            // keys by hand, the only evidence the extractor had was sessions that
+            // happened not to exist yet.
+            let version = res
+                .bytes()
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| {
+                    v.get("extractor_version")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or(0) as u32;
+            Ok(version >= EXTRACTOR_VERSION)
+        }
         Err(OsError::NotFound { .. }) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
+
+/// Bumped whenever a change should make already-extracted sessions worth revisiting:
+/// a different prompt, a different transcript shape, a fixed parser.
+///
+/// Not bumped for a provider swap or a model change — those are configuration, and
+/// re-extracting an entire lake because someone edited `ctxlake.toml` would be a
+/// surprising and expensive thing for a config edit to do.
+pub const EXTRACTOR_VERSION: u32 = 1;
 
 /// Find every sealed session under `sessions/` by locating `_SEALED` markers.
 /// Whether a given one has already been extracted is [`mark_extracted_if_new`]'s
@@ -1440,6 +1515,15 @@ Every claim MUST cite at least one (session_id, message_id) pair that appears in
 pub struct ExtractOutcome {
     pub session_id: String,
     pub claims_proposed: usize,
+    /// How many claims the model returned, before any were dropped.
+    ///
+    /// Reported separately from `claims_proposed` because the two failures look
+    /// identical without it. "The model found nothing worth claiming" and "the model
+    /// answered and we discarded every word of it" both printed as `0 claim(s)
+    /// proposed`, and they call for opposite fixes — a better prompt versus a bug in
+    /// `claim_from_raw`. A claim is dropped silently for an unparseable `claim_type`,
+    /// or for citing a message id that does not resolve, and neither leaves a trace.
+    pub claims_returned: usize,
     pub skipped_already_extracted: bool,
 }
 
@@ -1454,6 +1538,7 @@ pub async fn extract_session(
     provider: &dyn Provider,
     session: &SessionTranscript,
     date: &str,
+    fleet_id: &str,
 ) -> Result<ExtractOutcome, ExtractError> {
     if !tier2_enabled(cfg) {
         return Ok(ExtractOutcome {
@@ -1461,7 +1546,7 @@ pub async fn extract_session(
             ..Default::default()
         });
     }
-    if !mark_extracted_if_new(store, &session.session_id).await? {
+    if !mark_extracted_if_new(store, fleet_id, &session.session_id).await? {
         return Ok(ExtractOutcome {
             session_id: session.session_id.clone(),
             skipped_already_extracted: true,
@@ -1492,14 +1577,14 @@ pub async fn extract_session(
     let raw_response = match provider.complete(&request).await {
         Ok(r) => r,
         Err(e) => {
-            release_extraction_marker(store, &session.session_id).await;
+            release_extraction_marker(store, fleet_id, &session.session_id).await;
             return Err(e);
         }
     };
     let raw_claims = match parse_claims_response(&raw_response) {
         Ok(c) => c,
         Err(e) => {
-            release_extraction_marker(store, &session.session_id).await;
+            release_extraction_marker(store, fleet_id, &session.session_id).await;
             return Err(e);
         }
     };
@@ -1522,6 +1607,7 @@ pub async fn extract_session(
     let existing = crate::claims::fold(existing_events.iter());
 
     let mut proposed = 0usize;
+    let returned = raw_claims.len();
     for raw in raw_claims {
         if let Some(claim) =
             claim_from_raw(raw, &session.agent_id, &observed_at, &resolvable, &existing)
@@ -1530,9 +1616,19 @@ pub async fn extract_session(
             proposed += 1;
         }
     }
+    if returned > proposed {
+        tracing::warn!(
+            session_id = %session.session_id,
+            returned,
+            kept = proposed,
+            "extraction dropped claims: an unparseable claim_type, or a citation that \
+             resolves to no captured message"
+        );
+    }
     Ok(ExtractOutcome {
         session_id: session.session_id.clone(),
         claims_proposed: proposed,
+        claims_returned: returned,
         skipped_already_extracted: false,
     })
 }
@@ -1541,6 +1637,10 @@ pub async fn extract_session(
 pub struct ExtractRunSummary {
     pub sessions_processed: usize,
     pub claims_proposed: usize,
+    /// Claims the model returned across all sessions, before any were dropped. See
+    /// [`ExtractOutcome::claims_returned`] — without it, a prompt that produces nothing
+    /// and a parser that discards everything report the same number.
+    pub claims_returned: usize,
 }
 
 /// The full Tier 2 pass: find sealed, not-yet-extracted sessions and extract
@@ -1576,7 +1676,7 @@ pub async fn run(
         if summary.sessions_processed >= limit {
             break;
         }
-        if is_already_extracted(store, &session_ref.session_id).await? {
+        if is_already_extracted(store, fleet_id, &session_ref.session_id).await? {
             continue;
         }
         let transcript = load_transcript(store, &session_ref).await?;
@@ -1586,11 +1686,12 @@ pub async fn run(
             .and_then(|e| e.emitted_at.get(0..10))
             .unwrap_or("1970-01-01")
             .to_string();
-        let outcome = extract_session(store, cfg, provider, &transcript, &date).await?;
+        let outcome = extract_session(store, cfg, provider, &transcript, &date, fleet_id).await?;
         if !outcome.skipped_already_extracted {
             summary.sessions_processed += 1;
         }
         summary.claims_proposed += outcome.claims_proposed;
+        summary.claims_returned += outcome.claims_returned;
     }
     Ok(summary)
 }
@@ -1722,6 +1823,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -1748,6 +1850,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -2584,6 +2687,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -2592,7 +2696,7 @@ mod tests {
         // No idempotency marker should even be written — a true no-op touches
         // the store not at all.
         let marker_exists = store
-            .get(&ctxlake_store::layout::claims_extracted("s1"))
+            .get(&ctxlake_store::layout::claims_extracted("oxidant", "s1"))
             .await
             .is_ok();
         assert!(!marker_exists);
@@ -2601,11 +2705,69 @@ mod tests {
     // ---- idempotency: mark_extracted_if_new ----
 
     #[tokio::test]
+    async fn a_session_extracted_by_an_older_extractor_is_offered_again() {
+        // The gap Phase 4 closes. A successful `{"claims": []}` writes the marker just
+        // as a productive run does, so 37 sessions on a live lake were permanently
+        // marked done having produced nothing — and no improvement to the prompt, the
+        // transcript or the parser could ever be measured against them. Short of
+        // deleting keys by hand, the only evidence a new extractor had was sessions
+        // that happened not to exist yet.
+        let store = object_store::memory::InMemory::new();
+        let key = ctxlake_store::layout::claims_extracted("oxidant", "s1");
+
+        // A marker from before markers carried a version — the shape every existing
+        // one in a real lake has.
+        store
+            .put(&key, PutPayload::from_static(b"{}"))
+            .await
+            .unwrap();
+
+        assert!(
+            !is_already_extracted(&store, "oxidant", "s1").await.unwrap(),
+            "a versionless marker must not count as done for the current extractor"
+        );
+        assert!(
+            mark_extracted_if_new(&store, "oxidant", "s1")
+                .await
+                .unwrap(),
+            "and re-claiming it must succeed, not collide with itself"
+        );
+
+        // Having re-claimed it at the current version, it is done again.
+        assert!(
+            is_already_extracted(&store, "oxidant", "s1").await.unwrap(),
+            "a current marker must still skip, or every cycle re-extracts everything"
+        );
+        assert!(!mark_extracted_if_new(&store, "oxidant", "s1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn two_fleets_do_not_share_extraction_markers() {
+        // Same class as the roster and the snapshot pointer: `claims/extracted/<id>`
+        // was flat, so one fleet extracting a session marked it done for the other.
+        let store = object_store::memory::InMemory::new();
+        assert!(mark_extracted_if_new(&store, "ours", "s1").await.unwrap());
+        assert!(
+            mark_extracted_if_new(&store, "theirs", "s1").await.unwrap(),
+            "another fleet's marker must not claim this one's session"
+        );
+        assert!(is_already_extracted(&store, "ours", "s1").await.unwrap());
+        assert!(is_already_extracted(&store, "theirs", "s1").await.unwrap());
+        assert!(!is_already_extracted(&store, "third", "s1").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn mark_extracted_if_new_claims_exactly_once() {
         let store = object_store::memory::InMemory::new();
-        assert!(mark_extracted_if_new(&store, "s1").await.unwrap());
+        assert!(mark_extracted_if_new(&store, "oxidant", "s1")
+            .await
+            .unwrap());
         assert!(
-            !mark_extracted_if_new(&store, "s1").await.unwrap(),
+            !mark_extracted_if_new(&store, "oxidant", "s1")
+                .await
+                .unwrap(),
             "a second caller for the same session must not also claim it"
         );
     }
@@ -2626,7 +2788,7 @@ mod tests {
             for _ in 0..8 {
                 let store = store.clone();
                 handles.push(tokio::spawn(async move {
-                    mark_extracted_if_new(store.as_ref(), "sess-contended")
+                    mark_extracted_if_new(store.as_ref(), "oxidant", "sess-contended")
                         .await
                         .unwrap()
                 }));
@@ -2658,6 +2820,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -2670,6 +2833,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -2848,8 +3012,12 @@ mod tests {
         seal_one_session(&store, "2026-09-01", "s1").await;
         seal_one_session(&store, "2026-09-02", "s2").await;
         seal_one_session(&store, "2026-09-03", "s3").await;
-        mark_extracted_if_new(&store, "s1").await.unwrap();
-        mark_extracted_if_new(&store, "s2").await.unwrap();
+        mark_extracted_if_new(&store, "oxidant", "s1")
+            .await
+            .unwrap();
+        mark_extracted_if_new(&store, "oxidant", "s2")
+            .await
+            .unwrap();
 
         let cfg = SummarizeConfig {
             mode: SummarizeMode::Shadow,
@@ -2873,7 +3041,7 @@ mod tests {
              for real, not merely skipped"
         );
         // s3 specifically — not s1 or s2 again — must be the one newly marked.
-        assert!(is_already_extracted(&store, "s3").await.unwrap());
+        assert!(is_already_extracted(&store, "oxidant", "s3").await.unwrap());
     }
 
     #[test]
@@ -2942,7 +3110,9 @@ mod tests {
             "the first pass must surface the provider error"
         );
         assert!(
-            !is_already_extracted(&store, "flaky-1").await.unwrap(),
+            !is_already_extracted(&store, "oxidant", "flaky-1")
+                .await
+                .unwrap(),
             "a failed extraction must release its marker, or the session is lost"
         );
 
@@ -2997,6 +3167,7 @@ mod tests {
             },
             &session_a,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -3029,6 +3200,7 @@ mod tests {
             },
             &session_b,
             "2026-09-12",
+            "oxidant",
         )
         .await
         .unwrap();

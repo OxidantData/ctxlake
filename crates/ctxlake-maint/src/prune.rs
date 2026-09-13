@@ -99,10 +99,21 @@ pub async fn run(
         report.snapshots.push(key);
     }
 
-    for prefix in [layout::legacy_agents_prefix()] {
+    for prefix in [
+        layout::legacy_agents_prefix(),
+        layout::legacy_claims_extracted_prefix(),
+    ] {
         let mut stream = store.list(Some(&prefix));
+        let depth = prefix.as_ref().matches('/').count() + 1;
         while let Some(meta) = stream.next().await {
             let Ok(meta) = meta else { continue };
+            // Only the flat entries directly under the prefix. `claims/extracted/` now
+            // also contains `claims/extracted/<fleet>/<session>`, which is the current
+            // layout and must survive — pruning by prefix alone would delete every
+            // fleet's live markers and silently re-extract the entire lake.
+            if meta.location.as_ref().matches('/').count() != depth {
+                continue;
+            }
             if !dry_run {
                 store.delete(&meta.location).await?;
             }
@@ -242,6 +253,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pruning_legacy_markers_never_touches_the_fleet_scoped_ones() {
+        // `claims/extracted/` is now a *parent* of the current layout. Pruning by
+        // prefix alone would delete every fleet's live markers, and the next
+        // maintenance run would re-extract the entire lake — a model call per session,
+        // silently, because a cleanup command matched one path component too few.
+        let store = InMemory::new();
+        put(&store, "claims/extracted/old-session-1", "{}").await;
+        put(&store, "claims/extracted/old-session-2", "{}").await;
+        put(&store, "claims/extracted/myteam/live-session", "{}").await;
+
+        let report = run(&store, "myteam", false).await.unwrap();
+        assert_eq!(
+            report.legacy_live,
+            vec![
+                "claims/extracted/old-session-1".to_string(),
+                "claims/extracted/old-session-2".to_string(),
+            ]
+        );
+        assert!(
+            keys(&store)
+                .await
+                .contains(&"claims/extracted/myteam/live-session".to_string()),
+            "a live marker was deleted; the next run would re-extract that session"
+        );
+    }
+
+    #[tokio::test]
     async fn a_dry_run_reports_exactly_what_it_would_delete_and_deletes_nothing() {
         let store = InMemory::new();
         put(&store, "live/roster.json", "{}").await;
@@ -269,7 +307,10 @@ mod tests {
             "sessions/dt=2026-09-12/fleet=f/runtime=claude_code/agent=a/session=s/seg-000000.parquet",
             "sessions/dt=2026-09-12/fleet=f/runtime=claude_code/agent=a/session=s/_SEALED",
             "claims/events/dt=2026-09-12/agent=a/01J.json",
-            "claims/extracted/session-1",
+            // Fleet-scoped: the current layout, and never prunable. The flat form
+            // this used to name is the pre-scoping one, which is now legacy and
+            // therefore *is* pruned — see the sibling test.
+            "claims/extracted/myteam/session-1",
             "_meta/fleet.json",
         ];
         for k in protected {

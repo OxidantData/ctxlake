@@ -1001,6 +1001,7 @@ mod tests {
                 independent_count: 2,
                 confidence: 0.9,
                 status: "promoted".into(),
+                sessions: vec![],
             },
             ClaimRecord {
                 claim: "unrelated, from a different agent".into(),
@@ -1011,6 +1012,7 @@ mod tests {
                 independent_count: 2,
                 confidence: 0.9,
                 status: "promoted".into(),
+                sessions: vec![],
             },
         ];
         std::fs::write(

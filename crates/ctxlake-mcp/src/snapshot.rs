@@ -86,6 +86,13 @@ pub struct ClaimRow {
     pub independent_count: u32,
     pub confidence: f64,
     pub updated_at: String,
+    /// The sessions this claim was observed in, newest first.
+    ///
+    /// Carried so a memory can be followed up rather than only read. A claim is a
+    /// one-line summary of work that happened somewhere; without a session id an agent
+    /// that wants the detail — what command actually ran, what the output was — has
+    /// nowhere to go, and `fleet_history` is keyed by exactly this.
+    pub sessions: Vec<String>,
     pub embedding: Option<Vec<f32>>,
 }
 
@@ -137,6 +144,28 @@ fn decode_embedding(blob: &[u8]) -> Option<Vec<f32>> {
     )
 }
 
+/// Distinct `session_id`s out of a claim's stored evidence, in first-seen order.
+///
+/// Tolerant of shape: the column is written by `ctxlake_maint` and a future schema, or
+/// a partially written row, should cost the follow-up pointer rather than the claim.
+fn evidence_sessions(raw: String) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return vec![];
+    };
+    let Some(arr) = v.as_array() else {
+        return vec![];
+    };
+    let mut out: Vec<String> = Vec::new();
+    for e in arr {
+        if let Some(sid) = e.get("session_id").and_then(|s| s.as_str()) {
+            if !sid.is_empty() && !out.iter().any(|s| s == sid) {
+                out.push(sid.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn row_to_claim(row: &rusqlite::Row) -> rusqlite::Result<ClaimRow> {
     let embedding_blob: Option<Vec<u8>> = row.get("embedding")?;
     Ok(ClaimRow {
@@ -150,6 +179,7 @@ fn row_to_claim(row: &rusqlite::Row) -> rusqlite::Result<ClaimRow> {
         independent_count: row.get("independent_count")?,
         confidence: row.get("confidence")?,
         updated_at: row.get("updated_at")?,
+        sessions: evidence_sessions(row.get::<_, String>("evidence_json").unwrap_or_default()),
         embedding: embedding_blob.and_then(|b| decode_embedding(&b)),
     })
 }
@@ -175,7 +205,7 @@ pub(crate) fn fetch_visible(
     scope: Option<&str>,
 ) -> Vec<ClaimRow> {
     let sql = "SELECT claim_id, claim, claim_type, subject, scope, observed_by, status, \
-               independent_count, confidence, updated_at, embedding \
+               independent_count, confidence, updated_at, evidence_json, embedding \
                FROM claims \
                WHERE visible_to_agents = 1 \
                AND (?1 IS NULL OR subject = ?1) \
@@ -383,7 +413,7 @@ pub fn timeline(
     limit: usize,
 ) -> Vec<ClaimRow> {
     let sql = "SELECT claim_id, claim, claim_type, subject, scope, observed_by, status, \
-               independent_count, confidence, updated_at, embedding \
+               independent_count, confidence, updated_at, evidence_json, embedding \
                FROM claims \
                WHERE visible_to_agents = 1 \
                AND claim_type = 'outcome' \

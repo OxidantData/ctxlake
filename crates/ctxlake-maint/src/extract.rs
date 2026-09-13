@@ -1472,7 +1472,7 @@ pub async fn is_already_extracted(
 /// Not bumped for a provider swap or a model change — those are configuration, and
 /// re-extracting an entire lake because someone edited `ctxlake.toml` would be a
 /// surprising and expensive thing for a config edit to do.
-pub const EXTRACTOR_VERSION: u32 = 1;
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// Find every sealed session under `sessions/` by locating `_SEALED` markers.
 /// Whether a given one has already been extracted is [`mark_extracted_if_new`]'s
@@ -1565,10 +1565,38 @@ pub async fn load_transcript(
 /// The extraction system prompt: the stable prefix docs/memory.md's
 /// "prompt caching" paragraph describes — byte-identical across every session,
 /// so a caching-aware provider only pays for it once.
-pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You extract atomic, evidence-backed claims from a coding-agent session transcript.
+pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You extract atomic, evidence-backed claims from a coding-agent session transcript, for a memory another agent will read weeks from now in a different session.
+
 Respond with ONLY a JSON object of the shape:
 {"claims": [{"claim": string, "claim_type": "environment"|"convention"|"outcome"|"preference"|"hypothesis", "subject": string, "evidence": [{"session_id": string, "message_id": string}]}]}
-Every claim MUST cite at least one (session_id, message_id) pair that appears in the transcript's own [message_id] markers. Never invent a citation. If nothing in the transcript supports a durable claim, return {"claims": []}."#;
+
+THE FIVE TYPES. Choose deliberately; each is promoted under different rules.
+
+- "convention": a durable rule about how this codebase or team works, true before this session and after it.
+  e.g. "this repo uses `just`, not `make`" / "CI fails unless RUSTFLAGS=-D warnings is set"
+  The most valuable type. Prefer it whenever the evidence supports one.
+
+- "environment": a fact about the world outside the code — a host, port, service, credential mechanism, version.
+  e.g. "staging SSH listens on 2222" / "the MinIO container rejects If-None-Match: *"
+
+- "outcome": one specific thing that happened, immutable and timestamped.
+  e.g. "the Glue migration passed CI at abc123"
+  Use SPARINGLY. A structural digest of every session already records which files were
+  touched, which commands ran and how they exited. An "outcome" that restates that is
+  duplicate noise in a memory someone pays context-window tokens to read. Claim an
+  outcome only when it is surprising or consequential later — a migration that landed, a
+  root cause found — never merely to narrate the session.
+
+- "preference": how a human wants to be worked with. e.g. "prefers terse output"
+
+- "hypothesis": a suspected but unconfirmed cause. e.g. "the flake is a colima scheduling artifact"
+  Label honestly rather than promoting a guess to a fact.
+
+RULES.
+- Every claim MUST cite at least one (session_id, message_id) pair that appears in the transcript's own [message_id] markers. Never invent a citation.
+- "subject" is the thing the claim is about ("ci", "oxidant-loom", "staging"), so later claims about the same subject can be compared.
+- Atomic: one assertion per claim.
+- Do not claim what the transcript does not show. If nothing here is worth another agent's attention weeks from now, return {"claims": []} — that is a correct answer, not a failure."#;
 
 #[derive(Debug, Clone, Default)]
 pub struct ExtractOutcome {
@@ -2211,6 +2239,43 @@ mod tests {
     }
 
     // ---- structured output parsing ----
+
+    #[test]
+    fn the_prompt_defines_every_type_the_parser_will_accept() {
+        // The prompt named the five types in a JSON schema line and defined none of
+        // them. A model asked for "atomic, evidence-backed claims" with no notion of
+        // what the labels mean picks the one that fits "here is what I did" — and on a
+        // real lake every single promoted claim came back `outcome`, which is the one
+        // type a structural digest already records for free.
+        for t in [
+            "environment",
+            "convention",
+            "outcome",
+            "preference",
+            "hypothesis",
+        ] {
+            assert!(
+                EXTRACTION_SYSTEM_PROMPT.contains(&format!("\"{t}\": ")),
+                "the prompt must define `{t}`, not merely list it"
+            );
+        }
+        // And it must warn against the duplication, or the mix drifts straight back.
+        assert!(
+            EXTRACTION_SYSTEM_PROMPT.contains("structural digest"),
+            "the prompt must say why an `outcome` restating the digest is noise"
+        );
+        // Every type the prompt offers must be one the parser accepts, or the model is
+        // invited to produce claims that are then silently dropped.
+        for t in [
+            "environment",
+            "convention",
+            "outcome",
+            "preference",
+            "hypothesis",
+        ] {
+            assert!(crate::claims::ClaimType::parse(t).is_some(), "{t}");
+        }
+    }
 
     #[test]
     fn parse_claims_response_rejects_malformed_json_as_a_parse_error() {

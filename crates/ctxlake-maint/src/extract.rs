@@ -1099,6 +1099,62 @@ fn excerpt(raw: &str) -> String {
     }
 }
 
+/// How many already-known claims to show the extractor.
+///
+/// Bounded because this rides in front of every transcript and a fleet's claim count
+/// only grows. Newest first, so a growing lake keeps showing what is most likely to be
+/// re-observed rather than what happened first.
+const MAX_KNOWN_CLAIMS_SHOWN: usize = 60;
+
+/// And how much of each, so one verbose claim cannot crowd out fifty others.
+const MAX_KNOWN_CLAIM_CHARS: usize = 240;
+
+/// The "already recorded" block prefixed to a transcript, or `None` when the fleet
+/// believes nothing yet.
+///
+/// Only promoted and contested claims are shown. A candidate has not cleared the gate,
+/// and presenting one as established would let a rejected claim launder itself into
+/// the fleet's vocabulary through the next extraction.
+fn known_claims_preamble(existing: &BTreeMap<String, ClaimState>) -> Option<String> {
+    let mut rows: Vec<&ClaimState> = existing
+        .values()
+        .filter(|c| {
+            matches!(
+                c.status,
+                crate::claims::ClaimStatus::Promoted | crate::claims::ClaimStatus::Contested
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    // Newest first: `claim_id` is a ULID, so lexicographic order is chronological.
+    rows.sort_by(|a, b| b.claim_id.cmp(&a.claim_id));
+    rows.truncate(MAX_KNOWN_CLAIMS_SHOWN);
+
+    let mut out = String::from(
+        "ALREADY RECORDED — the fleet has these claims. If this transcript supports one \
+         of them, DO NOT restate it in your own words: either omit it, or repeat its \
+         text character for character so it is recognised as the same claim rather than \
+         filed as a near-duplicate. Only propose a claim that is not already here.\n",
+    );
+    for c in rows {
+        let text = truncate_chars(&c.claim, MAX_KNOWN_CLAIM_CHARS);
+        out.push_str(&format!("- [{}] {}\n", c.claim_type.as_str(), text));
+    }
+    out.push_str("\nTRANSCRIPT:\n");
+    Some(out)
+}
+
+/// Truncate on a character boundary, marking that it happened.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
+}
+
 /// Whether a rendered transcript carries enough for a claim to be grounded in.
 ///
 /// Three rounds of real failures shaped this, each one the model telling us plainly
@@ -1249,14 +1305,27 @@ fn find_existing_claim_id(
     subject: &str,
     claim_text: &str,
 ) -> Option<String> {
-    let norm_subject = claims::normalize_claim_text(subject);
+    let _ = subject;
     let norm_claim = claims::normalize_claim_text(claim_text);
     existing
         .values()
         .find(|s| {
             s.status != crate::claims::ClaimStatus::Retired
                 && s.claim_type == claim_type
-                && claims::normalize_claim_text(&s.subject) == norm_subject
+                // **Subject is deliberately not compared.**
+                //
+                // It used to be, and that is why identical claims were filed twice. The
+                // subject is free text the model invents per session: the same fact
+                // arrived as "console theming" and "oxidant theme storage", as
+                // "VitePress theme structure" and "oxidantdata-theme", as "navbar
+                // updates" and "site navigation updates". Requiring the subjects to
+                // match meant this function almost never fired, and each re-observation
+                // became a new claim with a fresh id instead of evidence on the
+                // existing one.
+                //
+                // The claim text is the assertion; the subject is a label for grouping
+                // it. Two claims with identical text are the same claim whatever the
+                // model chose to call the topic.
                 && claims::normalize_claim_text(&s.claim) == norm_claim
         })
         .map(|s| s.claim_id.clone())
@@ -1504,7 +1573,7 @@ pub async fn is_already_extracted(
 /// Not bumped for a provider swap or a model change — those are configuration, and
 /// re-extracting an entire lake because someone edited `ctxlake.toml` would be a
 /// surprising and expensive thing for a config edit to do.
-pub const EXTRACTOR_VERSION: u32 = 2;
+pub const EXTRACTOR_VERSION: u32 = 3;
 
 /// Find every sealed session under `sessions/` by locating `_SEALED` markers.
 /// Whether a given one has already been extracted is [`mark_extracted_if_new`]'s
@@ -1703,9 +1772,39 @@ pub async fn extract_session(
             skipped_already_extracted: false,
         });
     }
+    // **What the fleet already believes, shown to the extractor.**
+    //
+    // Duplication is the problem this solves, and it could not be solved downstream.
+    // Measured on a live lake: 12 near-duplicate pairs among 104 promoted claims, and
+    // no similarity threshold separates them. "TLS certificate mounting uses a
+    // kubernetes.io/tls Secret" and "the TLS Secret is mounted read-only at
+    // /etc/..." share 48% of their words and are two different facts; "the shared theme
+    // stylesheet must be byte-identical" and "oxidantdata.css must be byte-identical
+    // across repos" share 46% and are one fact. Auto-merging in that band fuses
+    // distinct facts, and refusing to merge keeps the duplicates.
+    //
+    // So the fix is prevention: hand the model what is already recorded and ask it to
+    // reuse the exact wording rather than invent a near-copy. Then
+    // `find_existing_claim_id`'s exact-text match — which was never wrong, only
+    // unreachable, because the model reworded every time — does the merge, and the
+    // second observation accumulates as evidence on the first claim instead of
+    // becoming a second claim.
+    //
+    // **This does not weaken the independence gate.** That gate exists because an agent
+    // told a claim mid-session will "independently" observe it — the echo. Here the
+    // session has already happened and its transcript is fixed; nothing shown to the
+    // extractor can change what the agent did. This decides only how existing evidence
+    // is filed, not what counts as evidence.
+    let existing_events = crate::claims::list_events(store).await?;
+    let existing = crate::claims::fold(existing_events.iter());
+    let user_prompt = match known_claims_preamble(&existing) {
+        Some(preamble) => format!("{preamble}\n{transcript_text}"),
+        None => transcript_text,
+    };
+
     let request = CompletionRequest {
         system_prompt: EXTRACTION_SYSTEM_PROMPT.to_string(),
-        user_prompt: transcript_text,
+        user_prompt,
         model: batch_cfg.model.clone(),
     };
     // The marker above was written *before* this call, so that two hosts cannot both
@@ -1747,9 +1846,6 @@ pub async fn extract_session(
     // is a model-quality problem this pass doesn't try to solve, and is a
     // different situation from cross-session corroboration, which is what
     // `find_existing_claim_id` exists for.
-    let existing_events = crate::claims::list_events(store).await?;
-    let existing = crate::claims::fold(existing_events.iter());
-
     let mut proposed = 0usize;
     let returned = raw_claims.len();
     for raw in raw_claims {
@@ -2271,6 +2367,136 @@ mod tests {
     }
 
     // ---- structured output parsing ----
+
+    fn claim_state(id: &str, ty: ClaimType, subject: &str, text: &str) -> ClaimState {
+        ClaimState {
+            claim_id: id.into(),
+            claim: text.into(),
+            claim_type: ty,
+            subject: subject.into(),
+            scope: crate::claims::Scope::Fleet,
+            observed_by: "cc-01".into(),
+            status: crate::claims::ClaimStatus::Promoted,
+            evidence: vec![],
+            independent_count: 1,
+            confidence: 0.65,
+            observed_at: "2026-09-13T00:00:00Z".into(),
+            embedding: None,
+            resolves_at: None,
+        }
+    }
+
+    #[test]
+    fn the_same_claim_under_a_different_subject_is_still_the_same_claim() {
+        // The duplication bug, exactly. On a live lake one fact arrived as subject
+        // "console theming" and again as "oxidant theme storage"; another as "navbar
+        // updates" and "site navigation updates". Requiring the subjects to match meant
+        // each re-observation was filed as a brand-new claim instead of evidence on the
+        // existing one.
+        let mut existing = BTreeMap::new();
+        existing.insert(
+            "c1".to_string(),
+            claim_state(
+                "c1",
+                ClaimType::Convention,
+                "console theming",
+                "Dark theme is set via localStorage",
+            ),
+        );
+
+        let found = find_existing_claim_id(
+            &existing,
+            ClaimType::Convention,
+            "oxidant theme storage", // a different label for the same topic
+            "Dark theme is set via localStorage",
+        );
+        assert_eq!(
+            found.as_deref(),
+            Some("c1"),
+            "identical text under a different subject must reuse the claim id"
+        );
+    }
+
+    #[test]
+    fn a_different_assertion_is_never_folded_onto_an_existing_claim() {
+        // The other direction, and the one that matters more: merging two distinct
+        // facts is worse than keeping a duplicate. These two share most of their words
+        // and are genuinely different — both were promoted from the same session on a
+        // real lake.
+        let mut existing = BTreeMap::new();
+        existing.insert(
+            "c1".to_string(),
+            claim_state(
+                "c1",
+                ClaimType::Convention,
+                "tls",
+                "TLS certificate mounting for manual mode uses a kubernetes.io/tls Secret type",
+            ),
+        );
+        assert_eq!(
+            find_existing_claim_id(
+                &existing,
+                ClaimType::Convention,
+                "tls",
+                "In manual mode, the TLS Secret is mounted read-only at /etc/oxidant-platform/tls",
+            ),
+            None,
+            "48% word overlap is not the same claim; only identical text merges"
+        );
+        // And a different type never merges, however the text reads.
+        assert_eq!(
+            find_existing_claim_id(
+                &existing,
+                ClaimType::Outcome,
+                "tls",
+                "TLS certificate mounting for manual mode uses a kubernetes.io/tls Secret type",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_extractor_is_shown_what_the_fleet_already_believes() {
+        // Prevention rather than post-hoc merging: no similarity threshold separates
+        // the real duplicates from the real distinctions in this data, so the model is
+        // asked not to produce the near-copy in the first place.
+        let mut existing = BTreeMap::new();
+        existing.insert(
+            "c1".to_string(),
+            claim_state(
+                "c1",
+                ClaimType::Convention,
+                "ci",
+                "CI needs RUSTFLAGS=-D warnings",
+            ),
+        );
+        let mut candidate = claim_state("c2", ClaimType::Outcome, "x", "a candidate claim");
+        candidate.status = crate::claims::ClaimStatus::Candidate;
+        existing.insert("c2".to_string(), candidate);
+
+        let preamble = known_claims_preamble(&existing).expect("something is known");
+        assert!(
+            preamble.contains("CI needs RUSTFLAGS=-D warnings"),
+            "{preamble}"
+        );
+        assert!(
+            preamble.contains("character for character"),
+            "must ask for exact reuse, or the model rewords and the merge never fires"
+        );
+        assert!(
+            !preamble.contains("a candidate claim"),
+            "a claim that has not cleared the gate must not be presented as established"
+        );
+        assert!(
+            preamble.contains("TRANSCRIPT:"),
+            "must separate the two sections"
+        );
+    }
+
+    #[test]
+    fn an_empty_lake_adds_no_preamble() {
+        assert!(known_claims_preamble(&BTreeMap::new()).is_none());
+    }
 
     #[test]
     fn the_prompt_defines_every_type_the_parser_will_accept() {

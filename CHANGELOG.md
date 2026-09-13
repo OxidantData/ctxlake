@@ -1,5 +1,92 @@
 # Changelog
 
+## v0.1.10
+
+Two halves of the same problem: the fleet was accumulating duplicate beliefs, and there
+was no way to look at the memory it had accumulated.
+
+> **Upgrading:** `ctxlake update`. Nothing to reconfigure.
+
+### Duplicate claims — prevented, not merged
+
+Three extraction passes over the same session produced three near-identical claims about
+the same fact. The extractor was shown nothing about what the fleet already believed, so
+every pass reworded the same observation into a new claim, and each landed at
+`independent_count = 1` instead of corroborating the first.
+
+Extraction now shows the model the promoted and contested claims already on file and
+asks it to **repeat a known claim character-for-character** when it sees the same fact
+again, so the second observation merges onto the existing claim. Prevention is 92%
+effective on new claims.
+
+An earlier version of that instruction offered the model a choice — *either omit the
+known claim, or repeat it*. A live probe showed it choosing omit and returning
+`{"claims": []}`, which discarded the corroboration entirely. The instruction is now
+repeat-never-omit.
+
+**Merging the existing backlog is not viable, and that is a finding rather than a
+limitation.** Measured on a real lake, word overlap does not separate a duplicate from a
+distinction: the *distinct* TLS pair scores 48% (one names the Secret type, the other the
+mount path) while the *duplicate* stylesheet pair scores 46%. No threshold divides them.
+So `ctxlake claims --duplicates` reports the pairs, ranked, and leaves the judgement
+where it can actually be made.
+
+### Every tier is now inspectable
+
+Tier 0 had no command at all — 51 session digests in the lake with no way to read one —
+and `ClaimEvent::Retired` existed in the event log with no CLI path, so a duplicate could
+be found and not acted on.
+
+```sh
+ctxlake sessions                                    # what the fleet has done
+ctxlake sessions <id>                               # one session, in full
+ctxlake claims --retire <claim_id> --reason "..."   # remove one from what agents read
+```
+
+`ctxlake sessions <id>` prints the repo and branch, duration, outcome, token usage and
+cost, the friction signals, every file touched, and every command with its exit code —
+then **the claims resting on that session**, by id. That last line is the join between
+what happened and what the fleet concluded from it, and the fastest route to a claim
+worth retiring.
+
+A command whose exit code is unknown prints `?` rather than `ok`: a session captured
+before transcript enrichment has no exit codes, and showing those as successes would
+invent a result.
+
+`--retire` appends a `Retired` event rather than deleting. The claim stops being
+agent-visible at the next maintenance pass; the record of having believed it, and the
+reason for stopping, stay in `claims/events/`. A claim that vanished without trace would
+be indistinguishable from one that was never made — which is exactly the history you want
+when the same wrong belief comes back. `--reason` is required for that reason.
+
+### Three bugs the new commands found on a real lake
+
+- **`ctxlake claims --status promoted` reported an empty lake against 117 promoted
+  claims.** It read only the `claims.json` mirror, which the maintenance chain stopped
+  writing once the snapshot gained a `claims` table — the same orphaned-reader shape as
+  `history.json` in v0.1.9, where every reference was a reader. It now reads the
+  snapshot, the same artifact the agent reads, with the mirror as a fallback for caches
+  written by an older ctxlake.
+- **`--duplicates` printed claim ids that `--retire` could not resolve.** Claim ids are
+  ULIDs, so claims minted in the same millisecond share a long prefix: eight characters
+  matched 94 claims. Ids now print at twelve characters everywhere, from one constant.
+- **Friction rendered as raw JSON.** It now decodes into the digest's own `Friction`
+  type and calls the same `headline()` the briefing uses, so there is one renderer to
+  keep correct instead of two.
+
+### Also
+
+- Session digest columns decode into the types the maintenance chain wrote them from. A
+  shape this reader cannot parse costs that column and nothing else, so a digest written
+  by a newer ctxlake cannot make `sessions` unusable on an older one.
+- The `convention` promotion threshold drops from 2 independent sessions to 1. This is a
+  concession, documented as one: `injected_context` is still never populated, so
+  `independent_count` can never exceed 1 and a threshold of 2 meant `convention` could
+  never promote at all. Restore it to 2 once independence lineage is real.
+- Test fixtures can now express a claim's evidence and a session's files, commands and
+  friction. Without those columns no test could exercise a reader that renders them —
+  the same gap that let the v0.1.9 capture bug survive review.
+
 ## v0.1.9
 
 The memory layer produced nothing and delivered nothing. Measured on a live lake

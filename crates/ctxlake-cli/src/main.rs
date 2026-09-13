@@ -532,14 +532,17 @@ async fn run_install(
             }
         };
         let verb = if installing { "install" } else { "uninstall" };
+        // Deliberately not `continue`. An early version returned here, and the effect
+        // was that a machine whose hooks were already wired never got its MCP server
+        // registered — which is the single most common state, since hooks were wired
+        // releases ago and MCP never was. The two configs are different files and must
+        // be decided independently.
         if !plan.changed() {
             println!(
-                "{runtime}: already up to date ({verb} is a no-op) — {}",
+                "{runtime}: hooks already up to date ({verb} is a no-op) — {}",
                 path.display()
             );
-            continue;
-        }
-        if args.dry_run {
+        } else if args.dry_run {
             println!(
                 "{runtime}: would change {}\n{}",
                 path.display(),
@@ -552,6 +555,41 @@ async fn run_install(
                 if let Some(caveat) = hooks::install_caveat(runtime) {
                     eprintln!("{runtime}: warning: {caveat}");
                 }
+            }
+        }
+
+        // The MCP registry is a separate file, so it is a separate change.
+        //
+        // Without it an agent can be *told* things — the briefing is injected at
+        // session start — but cannot *ask*: `memory_search`, `fleet_history` and
+        // `fleet_status` are unreachable. On a live machine `mcpServers` was empty
+        // while 38 promoted claims sat in the lake, which is the whole belief layer
+        // built and delivered to nobody. `main.rs` has claimed install does this since
+        // the subcommand was added; nothing did.
+        let mcp_plan = if installing {
+            hooks::plan_mcp_install(runtime, &cfg.fleet_id, &cfg.agent_id)
+        } else {
+            hooks::plan_mcp_uninstall(runtime)
+        };
+        match mcp_plan {
+            Ok(Some(p)) if p.changed() => {
+                if args.dry_run {
+                    println!("{runtime}: would change {}\n{}", p.path.display(), p.diff());
+                } else if let Err(e) = hooks::apply(&p) {
+                    // Non-fatal: the hooks are wired and capture works. Losing the
+                    // pull path is worth saying loudly, not worth failing the install
+                    // that just succeeded.
+                    eprintln!("{runtime}: warning: could not wire the MCP server ({e:#})");
+                    any_error = true;
+                } else {
+                    println!("{runtime}: MCP server {verb}ed in {}", p.path.display());
+                }
+            }
+            Ok(Some(_)) => println!("{runtime}: MCP server already up to date"),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{runtime}: warning: could not plan the MCP change ({e:#})");
+                any_error = true;
             }
         }
     }

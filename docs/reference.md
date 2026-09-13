@@ -17,7 +17,8 @@ exceptions are flagged inline — `ctxlake install hermes` wires hooks but not M
 | `ctxlake config` | Print the resolved config |
 | `ctxlake sync` | Run the daemon, or install it as a service so it survives a reboot |
 | `ctxlake maint` | Run the maintenance chain — safe from any number of hosts at once |
-| `ctxlake claims` | Review candidate / contested / promoted claims, or `--duplicates` |
+| `ctxlake claims` | Review claims, find `--duplicates`, `--retire` one |
+| `ctxlake sessions` | What each session recorded, and which claims rest on it |
 | `ctxlake quarantine` | Stop one agent's claims from promoting |
 | `ctxlake briefing` | Render the session briefing, or write it to the cache the hook reads |
 | `ctxlake mcp` | The stdio MCP server; `ctxlake install` registers it with each runtime |
@@ -342,8 +343,10 @@ auto-promote beyond agent scope"*.
 
 > **`--explain` is a read-only, best-effort evaluator**, not a second implementation of
 > the gate. The contradiction and independence checks need data it does not carry, and it
-> says so rather than guessing. `--status promoted`/`contested` read the local cache
-> mirror, the same file `memory_search` reads.
+> says so rather than guessing. `--status promoted`/`contested` read the published
+> snapshot — the same artifact the agent reads, so this can never report a different
+> fleet memory than the one in use. Each claim is printed under its id, which is what
+> `--retire` takes.
 
 ### `ctxlake claims --duplicates`
 
@@ -358,12 +361,58 @@ a real lake: two claims about TLS sharing 48% of their words are different facts
 names the Secret *type*, the other the *mount path*); two about a stylesheet sharing 46%
 are one fact stated twice. The distinctions score at least as high as the duplicates, so
 no threshold separates them and any automatic merge fuses things that are not the same.
-Retire one side with `ctxlake quarantine`, or leave both.
+Retire one side with `ctxlake claims --retire`, or leave both.
 
 New duplicates are prevented at extraction time instead — the extractor is shown what
 the fleet already believes and asked to repeat a known claim verbatim rather than reword
 it, so the second observation merges onto the existing claim as corroboration. This
 command is for the backlog that predates that.
+
+### `ctxlake claims --retire`
+
+```sh
+ctxlake claims --retire <claim_id> --reason "..."
+```
+
+The manual grooming path: `--duplicates` finds the pairs no machine can separate, and
+this is how you act on one. Takes a claim id or any unambiguous prefix — the twelve
+characters the other commands print are enough. An ambiguous prefix is reported, never
+resolved by taking the first match.
+
+**It appends, it does not delete.** A `Retired` event goes into `claims/events/`
+alongside the `Promoted` event that put the claim there. The claim stops being
+agent-visible at the next `ctxlake maint` pass — only `promoted` claims are ever read —
+but the record of having believed it, and your reason for stopping, survives. A claim
+that vanished without trace would be indistinguishable from one that was never made,
+which is exactly the history you want when the same wrong belief comes back.
+
+`--reason` is required, and is kept in the event. Six months on, *"which of these two
+did we keep, and why"* is the question, and the reason is the only thing that answers it.
+
+### `ctxlake sessions`
+
+```sh
+ctxlake sessions                 # what the fleet has done, newest first
+ctxlake sessions <id-prefix>     # one session in full
+ctxlake sessions --limit 50
+```
+
+Tier 0 — the structural digest that needs no model and cannot hallucinate.
+`ctxlake claims` shows what was *believed*; this shows the evidence underneath it.
+
+One session prints its repo and branch, duration, outcome, token usage and cost, the
+friction signals, every file it touched, and every command it ran with the exit code.
+A command whose exit code is unknown prints `?` rather than `ok` — a session captured
+before transcript enrichment has no exit codes at all, and showing those as successes
+would invent a result.
+
+It ends with **the claims that rest on that session**, by id, which is the join between
+what happened and what the fleet concluded from it — and the fastest way to find a claim
+worth retiring. A session no claim cites says so plainly: Tier 0 recorded it, Tier 2
+concluded nothing from it.
+
+Reads the local snapshot, deliberately — the same artifact the agent reads. If there is
+none yet it says so; run `ctxlake maint --once` or wait for the daemon's next refresh.
 
 ### `ctxlake quarantine`
 

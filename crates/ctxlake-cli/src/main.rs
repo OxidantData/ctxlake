@@ -20,6 +20,7 @@ mod paths;
 mod repo;
 mod sanitize;
 mod service;
+mod sessions;
 mod status;
 mod store_ctx;
 mod sync_cmd;
@@ -81,6 +82,12 @@ enum Command {
     Maint(MaintCmd),
     /// Review candidate, contested, and promoted claims.
     Claims(ClaimsCmd),
+    /// List what the fleet's sessions recorded, or open one in full.
+    ///
+    /// This is Tier 0 — the structural digest that needs no model and cannot
+    /// hallucinate. `ctxlake claims` shows what was *believed*; this shows the
+    /// evidence underneath it.
+    Sessions(SessionsCmd),
     /// Stop one agent's claims from promoting; its already-promoted claims move
     /// to contested. Capture continues.
     Quarantine(QuarantineCmd),
@@ -284,7 +291,7 @@ struct MaintCmd {
 
 #[derive(Args)]
 struct ClaimsCmd {
-    #[arg(long, value_parser = ["candidate", "contested", "promoted"], required_unless_present = "duplicates")]
+    #[arg(long, value_parser = ["candidate", "contested", "promoted"], required_unless_present_any = ["duplicates", "retire"])]
     status: Option<String>,
     /// List promoted claims that appear to say the same thing, for review.
     ///
@@ -299,10 +306,32 @@ struct ClaimsCmd {
     /// backlog that predates it.
     #[arg(long)]
     duplicates: bool,
+    /// Retire one claim by id (or an unambiguous prefix), with a reason.
+    ///
+    /// The manual grooming path: `--duplicates` finds the pairs a machine cannot
+    /// separate, and this is how you act on one. Appends a `Retired` event — the
+    /// claim stops being read, the record of it does not disappear.
+    #[arg(long, value_name = "CLAIM_ID", requires = "reason")]
+    retire: Option<String>,
+    /// Why this claim is being retired. Required with `--retire`, and kept in the
+    /// event log: six months on, "which duplicate did we keep, and why" is the
+    /// question, and the reason is the only thing that answers it.
+    #[arg(long)]
+    reason: Option<String>,
     /// For `--status candidate`: name which of the four gates rejected each
     /// claim, and why.
     #[arg(long)]
     explain: bool,
+}
+
+#[derive(Args)]
+struct SessionsCmd {
+    /// A session id, or any unambiguous prefix of one. A single match is shown
+    /// in full; several are listed.
+    session: Option<String>,
+    /// How many rows to list. Ignored when one session is shown in full.
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Args)]
@@ -472,12 +501,18 @@ async fn run() -> Result<()> {
         }
         Command::Claims(args) => {
             let cfg = load_config(&config_path)?;
-            if args.duplicates {
+            if let (Some(id), Some(reason)) = (&args.retire, &args.reason) {
+                claims::run_retire(&cfg, id, reason).await
+            } else if args.duplicates {
                 claims::run_duplicates(&cfg).await
             } else {
                 let status = args.status.as_deref().unwrap_or("promoted");
                 claims::run_claims(&cfg, status, args.explain).await
             }
+        }
+        Command::Sessions(args) => {
+            let cfg = load_config(&config_path)?;
+            sessions::run(&cfg, args.session.as_deref(), args.limit).await
         }
         Command::Quarantine(args) => {
             let cfg = load_config(&config_path)?;

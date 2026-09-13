@@ -497,6 +497,13 @@ pub mod test_support {
         pub ended_at: &'static str,
         pub summary: &'static str,
         pub outcome: &'static str,
+        /// The digest's own JSON columns. Default `"[]"`, so a fixture that does not
+        /// care about them reads exactly as before — but a reader that renders files,
+        /// commands or friction can now be tested against real shapes rather than
+        /// only against emptiness.
+        pub files_json: &'static str,
+        pub commands_json: &'static str,
+        pub friction_json: &'static str,
     }
 
     impl FixtureSession {
@@ -508,6 +515,9 @@ pub mod test_support {
                 ended_at: "2026-09-12T18:00:00Z",
                 summary,
                 outcome: "clean",
+                files_json: "[]",
+                commands_json: "[]",
+                friction_json: "[]",
             }
         }
     }
@@ -526,6 +536,8 @@ pub mod test_support {
         pub updated_at: &'static str,
         pub visible_to_agents: bool,
         pub embedding: Option<Vec<f32>>,
+        /// Which sessions this claim rests on. Default `"[]"`.
+        pub evidence_json: &'static str,
     }
 
     impl FixtureClaim {
@@ -548,6 +560,7 @@ pub mod test_support {
                 updated_at: "2026-09-09T00:00:00Z",
                 visible_to_agents: true,
                 embedding: None,
+                evidence_json: "[]",
             }
         }
     }
@@ -603,7 +616,7 @@ pub mod test_support {
                     1,
                     c.independent_count,
                     c.confidence,
-                    "[]",
+                    c.evidence_json,
                     c.updated_at,
                     c.visible_to_agents as i64,
                     c.embedding.as_deref().map(embedding_to_blob),
@@ -637,9 +650,9 @@ pub mod test_support {
                     1_i64,
                     s.outcome,
                     s.summary,
-                    "[]",
-                    "[]",
-                    "[]",
+                    s.files_json,
+                    s.commands_json,
+                    s.friction_json,
                     0_i64,
                     0_i64,
                     0.0_f64,

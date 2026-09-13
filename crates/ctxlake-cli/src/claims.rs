@@ -427,7 +427,13 @@ pub fn explain(group: &CandidateGroup, quarantined: &HashSet<String>) -> Explana
 pub async fn run_claims(cfg: &Config, status: &str, explain_flag: bool) -> Result<()> {
     match status {
         "candidate" => print_candidates(cfg, explain_flag).await,
-        "promoted" | "contested" => print_cached(&paths::cache_dir(&cfg.fleet_id), status),
+        // The snapshot first, the JSON mirror only as a fallback. On a lake with 117
+        // promoted claims this command printed "no promoted claims yet", because it
+        // read only `claims.json` — a mirror the maintenance chain stopped writing
+        // once the snapshot gained a `claims` table. The same orphaned-reader shape as
+        // `history.json`: every reference was a reader. The fallback stays for caches
+        // written by an older ctxlake that has a mirror and no snapshot.
+        "promoted" | "contested" => print_promoted(cfg, status),
         other => {
             anyhow::bail!("unknown --status {other:?} (expected candidate, contested, or promoted)")
         }
@@ -472,6 +478,54 @@ async fn print_candidates(cfg: &Config, explain_flag: bool) -> Result<()> {
     Ok(())
 }
 
+/// `--status promoted` / `--status contested`, read from the published snapshot —
+/// the same artifact the agent reads, so this cannot report a different fleet memory
+/// than the one in use.
+fn print_promoted(cfg: &Config, status: &str) -> Result<()> {
+    let Some(conn) = ctxlake_mcp::snapshot::open(&ctxlake_core::paths::cache_root(), &cfg.fleet_id)
+    else {
+        return print_cached(&paths::cache_dir(&cfg.fleet_id), status);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT claim_id, claim, claim_type, subject, observed_by, updated_at, \
+                independent_count, confidence, status \
+         FROM claims WHERE status = ?1 ORDER BY claim_type, claim_id",
+    )?;
+    let rows: Vec<(String, ClaimRecord)> = stmt
+        .query_map([status], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ClaimRecord {
+                    claim: r.get(1)?,
+                    claim_type: r.get(2)?,
+                    subject: r.get(3)?,
+                    observed_by: r.get(4)?,
+                    observed_at: r.get(5)?,
+                    independent_count: r.get::<_, i64>(6)?.max(0) as u32,
+                    confidence: r.get(7)?,
+                    status: r.get(8)?,
+                    sessions: Vec::new(),
+                },
+            ))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    if rows.is_empty() {
+        println!("no {status} claims in this fleet's snapshot.");
+        return Ok(());
+    }
+    println!("{} {status} claim(s)\n", rows.len());
+    for (id, c) in &rows {
+        // The id leads, because this listing is where grooming starts and `--retire`
+        // needs an id. Without it the operator has to go and find one by hand.
+        println!("{}", &id[..ID_DISPLAY_LEN.min(id.len())]);
+        println!("{}\n", ctxlake_mcp::memory::render(c));
+    }
+    Ok(())
+}
+
+/// The pre-snapshot fallback: the `claims.json` mirror an older ctxlake wrote.
+///
 /// `cache_dir` is the caller's already-resolved `<cache_root>/<fleet_id>/`
 /// (injected rather than derived internally from a `Config` so tests can point it
 /// at a tempdir without mutating the process-wide `$CTXLAKE_CACHE_DIR` — see
@@ -566,6 +620,140 @@ fn demote_cached_claims(cache_dir: &std::path::Path, agent_id: &str) -> Result<u
     Ok(demoted)
 }
 
+/// How much of a claim id to print when the id is meant to be copied.
+///
+/// Not cosmetic. Claim ids are ULIDs, so every claim minted in the same millisecond
+/// range shares a long prefix — eight characters matched 94 claims on a real lake,
+/// which made `--duplicates` print ids that `--retire` could not resolve. Twelve
+/// covers the full timestamp plus randomness.
+pub const ID_DISPLAY_LEN: usize = 12;
+
+/// How many candidates an ambiguous `--retire` prefix lists before it stops.
+const AMBIGUOUS_PREVIEW: usize = 10;
+
+/// `ctxlake claims --retire <claim_id> --reason "..."` — the manual grooming path.
+///
+/// **Why this is an append, not a delete.** Retiring writes a `Retired` event into
+/// `claims/events/` alongside the `Promoted` event that put the claim there. The claim
+/// stops being agent-visible at the next maintenance pass (only `promoted` claims are
+/// ever read), but the record of having believed it — and of your reason for stopping —
+/// survives. The lake has no deletes by design; a claim that vanished without trace
+/// would be indistinguishable from one that was never made, which is precisely the
+/// history an operator needs when the same wrong belief shows up again.
+///
+/// Takes a claim id or any unambiguous prefix, so the 8 characters
+/// `--duplicates` prints are enough to act on.
+pub async fn run_retire(cfg: &Config, id_prefix: &str, reason: &str) -> Result<()> {
+    let Some(conn) = ctxlake_mcp::snapshot::open(&ctxlake_core::paths::cache_root(), &cfg.fleet_id)
+    else {
+        println!("no snapshot synced locally yet for this fleet — nothing to retire against.");
+        return Ok(());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT claim_id, claim_type, claim, status FROM claims \
+         WHERE claim_id LIKE ?1 || '%' ORDER BY claim_id",
+    )?;
+    let matches: Vec<ClaimRow> = stmt
+        .query_map([id_prefix], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+
+    // Ambiguity is reported, never resolved by picking the first — retiring the wrong
+    // claim is silent, and the operator cannot tell from the output that it happened.
+    match matches.len() {
+        0 => {
+            println!("no claim in this fleet's snapshot starts with {id_prefix:?}.");
+            return Ok(());
+        }
+        1 => {}
+        n => {
+            // Showing a few is help; showing ninety is the same as showing none.
+            println!("{n} claims start with {id_prefix:?} — give more characters:");
+            for (id, ty, text, _) in matches.iter().take(AMBIGUOUS_PREVIEW) {
+                println!(
+                    "  {} [{}] {}",
+                    &id[..ID_DISPLAY_LEN.min(id.len())],
+                    ty,
+                    text
+                );
+            }
+            if n > AMBIGUOUS_PREVIEW {
+                println!("  ... and {} more", n - AMBIGUOUS_PREVIEW);
+            }
+            return Ok(());
+        }
+    }
+    let (claim_id, claim_type, claim_text, status) = &matches[0];
+    if status == "retired" {
+        println!(
+            "{} is already retired.",
+            &claim_id[..ID_DISPLAY_LEN.min(claim_id.len())]
+        );
+        return Ok(());
+    }
+
+    let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
+    let now = time::OffsetDateTime::from(ctx.clock.now().await?);
+    let at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let date = at.get(..10).unwrap_or_default().to_string();
+    let store = store_ctx::prefixed_store(&ctx);
+    ctxlake_maint::claims::append_retired(
+        store.as_ref(),
+        &date,
+        &cfg.agent_id,
+        claim_id,
+        &sanitize(reason),
+        &at,
+    )
+    .await
+    .with_context(|| format!("appending Retired event for {claim_id}"))?;
+
+    // The event is the truth, but the local cache is what this machine's next briefing
+    // reads. Without this the operator retires a claim and keeps being told it.
+    let dropped = drop_cached_claim(&paths::cache_dir(&cfg.fleet_id), claim_text)?;
+
+    println!(
+        "retired {} [{}]",
+        &claim_id[..ID_DISPLAY_LEN.min(claim_id.len())],
+        claim_type
+    );
+    println!("  {claim_text}");
+    println!("  reason: {reason}");
+    if dropped > 0 {
+        println!("  dropped from this machine's cached briefing immediately");
+    }
+    println!(
+        "\nFleet-wide it disappears at the next `ctxlake maint` pass, which folds the \
+         event into the published snapshot."
+    );
+    Ok(())
+}
+
+/// Remove a retired claim from the local cache mirror. Matches on claim text because
+/// the mirror carries no claim id (see [`ClaimRecord`]); exact match only, so a claim
+/// that merely resembles it is left alone. Returns how many entries it removed.
+fn drop_cached_claim(cache_dir: &std::path::Path, claim_text: &str) -> Result<usize> {
+    let path = cache_dir.join("claims.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Ok(0),
+    };
+    let mut claims: Vec<ClaimRecord> =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let before = claims.len();
+    claims.retain(|c| c.claim != claim_text);
+    let dropped = before - claims.len();
+    if dropped > 0 {
+        std::fs::write(&path, serde_json::to_vec_pretty(&claims)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(dropped)
+}
+
 /// How much word overlap makes two claims worth a human look.
 ///
 /// Low on purpose. This reports rather than acts, so a false positive costs one line
@@ -640,8 +828,8 @@ pub async fn run_duplicates(cfg: &Config) -> Result<()> {
     println!(
         "{} possible duplicate pair(s) among {} promoted claims.\n\
          Reported, not merged: at this overlap a real duplicate and a real distinction \
-         look the same,\nso the call is yours. Retire one side with `ctxlake quarantine` \
-         or leave both.\n",
+         look the same,\nso the call is yours: retire one side with `ctxlake claims \
+         --retire <id> --reason \"...\"`, or leave both.\n",
         pairs.len(),
         rows.len()
     );
@@ -653,8 +841,18 @@ pub async fn run_duplicates(cfg: &Config) -> Result<()> {
             " · DIFFERENT TYPES"
         };
         println!("  [{:.0}% overlap{same_subject}{same_type}]", o * 100.0);
-        println!("    {} [{}] {}", &a.0[..8.min(a.0.len())], a.1, a.3);
-        println!("    {} [{}] {}", &b.0[..8.min(b.0.len())], b.1, b.3);
+        println!(
+            "    {} [{}] {}",
+            &a.0[..ID_DISPLAY_LEN.min(a.0.len())],
+            a.1,
+            a.3
+        );
+        println!(
+            "    {} [{}] {}",
+            &b.0[..ID_DISPLAY_LEN.min(b.0.len())],
+            b.1,
+            b.3
+        );
         println!();
     }
     Ok(())
@@ -672,6 +870,75 @@ mod tests {
         let a = "the theme stylesheet must be byte-identical across both repos";
         let b = "stylesheet must be byte-identical";
         assert!((super::word_overlap(a, b) - super::word_overlap(b, a)).abs() < f32::EPSILON);
+    }
+
+    /// Grooming matches on claim text because the local mirror carries no id. Exact
+    /// match only: a claim that merely *resembles* the retired one is a different
+    /// belief, and silently dropping it would be the worst possible failure here.
+    #[test]
+    fn dropping_a_retired_claim_from_the_cache_matches_exactly_and_nothing_near_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claims.json");
+        let rec = |claim: &str| {
+            serde_json::json!({
+                "claim": claim,
+                "claim_type": "convention",
+                "observed_by": "cc-01",
+                "observed_at": "2026-09-09",
+                "status": "promoted",
+            })
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![
+                rec("Dark theme is set via localStorage.setItem('oxidant.theme', 'dark')"),
+                // Word-for-word a superset of the retired claim, and a *different*
+                // belief — the qualifier is the whole content. A substring match
+                // would take this one out too, silently.
+                rec("Dark theme is set via localStorage.setItem('oxidant.theme', 'dark') only when no OS preference is set"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let dropped = drop_cached_claim(
+            dir.path(),
+            "Dark theme is set via localStorage.setItem('oxidant.theme', 'dark')",
+        )
+        .unwrap();
+        assert_eq!(dropped, 1);
+
+        let left: Vec<ClaimRecord> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(
+            left[0].claim.contains("only when no OS preference"),
+            "the near-duplicate survives: {}",
+            left[0].claim
+        );
+    }
+
+    /// No cache mirror is the normal state on a machine whose snapshot superseded it.
+    /// That must be a quiet zero, not an error that aborts a retire whose event has
+    /// already been written to the lake.
+    #[test]
+    fn dropping_from_a_cache_that_does_not_exist_is_zero_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(drop_cached_claim(dir.path(), "anything").unwrap(), 0);
+    }
+
+    /// Eight characters of a ULID matched 94 claims on a real lake, which made
+    /// `--duplicates` print ids `--retire` could not resolve. This is the guard on
+    /// the two staying in step.
+    #[test]
+    fn the_printed_id_is_long_enough_to_separate_claims_minted_together() {
+        let a = "01M2C81811Q7W4XRZ80GCH1XD1";
+        let b = "01M2C8181MT7RW4XRZ80GCH1XD";
+        assert_ne!(
+            &a[..ID_DISPLAY_LEN],
+            &b[..ID_DISPLAY_LEN],
+            "two ULIDs from the same millisecond must not print identically"
+        );
     }
 
     #[test]

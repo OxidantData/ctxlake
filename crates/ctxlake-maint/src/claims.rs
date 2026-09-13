@@ -402,6 +402,36 @@ pub fn fold<'a>(events: impl IntoIterator<Item = &'a ClaimEvent>) -> BTreeMap<St
 /// this key never existed before this call and never will again, so there is no
 /// "materialize once, CAS forever after" split to make. Two proposals never
 /// collide on the same key because each mints its own ULID.
+/// Append a `Retired` event, removing a claim from what agents read.
+///
+/// The event log's own mechanism, not a delete: `claims/events/` is append-only and
+/// the fold is the truth, so retiring is a statement about a claim rather than the
+/// erasure of one. The proposal, its evidence and the reason it was retired all remain
+/// legible afterwards — which matters when the reason turns out to be wrong.
+///
+/// `retired_by` is recorded as the observer so a human grooming the lake is
+/// distinguishable from the gate expiring a claim on its own.
+pub async fn append_retired(
+    store: &dyn ObjectStore,
+    date: &str,
+    retired_by: &str,
+    claim_id: &str,
+    reason: &str,
+    at: &str,
+) -> Result<(), StoreError> {
+    let ulid = ctxlake_core::envelope::next_event_id();
+    let path = ctxlake_store::layout::claim_event(date, retired_by, &ulid);
+    let payload = PutPayload::from(serde_json::to_vec(&ClaimEvent::Retired {
+        claim_id: claim_id.to_string(),
+        at: at.to_string(),
+        reason: reason.to_string(),
+    })?);
+    store
+        .put_opts(&path, payload, PutMode::Create.into())
+        .await?;
+    Ok(())
+}
+
 pub async fn append_proposed(
     store: &dyn ObjectStore,
     date: &str,

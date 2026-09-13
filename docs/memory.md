@@ -243,6 +243,39 @@ A peer's belief must never reach a context window as bare fact:
 An agent reading *"1 session, contested"* behaves differently from one reading a bare
 assertion. That difference is the entire safety margin, and it costs a few tokens.
 
+## Inspecting and grooming each tier
+
+Memory is only trustworthy if you can look at it. Each tier has its own way in, and they
+compose: the claim tells you what the fleet believes, the session tells you what actually
+happened, and the link between them runs both ways.
+
+| Tier | What it holds | Look at it with |
+|---|---|---|
+| 0 | Session digests — files, commands, exit codes, friction, cost | `ctxlake sessions`, `ctxlake sessions <id>` |
+| 1 | Agent handoff notes | not wired yet; nothing writes one |
+| 2 | Claims | `ctxlake claims --status candidate --explain`, `--status contested`, `--status promoted` |
+
+Grooming is the same two commands:
+
+```sh
+ctxlake claims --duplicates                        # pairs that may be one belief
+ctxlake sessions <id>                              # the evidence, and every claim on it
+ctxlake claims --retire <claim_id> --reason "..."  # remove one from what agents read
+```
+
+`--retire` appends a `Retired` event rather than deleting anything. The claim stops being
+read at the next `ctxlake maint` pass; the record of having believed it, and your reason
+for stopping, stays in `claims/events/` — see [Reference](reference.md) for the full
+shape.
+
+A worked pass: `--duplicates` surfaces two claims about the same theme setting at 73%
+overlap. `ctxlake sessions` on the session each cites shows one of them also records the
+browser context it applies in. Retire the other, naming the survivor in the reason.
+
+**Retiring is not the same as quarantining.** `--retire` acts on one claim you have
+judged wrong or redundant. `ctxlake quarantine` acts on an *agent* whose claims you no
+longer trust as a class.
+
 ## Quarantine — the kill switch
 
 ```sh

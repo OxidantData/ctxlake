@@ -21,6 +21,7 @@ pub mod claude_code;
 pub mod cursor;
 pub mod hermes;
 mod json_util;
+pub mod mcp;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -246,6 +247,58 @@ pub fn read_if_exists(path: &Path) -> Result<Option<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
+}
+
+/// Where this runtime registers an MCP server, when it has such a file.
+///
+/// `None` for Hermes: its MCP configuration lives inside `config.yaml` under a schema
+/// no live install has been available to verify, and guessing a config shape from
+/// documentation is exactly how the `tool_result` bug happened.
+pub fn mcp_config_path(runtime: Runtime) -> Option<PathBuf> {
+    match runtime {
+        Runtime::ClaudeCode => Some(crate::paths::claude_code_mcp_path()),
+        Runtime::Cursor => Some(crate::paths::cursor_mcp_path()),
+        Runtime::Hermes => None,
+    }
+}
+
+/// The change that registers `ctxlake mcp` with `runtime`.
+///
+/// A second [`ChangeSet`] rather than folding into [`plan_install`], because it lands
+/// in a *different file*: Claude Code's hooks live in `~/.claude/settings.json` and its
+/// MCP servers in `~/.claude.json`. Keeping them separate means a failure to write one
+/// does not roll back or obscure the other, and `--dry-run` shows both diffs.
+pub fn plan_mcp_install(
+    runtime: Runtime,
+    fleet_id: &str,
+    agent_id: &str,
+) -> Result<Option<ChangeSet>> {
+    let Some(path) = mcp_config_path(runtime) else {
+        return Ok(None);
+    };
+    let before = read_if_exists(&path)?;
+    let after = mcp::install(before.as_deref(), fleet_id, agent_id)?;
+    Ok(Some(ChangeSet {
+        path,
+        before,
+        after,
+    }))
+}
+
+/// Remove exactly what [`plan_mcp_install`] added.
+pub fn plan_mcp_uninstall(runtime: Runtime) -> Result<Option<ChangeSet>> {
+    let Some(path) = mcp_config_path(runtime) else {
+        return Ok(None);
+    };
+    let Some(before) = read_if_exists(&path)? else {
+        return Ok(None);
+    };
+    let after = mcp::uninstall(Some(&before))?;
+    Ok(Some(ChangeSet {
+        path,
+        before: Some(before),
+        after,
+    }))
 }
 
 /// Apply a computed [`ChangeSet`]: write a `.bak` of whatever is currently on disk

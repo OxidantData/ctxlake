@@ -77,6 +77,15 @@ pub struct RuntimeReport {
     pub exists: bool,
     pub wired: bool,
     pub foreign_entries: usize,
+    /// Whether `ctxlake mcp` is registered with this runtime.
+    ///
+    /// Separate from `wired`, which is about hooks, because the two are different
+    /// directions and only one of them was ever connected. Hooks let ctxlake *tell* an
+    /// agent things at session start; MCP is the only way an agent can *ask* —
+    /// `memory_search`, `fleet_history`, `fleet_status`. A machine with hooks and no
+    /// MCP server has a working belief layer that nothing can query, which is what a
+    /// real install turned out to be.
+    pub mcp_wired: bool,
 }
 
 pub struct LlmReport {
@@ -261,6 +270,17 @@ impl Report {
                 state,
                 r.path.display()
             );
+            // Said only when hooks are wired: "no MCP server" on a runtime ctxlake
+            // does not touch at all is noise, not a finding.
+            if r.wired && !r.mcp_wired && crate::hooks::mcp_config_path(r.runtime).is_some() {
+                println!(
+                    "               -> no MCP server registered: this agent can be told \
+                     things but cannot ask.\n                  memory_search, \
+                     fleet_history and fleet_status are unreachable. Re-run \
+                     `ctxlake install {}`.",
+                    r.runtime.name()
+                );
+            }
         }
         if self.runtimes.iter().any(|r| r.exists && !r.wired) {
             println!("  (coexistence is fine — run `ctxlake install <runtime>` to wire one in)");
@@ -496,7 +516,8 @@ pub async fn run(cfg: &Config) -> Result<Report> {
                     // case for now (see `MaintReport::last_snapshot_age`'s doc) and
                     // any other error just leaves this `None` rather than failing
                     // the whole report over a display-only field.
-                    let snapshot_key = full_path(ctx, &ctxlake_store::layout::snapshot_latest());
+                    let snapshot_key =
+                        full_path(ctx, &ctxlake_store::layout::snapshot_latest(&cfg.fleet_id));
                     if let Ok(meta) = ctx.store.head(&snapshot_key).await {
                         if let Ok(age) =
                             SystemTime::now().duration_since(SystemTime::from(meta.last_modified))
@@ -521,12 +542,17 @@ pub async fn run(cfg: &Config) -> Result<Report> {
                 ctxlake_wired: false,
                 foreign_entries: 0,
             });
+            let mcp_wired = crate::hooks::mcp_config_path(runtime)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|t| crate::hooks::mcp::is_wired(&t))
+                .unwrap_or(false);
             RuntimeReport {
                 runtime,
                 path,
                 exists: status.config_exists,
                 wired: status.ctxlake_wired,
                 foreign_entries: status.foreign_entries,
+                mcp_wired,
             }
         })
         .collect();
@@ -1058,6 +1084,7 @@ mod tests {
             exists: false,
             wired: false,
             foreign_entries: 0,
+            mcp_wired: false,
         }];
         assert!(report.blocks_service_install().is_empty());
     }

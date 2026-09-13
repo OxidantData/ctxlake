@@ -1068,9 +1068,100 @@ struct RawExtraction {
 /// silently stored — docs/memory.md's "structured output" rule.
 pub fn parse_claims_response(raw: &str) -> Result<Vec<RawClaim>, ExtractError> {
     let candidate = unwrap_json_payload(raw);
-    let parsed: RawExtraction = serde_json::from_str(candidate)
-        .map_err(|e| ExtractError::MalformedResponse(e.to_string()))?;
-    Ok(parsed.claims)
+    serde_json::from_str::<RawExtraction>(candidate)
+        .map(|p| p.claims)
+        .map_err(|e| {
+            // The parser error alone said "expected value at line 1 column 1" and
+            // nothing about what arrived — which on a real lake meant a failing
+            // extraction that could not be diagnosed without reproducing it by hand.
+            // A bounded excerpt of the actual response is the difference between
+            // "the model refused" and "the envelope shape changed".
+            ExtractError::MalformedResponse(format!("{e}; response began: {}", excerpt(raw)))
+        })
+}
+
+/// A short, single-line, quoted excerpt of a model response, for an error message.
+///
+/// Bounded and flattened because this lands in a log an operator reads: a full
+/// response can be kilobytes, and a raw newline turns one error into forty lines.
+fn excerpt(raw: &str) -> String {
+    const MAX: usize = 200;
+    let flat: String = raw
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX)
+        .collect();
+    if raw.trim().chars().count() > MAX {
+        format!("{flat:?}…")
+    } else {
+        format!("{flat:?}")
+    }
+}
+
+/// Whether a rendered transcript carries enough for a claim to be grounded in.
+///
+/// Three rounds of real failures shaped this, each one the model telling us plainly
+/// that we had sent it nothing:
+///
+/// 1. Sessions rendering to the `session_id:` header alone.
+/// 2. Sessions rendering to a page of `[toolu_x] tool:Read` — ids and tool names, no
+///    inputs, no results, no evidence of anything.
+/// 3. A session whose entire content was one prompt reading `ok`.
+///
+/// The third is why this counts characters rather than lines. "Is there any text" is
+/// the wrong question; "is there enough text that a claim could cite it" is the right
+/// one, and `ok` answers no. A model handed that replies, correctly and at length,
+/// that it cannot see a transcript — then fails to parse as JSON.
+///
+/// The threshold errs toward attempting. A skipped session is revisitable, since
+/// `EXTRACTOR_VERSION` makes every already-marked session eligible again on the next
+/// bump; a wasted model call is spent for good. [`MIN_SUBSTANTIVE_CHARS`] is set below
+/// the length of a single real shell command, so "one `cargo test --workspace` and
+/// nothing else" is still extracted.
+fn transcript_is_empty(prompt: &str) -> bool {
+    substantive_chars(prompt) < MIN_SUBSTANTIVE_CHARS
+}
+
+/// Below this much actual content, there is nothing for a claim to cite.
+///
+/// Calibrated against real content at both ends, not chosen round:
+///
+/// - The session that failed on the live lake contained one prompt reading `ok`. It
+///   scores **2**, along with every other acknowledgement token — `yes`, `go`,
+///   `thanks`, `continue` — which is what these sessions are made of.
+/// - `staging listens on port 2222` scores **28**, and is `docs/memory.md`'s own
+///   example of a good `environment` claim. Anything that states something clears this
+///   comfortably.
+///
+/// A first attempt used 40 and would have skipped that example. This module's existing
+/// tests caught it, which is the argument for the threshold living beside them.
+///
+/// The asymmetry favours attempting: a skipped session becomes eligible again on the
+/// next `EXTRACTOR_VERSION` bump, while a wasted model call is spent for good.
+const MIN_SUBSTANTIVE_CHARS: usize = 12;
+
+/// Characters of real content in a rendered transcript.
+///
+/// Structure does not count: the `session_id:` header, the `[id]` markers and a bare
+/// `tool:NAME` are scaffolding the renderer adds, and a page of them is still an empty
+/// session.
+fn substantive_chars(prompt: &str) -> usize {
+    prompt
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("session_id:"))
+        .map(|l| {
+            let after_id = l.split_once("] ").map(|(_, rest)| rest).unwrap_or(l);
+            match after_id.strip_prefix("tool:") {
+                // The tool's name is scaffolding; its input and output are evidence.
+                Some(tail) => tail
+                    .split_once(' ')
+                    .map(|(_, args)| args.trim().len())
+                    .unwrap_or(0),
+                None => after_id.trim().len(),
+            }
+        })
+        .sum()
 }
 
 /// Pull the JSON object out of a response that may have been dressed up.
@@ -1289,8 +1380,8 @@ pub struct SessionTranscript {
 /// returning a more useful error to the caller, and a failure to clean up costs one
 /// session's claims, not correctness. The next run simply finds the marker and skips —
 /// the same outcome as before this existed.
-async fn release_extraction_marker(store: &dyn ObjectStore, session_id: &str) {
-    let key = ctxlake_store::layout::claims_extracted(session_id);
+async fn release_extraction_marker(store: &dyn ObjectStore, fleet_id: &str, session_id: &str) {
+    let key = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
     if let Err(e) = store.delete(&key).await {
         tracing::warn!(
             session_id,
@@ -1302,21 +1393,66 @@ async fn release_extraction_marker(store: &dyn ObjectStore, session_id: &str) {
 
 pub async fn mark_extracted_if_new(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     session_id: &str,
 ) -> Result<bool, StoreError> {
-    let path = ctxlake_store::layout::claims_extracted(session_id);
+    let path = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
+    // Create-if-absent is still what makes two hosts extract a session exactly once.
+    // The body is what makes a *later build* able to revisit it — see
+    // `is_already_extracted`.
+    let body = serde_json::json!({ "extractor_version": EXTRACTOR_VERSION });
+    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     match store
         .put_opts(
             &path,
-            PutPayload::from_static(b"{}"),
+            PutPayload::from(bytes.clone()),
             PutMode::Create.into(),
         )
         .await
     {
         Ok(_) => Ok(true),
-        Err(OsError::AlreadyExists { .. }) => Ok(false),
+        Err(OsError::AlreadyExists { .. }) => {
+            // Present, but possibly from an older extractor. `is_already_extracted`
+            // has already decided whether this session is due for a re-run; if it let
+            // us get here, the marker is stale and claiming it means overwriting.
+            //
+            // A plain overwrite rather than CAS: two hosts racing to re-extract the
+            // same stale session both do the work and both append proposals, which
+            // `find_existing_claim_id` already folds onto the same `claim_id`. The
+            // cost is a duplicated model call, not a corrupted lake.
+            if stored_extractor_version(store, fleet_id, session_id).await < EXTRACTOR_VERSION {
+                store.put(&path, PutPayload::from(bytes)).await?;
+                return Ok(true);
+            }
+            Ok(false)
+        }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Which extractor produced the claims for this session, or 0 when unknown.
+///
+/// 0 covers both "no marker" and "a marker from before markers carried a version",
+/// which are the same thing for this purpose: older than anything current.
+async fn stored_extractor_version(
+    store: &dyn ObjectStore,
+    fleet_id: &str,
+    session_id: &str,
+) -> u32 {
+    let path = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
+    let Ok(res) = store.get(&path).await else {
+        return 0;
+    };
+    let Ok(bytes) = res.bytes().await else {
+        return 0;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("extractor_version")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0) as u32
 }
 
 /// Read-only: has `session_id` already been extracted? A cheap existence check
@@ -1330,15 +1466,45 @@ pub async fn mark_extracted_if_new(
 /// correctness.
 pub async fn is_already_extracted(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     session_id: &str,
 ) -> Result<bool, StoreError> {
-    let path = ctxlake_store::layout::claims_extracted(session_id);
+    let path = ctxlake_store::layout::claims_extracted(fleet_id, session_id);
     match store.get(&path).await {
-        Ok(_) => Ok(true),
+        Ok(res) => {
+            // **Done by *which* extractor**, not merely done.
+            //
+            // Existence alone meant a session was finished forever. A successful
+            // `{"claims": []}` writes the marker just as a productive run does, so 37
+            // sessions on a live lake were permanently marked done having produced
+            // nothing — and no improvement to the prompt, the transcript, or the
+            // provider could ever have been measured against them. Short of deleting
+            // keys by hand, the only evidence the extractor had was sessions that
+            // happened not to exist yet.
+            let version = res
+                .bytes()
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| {
+                    v.get("extractor_version")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                .unwrap_or(0) as u32;
+            Ok(version >= EXTRACTOR_VERSION)
+        }
         Err(OsError::NotFound { .. }) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
+
+/// Bumped whenever a change should make already-extracted sessions worth revisiting:
+/// a different prompt, a different transcript shape, a fixed parser.
+///
+/// Not bumped for a provider swap or a model change — those are configuration, and
+/// re-extracting an entire lake because someone edited `ctxlake.toml` would be a
+/// surprising and expensive thing for a config edit to do.
+pub const EXTRACTOR_VERSION: u32 = 2;
 
 /// Find every sealed session under `sessions/` by locating `_SEALED` markers.
 /// Whether a given one has already been extracted is [`mark_extracted_if_new`]'s
@@ -1431,15 +1597,52 @@ pub async fn load_transcript(
 /// The extraction system prompt: the stable prefix docs/memory.md's
 /// "prompt caching" paragraph describes — byte-identical across every session,
 /// so a caching-aware provider only pays for it once.
-pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You extract atomic, evidence-backed claims from a coding-agent session transcript.
+pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You extract atomic, evidence-backed claims from a coding-agent session transcript, for a memory another agent will read weeks from now in a different session.
+
 Respond with ONLY a JSON object of the shape:
 {"claims": [{"claim": string, "claim_type": "environment"|"convention"|"outcome"|"preference"|"hypothesis", "subject": string, "evidence": [{"session_id": string, "message_id": string}]}]}
-Every claim MUST cite at least one (session_id, message_id) pair that appears in the transcript's own [message_id] markers. Never invent a citation. If nothing in the transcript supports a durable claim, return {"claims": []}."#;
+
+THE FIVE TYPES. Choose deliberately; each is promoted under different rules.
+
+- "convention": a durable rule about how this codebase or team works, true before this session and after it.
+  e.g. "this repo uses `just`, not `make`" / "CI fails unless RUSTFLAGS=-D warnings is set"
+  The most valuable type. Prefer it whenever the evidence supports one.
+
+- "environment": a fact about the world outside the code — a host, port, service, credential mechanism, version.
+  e.g. "staging SSH listens on 2222" / "the MinIO container rejects If-None-Match: *"
+
+- "outcome": one specific thing that happened, immutable and timestamped.
+  e.g. "the Glue migration passed CI at abc123"
+  Use SPARINGLY. A structural digest of every session already records which files were
+  touched, which commands ran and how they exited. An "outcome" that restates that is
+  duplicate noise in a memory someone pays context-window tokens to read. Claim an
+  outcome only when it is surprising or consequential later — a migration that landed, a
+  root cause found — never merely to narrate the session.
+
+- "preference": how a human wants to be worked with. e.g. "prefers terse output"
+
+- "hypothesis": a suspected but unconfirmed cause. e.g. "the flake is a colima scheduling artifact"
+  Label honestly rather than promoting a guess to a fact.
+
+RULES.
+- Every claim MUST cite at least one (session_id, message_id) pair that appears in the transcript's own [message_id] markers. Never invent a citation.
+- "subject" is the thing the claim is about ("ci", "oxidant-loom", "staging"), so later claims about the same subject can be compared.
+- Atomic: one assertion per claim.
+- Do not claim what the transcript does not show. If nothing here is worth another agent's attention weeks from now, return {"claims": []} — that is a correct answer, not a failure."#;
 
 #[derive(Debug, Clone, Default)]
 pub struct ExtractOutcome {
     pub session_id: String,
     pub claims_proposed: usize,
+    /// How many claims the model returned, before any were dropped.
+    ///
+    /// Reported separately from `claims_proposed` because the two failures look
+    /// identical without it. "The model found nothing worth claiming" and "the model
+    /// answered and we discarded every word of it" both printed as `0 claim(s)
+    /// proposed`, and they call for opposite fixes — a better prompt versus a bug in
+    /// `claim_from_raw`. A claim is dropped silently for an unparseable `claim_type`,
+    /// or for citing a message id that does not resolve, and neither leaves a trace.
+    pub claims_returned: usize,
     pub skipped_already_extracted: bool,
 }
 
@@ -1454,6 +1657,7 @@ pub async fn extract_session(
     provider: &dyn Provider,
     session: &SessionTranscript,
     date: &str,
+    fleet_id: &str,
 ) -> Result<ExtractOutcome, ExtractError> {
     if !tier2_enabled(cfg) {
         return Ok(ExtractOutcome {
@@ -1461,7 +1665,7 @@ pub async fn extract_session(
             ..Default::default()
         });
     }
-    if !mark_extracted_if_new(store, &session.session_id).await? {
+    if !mark_extracted_if_new(store, fleet_id, &session.session_id).await? {
         return Ok(ExtractOutcome {
             session_id: session.session_id.clone(),
             skipped_already_extracted: true,
@@ -1474,6 +1678,31 @@ pub async fn extract_session(
         .as_ref()
         .expect("tier2_enabled just confirmed cfg.batch.is_some()");
     let transcript_text = build_fenced_transcript(&session.envelopes);
+
+    // **A session with nothing in it is not worth a model call.**
+    //
+    // `build_fenced_transcript` renders `content` and tool calls; a session that
+    // produced neither — a window opened and closed, a `--resume` that never ran
+    // anything — renders to the `session_id:` header and nothing else. Sending that
+    // asks a model to extract claims from an empty document, and it answers, at
+    // length, that it cannot see a transcript. Ten of those in one pass on a real
+    // lake: ten paid calls, ten parse failures, and a summary line dominated by a
+    // failure that was never the model's fault.
+    //
+    // Left marked extracted rather than released, because there is nothing a later
+    // pass would do differently — the session is sealed and its content is final.
+    if transcript_is_empty(&transcript_text) {
+        tracing::debug!(
+            session_id = %session.session_id,
+            "no transcript content to extract from; skipping the model call"
+        );
+        return Ok(ExtractOutcome {
+            session_id: session.session_id.clone(),
+            claims_proposed: 0,
+            claims_returned: 0,
+            skipped_already_extracted: false,
+        });
+    }
     let request = CompletionRequest {
         system_prompt: EXTRACTION_SYSTEM_PROMPT.to_string(),
         user_prompt: transcript_text,
@@ -1492,14 +1721,14 @@ pub async fn extract_session(
     let raw_response = match provider.complete(&request).await {
         Ok(r) => r,
         Err(e) => {
-            release_extraction_marker(store, &session.session_id).await;
+            release_extraction_marker(store, fleet_id, &session.session_id).await;
             return Err(e);
         }
     };
     let raw_claims = match parse_claims_response(&raw_response) {
         Ok(c) => c,
         Err(e) => {
-            release_extraction_marker(store, &session.session_id).await;
+            release_extraction_marker(store, fleet_id, &session.session_id).await;
             return Err(e);
         }
     };
@@ -1522,6 +1751,7 @@ pub async fn extract_session(
     let existing = crate::claims::fold(existing_events.iter());
 
     let mut proposed = 0usize;
+    let returned = raw_claims.len();
     for raw in raw_claims {
         if let Some(claim) =
             claim_from_raw(raw, &session.agent_id, &observed_at, &resolvable, &existing)
@@ -1530,9 +1760,19 @@ pub async fn extract_session(
             proposed += 1;
         }
     }
+    if returned > proposed {
+        tracing::warn!(
+            session_id = %session.session_id,
+            returned,
+            kept = proposed,
+            "extraction dropped claims: an unparseable claim_type, or a citation that \
+             resolves to no captured message"
+        );
+    }
     Ok(ExtractOutcome {
         session_id: session.session_id.clone(),
         claims_proposed: proposed,
+        claims_returned: returned,
         skipped_already_extracted: false,
     })
 }
@@ -1541,6 +1781,19 @@ pub async fn extract_session(
 pub struct ExtractRunSummary {
     pub sessions_processed: usize,
     pub claims_proposed: usize,
+    /// Claims the model returned across all sessions, before any were dropped. See
+    /// [`ExtractOutcome::claims_returned`] — without it, a prompt that produces nothing
+    /// and a parser that discards everything report the same number.
+    pub claims_returned: usize,
+    /// Sessions whose extraction failed and will be retried next pass.
+    ///
+    /// Counted rather than propagated: a failure here used to abort the whole
+    /// maintenance chain, taking compaction, digests, the gate and the snapshot with
+    /// it — none of which involve a model.
+    pub sessions_failed: usize,
+    /// The most recent failure, for the cycle summary. One example beats a count with
+    /// no detail, and the full list belongs in the log rather than in one line.
+    pub last_error: Option<String>,
 }
 
 /// The full Tier 2 pass: find sealed, not-yet-extracted sessions and extract
@@ -1576,21 +1829,54 @@ pub async fn run(
         if summary.sessions_processed >= limit {
             break;
         }
-        if is_already_extracted(store, &session_ref.session_id).await? {
+        if is_already_extracted(store, fleet_id, &session_ref.session_id).await? {
             continue;
         }
-        let transcript = load_transcript(store, &session_ref).await?;
+        let transcript = match load_transcript(store, &session_ref).await {
+            Ok(t) => t,
+            Err(e) => {
+                summary.sessions_failed += 1;
+                tracing::warn!(session_id = %session_ref.session_id, error = %e,
+                    "could not load a session for extraction; continuing");
+                continue;
+            }
+        };
         let date = transcript
             .envelopes
             .first()
             .and_then(|e| e.emitted_at.get(0..10))
             .unwrap_or("1970-01-01")
             .to_string();
-        let outcome = extract_session(store, cfg, provider, &transcript, &date).await?;
-        if !outcome.skipped_already_extracted {
-            summary.sessions_processed += 1;
+
+        // **One session's failure must not end the pass.**
+        //
+        // This was `?`, and a single malformed model response therefore aborted not
+        // just extraction but the entire maintenance chain — `run::run` propagates it
+        // before compaction's siblings, the gate and the snapshot ever run. Seen the
+        // first time retry was enabled: 37 sessions became eligible again, the second
+        // one came back as something that was not JSON, and the whole cycle died with
+        // it. Every session after it stayed unextracted, and the digests and snapshot
+        // that had nothing to do with a model were skipped too.
+        //
+        // Exactly the shape already fixed twice at the daemon and cycle boundaries: an
+        // optional step taking mandatory ones down with it. `extract_session` releases
+        // its own marker on failure, so a session that fails here is retried next pass
+        // rather than being marked done.
+        match extract_session(store, cfg, provider, &transcript, &date, fleet_id).await {
+            Ok(outcome) => {
+                if !outcome.skipped_already_extracted {
+                    summary.sessions_processed += 1;
+                }
+                summary.claims_proposed += outcome.claims_proposed;
+                summary.claims_returned += outcome.claims_returned;
+            }
+            Err(e) => {
+                summary.sessions_failed += 1;
+                summary.last_error = Some(e.to_string());
+                tracing::warn!(session_id = %session_ref.session_id, error = %e,
+                    "extraction failed for one session; continuing with the rest");
+            }
         }
-        summary.claims_proposed += outcome.claims_proposed;
     }
     Ok(summary)
 }
@@ -1722,6 +2008,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -1748,6 +2035,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -1983,6 +2271,43 @@ mod tests {
     }
 
     // ---- structured output parsing ----
+
+    #[test]
+    fn the_prompt_defines_every_type_the_parser_will_accept() {
+        // The prompt named the five types in a JSON schema line and defined none of
+        // them. A model asked for "atomic, evidence-backed claims" with no notion of
+        // what the labels mean picks the one that fits "here is what I did" — and on a
+        // real lake every single promoted claim came back `outcome`, which is the one
+        // type a structural digest already records for free.
+        for t in [
+            "environment",
+            "convention",
+            "outcome",
+            "preference",
+            "hypothesis",
+        ] {
+            assert!(
+                EXTRACTION_SYSTEM_PROMPT.contains(&format!("\"{t}\": ")),
+                "the prompt must define `{t}`, not merely list it"
+            );
+        }
+        // And it must warn against the duplication, or the mix drifts straight back.
+        assert!(
+            EXTRACTION_SYSTEM_PROMPT.contains("structural digest"),
+            "the prompt must say why an `outcome` restating the digest is noise"
+        );
+        // Every type the prompt offers must be one the parser accepts, or the model is
+        // invited to produce claims that are then silently dropped.
+        for t in [
+            "environment",
+            "convention",
+            "outcome",
+            "preference",
+            "hypothesis",
+        ] {
+            assert!(crate::claims::ClaimType::parse(t).is_some(), "{t}");
+        }
+    }
 
     #[test]
     fn parse_claims_response_rejects_malformed_json_as_a_parse_error() {
@@ -2584,6 +2909,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -2592,7 +2918,7 @@ mod tests {
         // No idempotency marker should even be written — a true no-op touches
         // the store not at all.
         let marker_exists = store
-            .get(&ctxlake_store::layout::claims_extracted("s1"))
+            .get(&ctxlake_store::layout::claims_extracted("oxidant", "s1"))
             .await
             .is_ok();
         assert!(!marker_exists);
@@ -2601,11 +2927,69 @@ mod tests {
     // ---- idempotency: mark_extracted_if_new ----
 
     #[tokio::test]
+    async fn a_session_extracted_by_an_older_extractor_is_offered_again() {
+        // The gap Phase 4 closes. A successful `{"claims": []}` writes the marker just
+        // as a productive run does, so 37 sessions on a live lake were permanently
+        // marked done having produced nothing — and no improvement to the prompt, the
+        // transcript or the parser could ever be measured against them. Short of
+        // deleting keys by hand, the only evidence a new extractor had was sessions
+        // that happened not to exist yet.
+        let store = object_store::memory::InMemory::new();
+        let key = ctxlake_store::layout::claims_extracted("oxidant", "s1");
+
+        // A marker from before markers carried a version — the shape every existing
+        // one in a real lake has.
+        store
+            .put(&key, PutPayload::from_static(b"{}"))
+            .await
+            .unwrap();
+
+        assert!(
+            !is_already_extracted(&store, "oxidant", "s1").await.unwrap(),
+            "a versionless marker must not count as done for the current extractor"
+        );
+        assert!(
+            mark_extracted_if_new(&store, "oxidant", "s1")
+                .await
+                .unwrap(),
+            "and re-claiming it must succeed, not collide with itself"
+        );
+
+        // Having re-claimed it at the current version, it is done again.
+        assert!(
+            is_already_extracted(&store, "oxidant", "s1").await.unwrap(),
+            "a current marker must still skip, or every cycle re-extracts everything"
+        );
+        assert!(!mark_extracted_if_new(&store, "oxidant", "s1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn two_fleets_do_not_share_extraction_markers() {
+        // Same class as the roster and the snapshot pointer: `claims/extracted/<id>`
+        // was flat, so one fleet extracting a session marked it done for the other.
+        let store = object_store::memory::InMemory::new();
+        assert!(mark_extracted_if_new(&store, "ours", "s1").await.unwrap());
+        assert!(
+            mark_extracted_if_new(&store, "theirs", "s1").await.unwrap(),
+            "another fleet's marker must not claim this one's session"
+        );
+        assert!(is_already_extracted(&store, "ours", "s1").await.unwrap());
+        assert!(is_already_extracted(&store, "theirs", "s1").await.unwrap());
+        assert!(!is_already_extracted(&store, "third", "s1").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn mark_extracted_if_new_claims_exactly_once() {
         let store = object_store::memory::InMemory::new();
-        assert!(mark_extracted_if_new(&store, "s1").await.unwrap());
+        assert!(mark_extracted_if_new(&store, "oxidant", "s1")
+            .await
+            .unwrap());
         assert!(
-            !mark_extracted_if_new(&store, "s1").await.unwrap(),
+            !mark_extracted_if_new(&store, "oxidant", "s1")
+                .await
+                .unwrap(),
             "a second caller for the same session must not also claim it"
         );
     }
@@ -2626,7 +3010,7 @@ mod tests {
             for _ in 0..8 {
                 let store = store.clone();
                 handles.push(tokio::spawn(async move {
-                    mark_extracted_if_new(store.as_ref(), "sess-contended")
+                    mark_extracted_if_new(store.as_ref(), "oxidant", "sess-contended")
                         .await
                         .unwrap()
                 }));
@@ -2658,6 +3042,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -2670,6 +3055,7 @@ mod tests {
             &TriggerSensitiveProvider,
             &session,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -2848,8 +3234,12 @@ mod tests {
         seal_one_session(&store, "2026-09-01", "s1").await;
         seal_one_session(&store, "2026-09-02", "s2").await;
         seal_one_session(&store, "2026-09-03", "s3").await;
-        mark_extracted_if_new(&store, "s1").await.unwrap();
-        mark_extracted_if_new(&store, "s2").await.unwrap();
+        mark_extracted_if_new(&store, "oxidant", "s1")
+            .await
+            .unwrap();
+        mark_extracted_if_new(&store, "oxidant", "s2")
+            .await
+            .unwrap();
 
         let cfg = SummarizeConfig {
             mode: SummarizeMode::Shadow,
@@ -2873,7 +3263,7 @@ mod tests {
              for real, not merely skipped"
         );
         // s3 specifically — not s1 or s2 again — must be the one newly marked.
-        assert!(is_already_extracted(&store, "s3").await.unwrap());
+        assert!(is_already_extracted(&store, "oxidant", "s3").await.unwrap());
     }
 
     #[test]
@@ -2922,6 +3312,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_session_costs_no_model_call() {
+        // Ten of these in one real pass: a window opened and closed with no prompt and
+        // no tool call. Each was a paid call that came back, at length, explaining the
+        // model could not see a transcript — then failed to parse. The failure was
+        // never the model's.
+        struct MustNotBeCalled(std::sync::atomic::AtomicUsize);
+        impl Provider for MustNotBeCalled {
+            fn complete<'a>(
+                &'a self,
+                _req: &'a CompletionRequest,
+            ) -> futures::future::BoxFuture<'a, Result<String, ExtractError>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(r#"{"claims":[]}"#.to_string()) })
+            }
+        }
+
+        let store = object_store::memory::InMemory::new();
+        let provider = MustNotBeCalled(std::sync::atomic::AtomicUsize::new(0));
+        // Session lifecycle only: no content, no tool.
+        let session = SessionTranscript {
+            session_id: "empty-1".into(),
+            agent_id: "cc-01".into(),
+            envelopes: vec![
+                Envelope::new(
+                    "oxidant",
+                    "cc-01",
+                    Runtime::ClaudeCode,
+                    "empty-1",
+                    EventType::SessionStart,
+                    "2026-09-11T10:00:00.000Z",
+                ),
+                Envelope::new(
+                    "oxidant",
+                    "cc-01",
+                    Runtime::ClaudeCode,
+                    "empty-1",
+                    EventType::SessionEnd,
+                    "2026-09-11T10:05:00.000Z",
+                ),
+            ],
+        };
+
+        let out = extract_session(
+            &store,
+            &shadow_cfg(),
+            &provider,
+            &session,
+            "2026-09-11",
+            "oxidant",
+        )
+        .await
+        .expect("an empty session is not an error");
+
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the model must not be called with an empty transcript"
+        );
+        assert_eq!(out.claims_proposed, 0);
+        assert!(
+            is_already_extracted(&store, "oxidant", "empty-1")
+                .await
+                .unwrap(),
+            "and it must stay marked done — a later pass would do nothing different"
+        );
+    }
+
+    #[test]
+    fn transcript_emptiness_is_measured_in_content_not_lines() {
+        // Each case below is a real failing session from the live lake, in the order
+        // they were found. Every one of them made the model reply, correctly, that it
+        // had been sent no transcript — and then fail to parse as JSON.
+
+        // Round 1: the header alone.
+        assert!(transcript_is_empty("session_id: s1\n"));
+        assert!(transcript_is_empty(""));
+
+        // Round 2: ids and tool names, no inputs, no results.
+        assert!(transcript_is_empty(
+            "session_id: s1\n[toolu_a] tool:Read\n[toolu_b] tool:Glob\n[toolu_c] tool:Read\n"
+        ));
+
+        // Round 3: one prompt reading `ok`. This is why the check counts characters —
+        // "is there any text" says yes, and there is still nothing to cite.
+        assert!(transcript_is_empty("session_id: s1\n[01M2B] ok\n"));
+
+        // And what must still be attempted. `staging listens on port 2222` is
+        // docs/memory.md's own example of a good environment claim and scores 28; an
+        // earlier threshold of 40 would have skipped it, and this suite caught that.
+        assert!(!transcript_is_empty(
+            "session_id: s1\n[toolu_a] tool:Bash input={\"command\":\"cargo test --workspace\"}\n"
+        ));
+        // A real prompt, with no tool call at all, can still carry a preference or a
+        // convention.
+        assert!(!transcript_is_empty(
+            "session_id: s1\n[m1] always run the full workspace test suite before pushing\n"
+        ));
+        // A failure with output and no input is exactly the session worth extracting.
+        assert!(!transcript_is_empty(
+            "session_id: s1\n[toolu_a] tool:Bash exit=1 result=error: could not compile ctxlake-maint\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_bad_session_does_not_stop_the_ones_after_it() {
+        // The exact production failure: 37 sessions became eligible for re-extraction,
+        // the second returned something that was not JSON, and the whole maintenance
+        // chain died with it — every later session unextracted, and the digests and
+        // snapshot skipped too.
+        struct OneBadApple;
+        impl Provider for OneBadApple {
+            fn complete<'a>(
+                &'a self,
+                req: &'a CompletionRequest,
+            ) -> futures::future::BoxFuture<'a, Result<String, ExtractError>> {
+                // Not an error — a *valid* response that is not JSON. That is the
+                // production failure: the model answered in prose.
+                let bad = req.user_prompt.contains("bad-1");
+                Box::pin(async move {
+                    if bad {
+                        Ok("I'm sorry, I can't help with that.".to_string())
+                    } else {
+                        Ok(r#"{"claims":[]}"#.to_string())
+                    }
+                })
+            }
+        }
+
+        let store = object_store::memory::InMemory::new();
+        for id in ["aaa-good-1", "bad-1", "zzz-good-2"] {
+            seal_one_session(&store, "2026-09-11", id).await;
+        }
+
+        let summary = run(&store, "oxidant", &shadow_cfg(), &OneBadApple)
+            .await
+            .expect("the pass must complete");
+
+        assert_eq!(summary.sessions_failed, 1, "{summary:?}");
+        assert_eq!(
+            summary.sessions_processed, 2,
+            "the sessions either side of the bad one must still be extracted: {summary:?}"
+        );
+        // And the bad one is retryable rather than marked done.
+        assert!(!is_already_extracted(&store, "oxidant", "bad-1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_response_error_says_what_actually_came_back() {
+        // "expected value at line 1 column 1" and nothing else is what a real failing
+        // extraction reported. Undiagnosable without reproducing it by hand.
+        let err = parse_claims_response("I'm sorry, I can't help with that.").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("can't help"), "must quote the response: {msg}");
+
+        // Bounded and single-line: this lands in a log an operator reads.
+        let huge = format!("nonsense {}", "x".repeat(5000));
+        let msg = parse_claims_response(&huge).unwrap_err().to_string();
+        assert!(msg.len() < 400, "{} chars", msg.len());
+        let multiline = "not json
+second line
+third line";
+        let msg = parse_claims_response(multiline).unwrap_err().to_string();
+        assert_eq!(msg.lines().count(), 1, "must stay one line: {msg}");
+    }
+
+    #[tokio::test]
     async fn a_transient_provider_failure_does_not_discard_the_session_forever() {
         // The marker is written before the provider call so two hosts cannot both pay
         // for the same session. Nothing used to release it on failure, so one 503
@@ -2936,13 +3494,26 @@ mod tests {
             session_id: "flaky-1",
         };
 
-        let first = run(&store, "oxidant", &cfg, &provider).await;
-        assert!(
-            first.is_err(),
-            "the first pass must surface the provider error"
+        // The pass *reports* the failure rather than returning `Err`. It used to
+        // propagate, and a single malformed response therefore aborted the entire
+        // maintenance chain — compaction, digests, the gate and the snapshot, none of
+        // which involve a model. Seen the first time retry was enabled on a real lake.
+        let first = run(&store, "oxidant", &cfg, &provider)
+            .await
+            .expect("one session's failure must not end the pass");
+        assert_eq!(
+            first.sessions_failed, 1,
+            "the failure must be counted, not swallowed"
         );
         assert!(
-            !is_already_extracted(&store, "flaky-1").await.unwrap(),
+            first.last_error.is_some(),
+            "and it must carry something an operator can act on"
+        );
+        assert_eq!(first.sessions_processed, 0);
+        assert!(
+            !is_already_extracted(&store, "oxidant", "flaky-1")
+                .await
+                .unwrap(),
             "a failed extraction must release its marker, or the session is lost"
         );
 
@@ -2997,6 +3568,7 @@ mod tests {
             },
             &session_a,
             "2026-09-09",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -3029,6 +3601,7 @@ mod tests {
             },
             &session_b,
             "2026-09-12",
+            "oxidant",
         )
         .await
         .unwrap();
@@ -3088,18 +3661,27 @@ mod tests {
         .await
         .unwrap();
 
+        // The half that still holds: extraction reuses the SAME `claim_id` across both
+        // sessions rather than filing two claims, so the echo is recognised as one
+        // claim with two reporters instead of two independent agreements. That is what
+        // makes `compute_independent_count` able to see through it at all.
         assert_eq!(
-            summary.promoted, 0,
-            "one observation wearing two reporters must not promote a convention \
-             (which requires 2 INDEPENDENT sessions)"
+            summary.promoted + summary.sent_to_review,
+            1,
+            "both sessions must land on one claim, not two"
         );
-        assert_eq!(summary.sent_to_review, 1);
-        assert!(
-            crate::claims::list_fleet_claims(&store)
-                .await
-                .unwrap()
-                .is_empty(),
-            "the echoed claim must never reach fleet scope"
+
+        // The half that changed: `Convention`'s independence threshold is now 1, so
+        // that single independent observation promotes. This used to assert
+        // `promoted == 0` and that the claim never reached fleet scope.
+        //
+        // The concession is documented on `gate::independent_threshold`: a bar of 2 was
+        // unreachable while nothing populates `injected_context`, so it discarded every
+        // convention rather than protecting against echoes. **Restore this assertion
+        // when `injected_context` is populated and the threshold goes back to 2.**
+        assert_eq!(
+            summary.promoted, 1,
+            "with the threshold at 1, the claim promotes; see independent_threshold"
         );
     }
 }

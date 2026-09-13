@@ -171,7 +171,7 @@ pub async fn run(
     )
     .await?;
 
-    let snapshot = snapshot::publish(store, agent_reads_enabled).await?;
+    let snapshot = snapshot::publish(store, fleet_id, agent_reads_enabled).await?;
 
     Ok(MaintenanceReport {
         dates_compacted,
@@ -362,7 +362,7 @@ mod tests {
             // One coherent snapshot at the end: the pointer names a blob that
             // actually exists and matches what both runs computed.
             let pointer = store
-                .get(&ctxlake_store::layout::snapshot_latest())
+                .get(&ctxlake_store::layout::snapshot_latest("oxidant"))
                 .await
                 .unwrap();
             let pointer: serde_json::Value =

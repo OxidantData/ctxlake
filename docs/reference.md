@@ -1,7 +1,7 @@
 # Reference — commands, configuration, MCP tools
 
 Everything here is real: this describes the shipped binaries, not a plan for them. Two
-exceptions are flagged inline — `ctxlake mcp` and `ctxlake install hermes`.
+exceptions are flagged inline — `ctxlake install hermes` wires hooks but not MCP.
 
 ## Commands
 
@@ -20,7 +20,7 @@ exceptions are flagged inline — `ctxlake mcp` and `ctxlake install hermes`.
 | `ctxlake claims` | Review candidate / contested / promoted claims |
 | `ctxlake quarantine` | Stop one agent's claims from promoting |
 | `ctxlake briefing` | Render the session briefing, or write it to the cache the hook reads |
-| `ctxlake mcp` | The stdio MCP server — **not wired up yet**, see [MCP tools](#mcp-tools) |
+| `ctxlake mcp` | The stdio MCP server; `ctxlake install` registers it with each runtime |
 
 Every subcommand accepts `--config <path>` to point at a `ctxlake.toml` elsewhere than
 `$XDG_CONFIG_HOME/ctxlake/ctxlake.toml` (or `~/.config/ctxlake/ctxlake.toml` when
@@ -506,15 +506,30 @@ api_key_env = "OLLAMA_API_KEY"   # unused locally, but still a name, never a val
 protocol revision `2024-11-05`. All three runtimes are MCP clients, so this is the one
 surface that works identically everywhere.
 
-> **The server is implemented; `ctxlake mcp` is not wired up yet.** Every tool works
-> today against the local filesystem via a real `ctxlake-mcp` binary, but `ctxlake-cli`
-> has no `mcp` subcommand and no `install` support for the config block below. To run it
-> now, build `ctxlake-mcp` and point a runtime's MCP config directly at that binary,
-> setting `CTXLAKE_FLEET_ID` / `CTXLAKE_AGENT_ID` in the config's own `env` block.
+`ctxlake install <runtime>` registers it. Claude Code's entry lands in `~/.claude.json`
+and Cursor's in `~/.cursor/mcp.json` — **different files from their hook configs**, and
+merged with the same never-clobber discipline: `~/.claude.json` is over 100 KB of live
+state on a real machine, and everything outside `mcpServers.ctxlake` survives untouched.
 
 ```json
-{ "mcpServers": { "ctxlake": { "command": "ctxlake", "args": ["mcp"] } } }
+{ "mcpServers": { "ctxlake": {
+    "command": "ctxlake", "args": ["mcp"],
+    "env": { "CTXLAKE_FLEET_ID": "myteam", "CTXLAKE_AGENT_ID": "cc-01" } } } }
 ```
+
+`fleet_id` and `agent_id` ride in `env` because the server resolves them from the
+environment exactly as the hook does, and a server started by a runtime inherits none
+of your shell's.
+
+> **Hermes is not wired.** Its MCP configuration lives in `config.yaml` under a schema
+> no live install has been available to check against, and guessing a config shape from
+> documentation is how this project's worst bug started. `ctxlake install hermes` wires
+> hooks only and says so.
+
+> **Hooks and MCP are different directions.** Hooks let ctxlake *tell* an agent things
+> at session start; MCP is the only way an agent can *ask*. A machine with hooks and no
+> MCP server has a working belief layer nothing can query — which is what every install
+> was until this landed. `ctxlake doctor` now reports it.
 
 | Tool | Shape | What it does |
 |---|---|---|

@@ -106,7 +106,10 @@ pub async fn refresh_snapshot(
         if_none_match: state.snapshot_pointer_etag.clone(),
         ..Default::default()
     };
-    let pointer_res = match store.get_opts(&layout::snapshot_latest(), opts).await {
+    let pointer_res = match store
+        .get_opts(&layout::snapshot_latest(&cfg.fleet_id), opts)
+        .await
+    {
         Ok(res) => res,
         Err(OsError::NotModified { .. }) => return Ok(false),
         // Nobody has published a snapshot yet (no `ctxlake maint` run in this
@@ -310,7 +313,7 @@ mod tests {
         let pointer = serde_json::json!({"content_hash": content_hash});
         store
             .put(
-                &layout::snapshot_latest(),
+                &layout::snapshot_latest("oxidant"),
                 PutPayload::from(serde_json::to_vec(&pointer).unwrap()),
             )
             .await
@@ -345,7 +348,7 @@ mod tests {
         let pointer = serde_json::json!({"content_hash": "abc123"});
         store
             .put(
-                &layout::snapshot_latest(),
+                &layout::snapshot_latest("oxidant"),
                 PutPayload::from(serde_json::to_vec(&pointer).unwrap()),
             )
             .await

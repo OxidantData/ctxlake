@@ -23,7 +23,7 @@ use crate::upload::UploadConfig;
 
 /// Everything the daemon needs to start; see `docs/architecture.md`'s "Every knob"
 /// table for where the interval defaults below come from.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DaemonConfig {
     pub fleet_id: String,
     pub agent_id: String,
@@ -43,6 +43,31 @@ pub struct DaemonConfig {
     /// gates how promptly (not whether — see `crate::presence`'s module doc) a
     /// due roster rebuild actually happens.
     pub presence_poll_interval: Duration,
+    /// Attaches what the session transcript knows and the hook could not see — tool
+    /// results, exit status, usage, branch. `None` leaves sealing exactly as it was.
+    /// See [`crate::upload::SessionEnricher`].
+    pub enricher: Option<Arc<dyn crate::upload::SessionEnricher>>,
+}
+
+impl std::fmt::Debug for DaemonConfig {
+    /// Hand-rolled: `dyn SessionEnricher` cannot derive `Debug`, and whether one is
+    /// wired is the only part of it worth seeing in a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonConfig")
+            .field("fleet_id", &self.fleet_id)
+            .field("agent_id", &self.agent_id)
+            .field("runtime", &self.runtime)
+            .field("spool_root", &self.spool_root)
+            .field("cache_root", &self.cache_root)
+            .field("repo", &self.repo)
+            .field("branch", &self.branch)
+            .field("cwd", &self.cwd)
+            .field("upload_poll_interval", &self.upload_poll_interval)
+            .field("cache_poll_interval", &self.cache_poll_interval)
+            .field("presence_poll_interval", &self.presence_poll_interval)
+            .field("enricher", &self.enricher.is_some())
+            .finish()
+    }
 }
 
 impl DaemonConfig {
@@ -67,6 +92,7 @@ impl DaemonConfig {
             upload_poll_interval: Duration::from_secs(2),
             cache_poll_interval: Duration::from_secs(10),
             presence_poll_interval: Duration::from_secs(60),
+            enricher: None,
         }
     }
 }
@@ -84,6 +110,7 @@ impl Daemon {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let upload_cfg = UploadConfig {
+            enricher: cfg.enricher.clone(),
             fleet_id: cfg.fleet_id.clone(),
             agent_id: cfg.agent_id.clone(),
             spool_root: cfg.spool_root.clone(),

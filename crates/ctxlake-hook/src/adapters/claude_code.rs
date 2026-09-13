@@ -42,7 +42,15 @@ pub fn normalize(event: &str, v: &Value) -> Result<Envelope, String> {
         // `Stop` is "the assistant finished its turn" — the closest normalized
         // counterpart is an assistant message, since `EventType` has no dedicated
         // turn-boundary variant (see envelope.rs).
-        "Stop" => EventType::Assistant,
+        //
+        // `SubagentStop` is the same event for a subagent's turn, and
+        // `docs/runtimes.md`'s mapping table has always claimed both map here. The
+        // installer has always wired it too (`hooks/claude_code.rs::EVENTS`) — only
+        // this match was missing it, so every subagent turn was rejected with
+        // "unknown claude_code event" and written to the hook error log instead of the
+        // spool. 39 of them on one machine before anyone looked. The `events_match`
+        // test below now pins the installer's list and this match together.
+        "Stop" | "SubagentStop" => EventType::Assistant,
         other => return Err(format!("unknown claude_code event: {other}")),
     };
 
@@ -87,7 +95,7 @@ pub fn normalize(event: &str, v: &Value) -> Result<Envelope, String> {
     }
 
     if matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure") {
-        env.tool = Some(build_tool_call(event, v, &redactor, &mut acc));
+        env.tool = Some(build_tool_call(v, &redactor, &mut acc));
         // `tool_use_id` is the join key across Pre/Post for the same call; `message_id`
         // is the closest existing slot (see adapters/mod.rs's Envelope field notes).
         env.message_id = get_str(v, "tool_use_id").map(str::to_string);
@@ -102,12 +110,7 @@ pub fn normalize(event: &str, v: &Value) -> Result<Envelope, String> {
     Ok(env)
 }
 
-fn build_tool_call(
-    event: &str,
-    v: &Value,
-    redactor: &Redactor,
-    acc: &mut RedactionAcc,
-) -> ToolCall {
+fn build_tool_call(v: &Value, redactor: &Redactor, acc: &mut RedactionAcc) -> ToolCall {
     let name = get_str(v, "tool_name").unwrap_or("unknown").to_string();
     let file_path = v
         .get("tool_input")
@@ -135,17 +138,24 @@ fn build_tool_call(
         ..Default::default()
     };
 
-    if matches!(event, "PostToolUse" | "PostToolUseFailure") {
-        let raw_result = get_stringified(v, "tool_result").map(|s| truncate(&s));
-        let raw_result = withhold_if_denied_path(redactor, acc, file_path.as_deref(), raw_result);
-        tool.result = scrub_field(redactor, acc, raw_result, true);
-        if event == "PostToolUseFailure" {
-            // Claude Code's `PostToolUseFailure` does not hand us a numeric exit
-            // code on this hook; `1` records "this call failed" without inventing a
-            // code the runtime never actually sent.
-            tool.exit_code = Some(1);
-        }
-    }
+    // **No result is read from the hook payload, deliberately.**
+    //
+    // This used to read a `tool_result` key. In 842 real envelopes captured from three
+    // machines it produced a result exactly zero times, while 417 of 425 tool-use ids
+    // had a Pre+Post envelope pair — so `PostToolUse` was firing and the key simply was
+    // not the one the runtime sends. The fixture that "verified" it was hand-written
+    // from documentation, so the fixture and this code agreed with each other and
+    // neither could notice. A documentation lookup could not settle the real name
+    // either.
+    //
+    // Results, exit status, token usage, git branch and Bash-driven file edits all come
+    // from the session transcript instead (`import::claude_code`), whose path every hook
+    // payload carries and whose shape can be read rather than guessed. That is also the
+    // only source for `usage` and `bashEditDiff`, which no hook payload carries at all —
+    // and it keeps the largest payload in the system off a 5ms hot path.
+    //
+    // Cursor and Hermes keep hook-side result capture: they populate it correctly today
+    // and have no equivalent transcript.
 
     if let Some(p) = file_path {
         tool.paths = vec![p];
@@ -218,7 +228,11 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_maps_result_and_paths() {
+    fn post_tool_use_records_the_call_and_its_paths_but_no_output() {
+        // The hook deliberately carries no tool output for Claude Code — see
+        // `build_tool_call`. What it must still carry is the *identity* of the call,
+        // because `message_id` is the join key the transcript reader uses to attach
+        // the result, exit status and usage later.
         let env = normalize(
             "PostToolUse",
             &v(serde_json::json!({
@@ -226,34 +240,51 @@ mod tests {
                 "tool_use_id": "tu-1",
                 "tool_name": "Read",
                 "tool_input": {"file_path": "/repo/README.md"},
-                "tool_result": "# ctxlake"
+                "tool_response": "# ctxlake"
             })),
         )
         .unwrap();
-        let tool = env.tool.unwrap();
-        assert_eq!(tool.result.as_deref(), Some("# ctxlake"));
+        let tool = env.tool.clone().unwrap();
+        assert_eq!(
+            env.message_id.as_deref(),
+            Some("tu-1"),
+            "the transcript join key must survive, or enrichment has nothing to attach to"
+        );
         assert_eq!(tool.paths, vec!["/repo/README.md".to_string()]);
+        assert!(
+            tool.result.is_none(),
+            "no hook payload key is read for output, whatever it is named"
+        );
         assert!(tool.exit_code.is_none());
     }
 
     #[test]
-    fn post_tool_use_failure_records_a_synthetic_exit_code() {
+    fn a_tool_failure_is_still_recorded_as_a_call() {
+        // `PostToolUseFailure` used to be the only setter of `exit_code`, and was never
+        // wired by the installer — so it never fired. Failure now comes from the
+        // transcript's `is_error` flag instead, joined on `message_id`. The event is
+        // still accepted here rather than rejected, so a runtime that does send it does
+        // not end up in the hook error log.
         let env = normalize(
             "PostToolUseFailure",
             &v(serde_json::json!({
                 "session_id": "s1",
                 "tool_use_id": "tu-1",
                 "tool_name": "Bash",
-                "tool_input": {"command": "false"},
-                "tool_result": "command failed"
+                "tool_input": {"command": "false"}
             })),
         )
         .unwrap();
-        assert_eq!(env.tool.unwrap().exit_code, Some(1));
+        assert_eq!(env.message_id.as_deref(), Some("tu-1"));
+        assert_eq!(env.tool.unwrap().name, "Bash");
     }
 
     #[test]
-    fn reading_a_denied_path_withholds_the_result_but_keeps_the_call() {
+    fn a_denied_path_read_carries_no_output_to_withhold() {
+        // This used to assert that a `.aws/credentials` read was replaced by a
+        // "withheld" marker. Stronger now: the hook carries no tool output at all, so
+        // there is nothing on this path to leak. The equivalent redaction test for the
+        // transcript reader — which *does* handle raw output — lives with that module.
         let env = normalize(
             "PostToolUse",
             &v(serde_json::json!({
@@ -261,15 +292,18 @@ mod tests {
                 "tool_use_id": "tu-1",
                 "tool_name": "Read",
                 "tool_input": {"file_path": "/Users/x/.aws/credentials"},
-                "tool_result": "[default]\naws_access_key_id=AKIAIOSFODNN7EXAMPLE"
+                "tool_response": "[default]\naws_access_key_id=AKIAIOSFODNN7EXAMPLE"
             })),
         )
         .unwrap();
-        let tool = env.tool.unwrap();
-        assert!(tool.result.as_deref().unwrap().contains("withheld"));
-        assert!(!tool.result.as_deref().unwrap().contains("AKIA"));
+        let tool = env.tool.clone().unwrap();
+        assert!(tool.result.is_none(), "no output is captured here at all");
         assert_eq!(tool.name, "Read", "the call itself is still recorded");
-        assert_eq!(env.redaction.status, "quarantined");
+        let blob = serde_json::to_string(&env).unwrap();
+        assert!(
+            !blob.contains("AKIA"),
+            "no part of the envelope may carry the key: {blob}"
+        );
     }
 
     #[test]
@@ -303,7 +337,11 @@ mod tests {
     }
 
     #[test]
-    fn a_leaked_secret_in_tool_output_is_quarantined_before_it_reaches_the_envelope() {
+    fn a_secret_in_tool_output_cannot_reach_the_envelope_because_output_is_not_read() {
+        // `cat .env` is the canonical case. Previously the result was scrubbed and the
+        // envelope marked quarantined; now the output never enters the hook path, which
+        // is a stronger guarantee than scrubbing it. The scrubber still runs on the
+        // *input* (the command line itself) — see the sibling test.
         let env = normalize(
             "PostToolUse",
             &v(serde_json::json!({
@@ -311,17 +349,16 @@ mod tests {
                 "tool_use_id": "tu-1",
                 "tool_name": "Bash",
                 "tool_input": {"command": "cat .env"},
-                "tool_result": "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"
+                "tool_response": "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
             })),
         )
         .unwrap();
-        let tool = env.tool.unwrap();
-        assert!(!tool.result.as_deref().unwrap().contains("AKIA"));
-        assert_eq!(env.redaction.status, "quarantined");
-        assert!(env
-            .redaction
-            .rules_fired
-            .contains(&"aws_access_key_id".to_string()));
+        let blob = serde_json::to_string(&env).unwrap();
+        assert!(
+            !blob.contains("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"),
+            "a secret in tool output must not reach the envelope: {blob}"
+        );
+        assert!(env.tool.unwrap().result.is_none());
     }
 
     #[test]

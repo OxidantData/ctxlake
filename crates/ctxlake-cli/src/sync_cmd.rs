@@ -84,6 +84,13 @@ fn build_daemon_config(
         cache_root,
     );
     daemon_cfg.repo = Some(detect_repo());
+    // Attach what the session transcript knows at seal time — tool output, whether a
+    // call failed, token usage, git branch, and the file edits made through Bash that
+    // no hook payload can see. Without this the digest carries duration and nothing
+    // else, which is what `docs/memory.md` promised and did not deliver.
+    daemon_cfg.enricher = Some(std::sync::Arc::new(
+        crate::import::claude_code::TranscriptEnricher,
+    ));
     daemon_cfg.upload_poll_interval = interval_override(
         "CTXLAKE_SYNC_UPLOAD_INTERVAL_MS",
         daemon_cfg.upload_poll_interval,

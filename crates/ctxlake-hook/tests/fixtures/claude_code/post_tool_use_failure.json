@@ -1,4 +1,5 @@
 {
+  "_note": "The payload key holding tool output is deliberately NOT asserted. This fixture was originally hand-written from documentation with a `tool_result` key, and the adapter read the same invented name — so fixture and code agreed with each other while 842 real envelopes carried no result at all. The hook now reads no output key whatever it is called; results, exit status and usage come from the session transcript. See adapters/claude_code.rs::build_tool_call.",
   "event": "PostToolUseFailure",
   "payload": {
     "session_id": "cc-sess-001",
@@ -7,14 +8,13 @@
     "tool_name": "Bash",
     "tool_input": {"command": "cargo test --nonexistent-flag"},
     "tool_use_id": "tu-102",
-    "tool_result": "error: unrecognized option '--nonexistent-flag'"
+    "tool_response": "error: unrecognized option '--nonexistent-flag'"
   },
   "expect": {
     "event_type": "tool_call",
+    "message_id": "tu-102",
     "tool": {
-      "name": "Bash",
-      "result": "error: unrecognized option '--nonexistent-flag'",
-      "exit_code": 1
+      "name": "Bash"
     }
   }
 }

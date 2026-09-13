@@ -307,10 +307,37 @@ pub fn compute_independent_count(
         .count() as u32
 }
 
+/// How many independent sessions a claim type needs before it may promote.
+///
+/// **`Convention` was lowered from 2 to 1, and that is a real concession.**
+///
+/// Two independent observations is the right bar in principle: it is what separates a
+/// convention the codebase actually has from one agent's opinion, and it is the
+/// confirmation-bias protection `docs/memory.md` describes. But the count it compares
+/// against is computed by subtracting sessions that were *told* a related claim, using
+/// `injected_context` — and nothing populates that field. So the count cannot exceed 1
+/// from a single session's evidence, and the bar of 2 was not strict, it was
+/// unreachable: on a live lake every one of 41 conventions sat as a permanent
+/// candidate, including the most useful claims in the fleet.
+///
+/// An unreachable gate does not protect anything; it just discards the category. So
+/// this trades a guarantee that was never being enforced for claims that actually
+/// reach an agent.
+///
+/// What still stands between a convention and a context window: the contradiction gate
+/// (a conflicting claim contests both rather than letting the newest win), the
+/// provenance gate (every citation must resolve to a captured message), the quarantine
+/// kill switch, and attribution on read — a promoted convention still renders with its
+/// observer, its session, its independent count of 1, and the standing "verify before
+/// relying on these" note.
+///
+/// **Restore the 2 once `injected_context` is populated.** At that point the count
+/// becomes meaningful, echo suppression starts working, and the bar is enforceable
+/// rather than decorative. That is the real fix; this is the honest interim.
 fn independent_threshold(claim_type: ClaimType) -> u32 {
     match claim_type {
         ClaimType::Environment | ClaimType::Outcome => 1,
-        ClaimType::Convention => 2,
+        ClaimType::Convention => 1,
         // A hypothesis never reaches this point on its own account —
         // evidence_precheck already rejected every one of them unconditionally.
         // A defensive high bar here means a future refactor that skips gate 1 by
@@ -858,13 +885,31 @@ mod tests {
         let promoted = Vec::new();
         let ctx = default_ctx(&promoted, &known_agents, &windows, &injected);
 
+        // The count is still computed correctly — two sessions agreeing, one of which
+        // was told the claim, is one independent observation, not two. That logic is
+        // intact and `echo_case_two_sessions_agree_but_one_read_the_others_claim_...`
+        // pins it directly.
+        assert_eq!(
+            compute_independent_count(&c.claim_id, &c.evidence, &injected),
+            1,
+            "an echo must never count as corroboration"
+        );
+
+        // What changed: with `Convention`'s threshold lowered to 1, that single
+        // independent observation is now enough to promote. This test used to assert
+        // the gate held it back, and it no longer does.
+        //
+        // The concession is deliberate and documented on `independent_threshold`: the
+        // bar of 2 could never be met, because `injected_context` is populated by
+        // nothing, so it discarded the category rather than protecting it. **When
+        // `injected_context` starts being populated, raise the threshold back to 2 and
+        // restore this assertion** — at that point the count is meaningful and echo
+        // suppression genuinely works.
         let decision = run_gate(&c, &ctx, always_resolves);
-        match decision {
-            GateDecision::Review { failed_gate, .. } => assert_eq!(failed_gate, "independence"),
-            other => {
-                panic!("expected the independence gate to hold this claim back, got {other:?}")
-            }
-        }
+        assert!(
+            matches!(decision, GateDecision::Promote { .. }),
+            "with the threshold at 1, one independent observation promotes; got {decision:?}"
+        );
     }
 
     #[test]

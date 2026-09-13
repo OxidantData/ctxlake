@@ -54,6 +54,7 @@ impl PruneReport {
 /// Prune what is safe to prune. `dry_run` reports without deleting.
 pub async fn run(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     dry_run: bool,
 ) -> Result<PruneReport, ctxlake_store::StoreError> {
     let mut report = PruneReport::default();
@@ -62,7 +63,7 @@ pub async fn run(
     // treated as fatal if unreadable: pruning snapshots without knowing which one is
     // current could delete the live one, and "the pointer is unreadable" is not a
     // state in which to start guessing.
-    let current = current_snapshot_hash(store).await?;
+    let current = current_snapshot_hash(store, fleet_id).await?;
     // Unix seconds on both sides rather than naming `chrono`'s types. `object_store`
     // exposes `last_modified` as a `chrono::DateTime`, but this workspace uses `time`
     // everywhere else and adding a second date library as a declared dependency to
@@ -98,10 +99,21 @@ pub async fn run(
         report.snapshots.push(key);
     }
 
-    for prefix in [layout::legacy_agents_prefix()] {
+    for prefix in [
+        layout::legacy_agents_prefix(),
+        layout::legacy_claims_extracted_prefix(),
+    ] {
         let mut stream = store.list(Some(&prefix));
+        let depth = prefix.as_ref().matches('/').count() + 1;
         while let Some(meta) = stream.next().await {
             let Ok(meta) = meta else { continue };
+            // Only the flat entries directly under the prefix. `claims/extracted/` now
+            // also contains `claims/extracted/<fleet>/<session>`, which is the current
+            // layout and must survive — pruning by prefix alone would delete every
+            // fleet's live markers and silently re-extract the entire lake.
+            if meta.location.as_ref().matches('/').count() != depth {
+                continue;
+            }
             if !dry_run {
                 store.delete(&meta.location).await?;
             }
@@ -128,8 +140,9 @@ pub async fn run(
 /// The content hash `snapshot/latest.json` currently points at.
 async fn current_snapshot_hash(
     store: &dyn ObjectStore,
+    fleet_id: &str,
 ) -> Result<Option<String>, ctxlake_store::StoreError> {
-    match store.get(&layout::snapshot_latest()).await {
+    match store.get(&layout::snapshot_latest(fleet_id)).await {
         Ok(res) => {
             let bytes = res.bytes().await?;
             let v: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -174,9 +187,14 @@ mod tests {
         // The one object in `snapshot/` that a reader is guaranteed to want.
         let store = InMemory::new();
         put(&store, "snapshot/aaa.sqlite", "current").await;
-        put(&store, "snapshot/latest.json", r#"{"content_hash":"aaa"}"#).await;
+        put(
+            &store,
+            "snapshot/fleets/myteam/latest.json",
+            r#"{"content_hash":"aaa"}"#,
+        )
+        .await;
 
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert!(report.snapshots.is_empty(), "{report:?}");
         assert!(keys(&store).await.contains(&"snapshot/aaa.sqlite".into()));
     }
@@ -189,9 +207,14 @@ mod tests {
         let store = InMemory::new();
         put(&store, "snapshot/old.sqlite", "superseded").await;
         put(&store, "snapshot/new.sqlite", "current").await;
-        put(&store, "snapshot/latest.json", r#"{"content_hash":"new"}"#).await;
+        put(
+            &store,
+            "snapshot/fleets/myteam/latest.json",
+            r#"{"content_hash":"new"}"#,
+        )
+        .await;
 
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert!(report.snapshots.is_empty(), "{report:?}");
         assert_eq!(report.snapshots_within_grace, 1);
         assert!(keys(&store).await.contains(&"snapshot/old.sqlite".into()));
@@ -209,7 +232,7 @@ mod tests {
         put(&store, "live/fleets/myteam/agents/cc-01.json", "{}").await;
         put(&store, "live/fleets/myteam/roster.json", "{}").await;
 
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert_eq!(
             report.legacy_live,
             vec![
@@ -230,17 +253,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pruning_legacy_markers_never_touches_the_fleet_scoped_ones() {
+        // `claims/extracted/` is now a *parent* of the current layout. Pruning by
+        // prefix alone would delete every fleet's live markers, and the next
+        // maintenance run would re-extract the entire lake — a model call per session,
+        // silently, because a cleanup command matched one path component too few.
+        let store = InMemory::new();
+        put(&store, "claims/extracted/old-session-1", "{}").await;
+        put(&store, "claims/extracted/old-session-2", "{}").await;
+        put(&store, "claims/extracted/myteam/live-session", "{}").await;
+
+        let report = run(&store, "myteam", false).await.unwrap();
+        assert_eq!(
+            report.legacy_live,
+            vec![
+                "claims/extracted/old-session-1".to_string(),
+                "claims/extracted/old-session-2".to_string(),
+            ]
+        );
+        assert!(
+            keys(&store)
+                .await
+                .contains(&"claims/extracted/myteam/live-session".to_string()),
+            "a live marker was deleted; the next run would re-extract that session"
+        );
+    }
+
+    #[tokio::test]
     async fn a_dry_run_reports_exactly_what_it_would_delete_and_deletes_nothing() {
         let store = InMemory::new();
         put(&store, "live/roster.json", "{}").await;
         put(&store, "live/agents/cc-01.json", "{}").await;
 
         let before = keys(&store).await;
-        let dry = run(&store, true).await.unwrap();
+        let dry = run(&store, "myteam", true).await.unwrap();
         assert_eq!(dry.legacy_live.len(), 2);
         assert_eq!(keys(&store).await, before, "a dry run must delete nothing");
 
-        let wet = run(&store, false).await.unwrap();
+        let wet = run(&store, "myteam", false).await.unwrap();
         assert_eq!(
             wet.legacy_live, dry.legacy_live,
             "the dry run must predict the real one exactly"
@@ -257,13 +307,16 @@ mod tests {
             "sessions/dt=2026-09-12/fleet=f/runtime=claude_code/agent=a/session=s/seg-000000.parquet",
             "sessions/dt=2026-09-12/fleet=f/runtime=claude_code/agent=a/session=s/_SEALED",
             "claims/events/dt=2026-09-12/agent=a/01J.json",
-            "claims/extracted/session-1",
+            // Fleet-scoped: the current layout, and never prunable. The flat form
+            // this used to name is the pre-scoping one, which is now legacy and
+            // therefore *is* pruned — see the sibling test.
+            "claims/extracted/myteam/session-1",
             "_meta/fleet.json",
         ];
         for k in protected {
             put(&store, k, "{}").await;
         }
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert_eq!(report.total(), 0, "{report:?}");
         assert_eq!(keys(&store).await.len(), protected.len());
     }

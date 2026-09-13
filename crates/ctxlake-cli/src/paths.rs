@@ -140,6 +140,22 @@ pub fn env_file() -> PathBuf {
     config_home().join("ctxlake").join("env")
 }
 
+/// Where Claude Code keeps its MCP server registry: `~/.claude.json`.
+///
+/// **A different file from `settings.json`, and a much more dangerous one.** This is
+/// 112 KB of live state on a real machine — 116 top-level keys, 45 project records,
+/// onboarding flags, history. The merge-never-clobber rule that protects a 31 KB
+/// `settings.json` matters here at three and a half times the stakes: everything
+/// outside `mcpServers.ctxlake` must survive byte for byte.
+pub fn claude_code_mcp_path() -> PathBuf {
+    home_dir().join(".claude.json")
+}
+
+/// Where Cursor keeps its MCP server registry.
+pub fn cursor_mcp_path() -> PathBuf {
+    home_dir().join(".cursor").join("mcp.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

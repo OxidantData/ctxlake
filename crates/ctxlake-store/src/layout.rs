@@ -143,6 +143,28 @@ pub fn session_digest(
     session_dir(date, fleet, runtime, agent, session_id).join("digest.json")
 }
 
+/// What the session transcript knows that the hook could not capture.
+///
+/// Written once at seal time by the agent's own daemon, because the transcript is a
+/// local file that only that machine can read — and read back by `ctxlake maint` on any
+/// host, which is why it lives in the lake beside the segments rather than staying on
+/// disk.
+///
+/// It exists because the capture path cannot see this data at all. Tool results, exit
+/// status, token usage, git branch and Bash-driven file edits are absent from every hook
+/// payload; `docs/memory.md` promised all of them and the digest delivered duration
+/// alone. A sibling object rather than a rewrite of the segments: `sessions/` is
+/// append-only, and enrichment arriving later must not mean rewriting immutable bronze.
+pub fn session_enrichment(
+    date: &str,
+    fleet: &str,
+    runtime: Runtime,
+    agent: &str,
+    session_id: &str,
+) -> Path {
+    session_dir(date, fleet, runtime, agent, session_id).join("transcript.json")
+}
+
 /// One output file of a compaction run over a `(date, fleet)` partition — see
 /// `ctxlake_maint::compact`. Deliberately a *sibling* prefix to `sessions/dt=.../`
 /// rather than a rewrite of it in place: bronze (the per-session `seg-*.parquet`
@@ -208,8 +230,21 @@ pub fn claim_event(date: &str, agent: &str, ulid: &str) -> Path {
 
 /// Claims already extracted out of a given session, so re-running extraction is
 /// idempotent instead of re-proposing the same claim twice.
-pub fn claims_extracted(session_id: &str) -> Path {
-    Path::from("claims").join("extracted").join(session_id)
+pub fn claims_extracted(fleet_id: &str, session_id: &str) -> Path {
+    Path::from("claims")
+        .join("extracted")
+        .join(fleet_id)
+        .join(session_id)
+}
+
+/// The pre-fleet-scoping marker prefix, for `ctxlake maint --prune` to clean up.
+///
+/// Scoped for the same reason the roster and the snapshot pointer were: two fleets
+/// sharing a bucket shared these, so one fleet extracting a session id marked it done
+/// for the other. Session ids are runtime-generated UUIDs, so a collision is unlikely
+/// rather than impossible — but "unlikely" is not the guarantee `--fleet` advertises.
+pub fn legacy_claims_extracted_prefix() -> Path {
+    Path::from("claims").join("extracted")
 }
 
 /// The `claims/fleet/` prefix — promoted (and later contested/retired) claims,
@@ -248,7 +283,21 @@ pub fn snapshot(content_hash: &str) -> Path {
 /// The CAS pointer to the current snapshot. This is the one object in `snapshot/`
 /// that is ever overwritten, and it is overwritten via CAS — publish is
 /// write-then-swap, never swap-then-write.
-pub fn snapshot_latest() -> Path {
+pub fn snapshot_latest(fleet_id: &str) -> Path {
+    Path::from("snapshot")
+        .join("fleets")
+        .join(fleet_id)
+        .join("latest.json")
+}
+
+/// The pre-fleet-scoping pointer, for `ctxlake maint --prune` to clean up.
+///
+/// Scoped once the snapshot started carrying session history: the blob is
+/// content-addressed and shared harmlessly, but a single global pointer meant two
+/// fleets publishing in turn each served the other's artifact half the time. That was
+/// tolerable while the snapshot held only claims — which are still fleet-global, a
+/// separate and older leak — and is not once it holds one fleet's sessions.
+pub fn legacy_snapshot_latest() -> Path {
     Path::from("snapshot").join("latest.json")
 }
 
@@ -316,8 +365,8 @@ mod tests {
             "claims/events/dt=2026-09-11/agent=cc-01/01J000000000000000000000.json"
         );
         assert_eq!(
-            claims_extracted("sess-1").as_ref(),
-            "claims/extracted/sess-1"
+            claims_extracted("myteam", "sess-1").as_ref(),
+            "claims/extracted/myteam/sess-1"
         );
         assert_eq!(claims_fleet_prefix().as_ref(), "claims/fleet");
         assert_eq!(
@@ -328,7 +377,11 @@ mod tests {
             snapshot("deadbeef1234").as_ref(),
             "snapshot/deadbeef1234.sqlite"
         );
-        assert_eq!(snapshot_latest().as_ref(), "snapshot/latest.json");
+        assert_eq!(
+            snapshot_latest("myteam").as_ref(),
+            "snapshot/fleets/myteam/latest.json"
+        );
+        assert_eq!(legacy_snapshot_latest().as_ref(), "snapshot/latest.json");
         assert_eq!(quarantine_prefix().as_ref(), "quarantine");
         assert_eq!(
             session_digest("2026-09-11", "oxidant", Runtime::ClaudeCode, "cc-01", "sess-1")
@@ -418,15 +471,29 @@ mod tests {
         );
 
         let evil_session = "a/b/../c";
-        let cp = claims_extracted(evil_session);
+        let cp = claims_extracted("myteam", evil_session);
         assert!(
-            cp.as_ref().starts_with("claims/extracted/"),
+            cp.as_ref().starts_with("claims/extracted/myteam/"),
             "escaped its directory: {cp}"
         );
         assert_eq!(
             cp.as_ref().matches('/').count(),
-            2,
+            3,
             "an extra path separator survived encoding: {cp}"
+        );
+    }
+
+    #[test]
+    fn enrichment_sits_beside_the_segments_it_enriches() {
+        let d = session_dir("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1");
+        assert_eq!(
+            session_enrichment("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1"),
+            d.join("transcript.json")
+        );
+        // Must not collide with the digest computed from it, nor with a segment.
+        assert_ne!(
+            session_enrichment("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1"),
+            session_digest("2026-09-12", "myteam", Runtime::ClaudeCode, "cc-01", "s1")
         );
     }
 

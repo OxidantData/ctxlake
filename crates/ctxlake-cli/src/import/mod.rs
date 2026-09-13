@@ -37,6 +37,7 @@
 //! other order are silently wrong in a way no test of a single envelope can see.
 //! Every source here must therefore call `Envelope::new` in chronological order.
 
+pub mod claude_code;
 pub mod hermes;
 
 use std::collections::HashSet;
@@ -312,6 +313,8 @@ impl EnvelopeSink for Spooler<'_> {
                     &self.spool_root,
                     self.runtime_dir,
                     session_id,
+                    // Imported sessions have no live transcript to attach.
+                    None,
                 )
                 .map_err(|e| anyhow!("marking session {session_id} done: {e}"))?;
                 // Recorded only after the events are actually on disk: a ledger

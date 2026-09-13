@@ -93,6 +93,14 @@ pub struct ClaimRecord {
     /// rejected, since this crate is a reader here, not the gate that assigns it.
     #[serde(default = "default_promoted_status")]
     pub status: String,
+    /// Sessions this claim came from, so an agent can go and look.
+    ///
+    /// A claim is one line about work that happened somewhere. Without this an agent
+    /// that wants the detail behind it — the command, the output, what else that
+    /// session did — has nowhere to go. `fleet_history` is keyed by session id, so this
+    /// is the join between "what is believed" and "what actually happened".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<String>,
 }
 
 fn default_promoted_status() -> String {
@@ -110,6 +118,7 @@ impl From<&ClaimRow> for ClaimRecord {
             independent_count: row.independent_count,
             confidence: row.confidence,
             status: row.status.clone(),
+            sessions: row.sessions.clone(),
         }
     }
 }
@@ -146,8 +155,23 @@ pub fn render(c: &ClaimRecord) -> String {
     } else {
         ""
     };
+    // Where to go for the detail behind the line. Sanitized like every other field —
+    // a session id reaches here from the store, and this crate trusts nothing it reads.
+    let origin = match c.sessions.first() {
+        Some(sid) => {
+            let sid = sanitize::clean_single_line(sid, sanitize::MAX_SHORT_FIELD);
+            let more = c.sessions.len().saturating_sub(1);
+            let extra = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            format!("\n  from session {sid}{extra} — `fleet_history` for what it did")
+        }
+        None => String::new(),
+    };
     format!(
-        "[{observer}, {date}, {sessions}, conf {:.2}{contested}]\n  {claim_text}",
+        "[{observer}, {date}, {sessions}, conf {:.2}{contested}]\n  {claim_text}{origin}",
         c.confidence
     )
 }
@@ -465,6 +489,49 @@ pub fn briefing_claims(cache_root: &Path, fleet_id: &str, limit: usize) -> Vec<S
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_rendered_claim_says_which_session_to_look_at() {
+        // A claim is one line about work that happened somewhere. Without a session id
+        // an agent that wants the detail behind it has nowhere to go — and
+        // `fleet_history` is keyed by exactly this, so the pointer is the join between
+        // "what is believed" and "what actually happened".
+        let c = ClaimRecord {
+            claim: "CI fails unless RUSTFLAGS=-D warnings is set".into(),
+            claim_type: "convention".into(),
+            subject: Some("ci".into()),
+            observed_by: "cc-01".into(),
+            observed_at: "2026-09-12".into(),
+            independent_count: 2,
+            confidence: 0.8,
+            status: "promoted".into(),
+            sessions: vec!["sess-a".into(), "sess-b".into()],
+        };
+        let out = render(&c);
+        assert!(out.contains("sess-a"), "got: {out}");
+        assert!(out.contains("+1 more"), "got: {out}");
+        assert!(out.contains("fleet_history"), "say where to go: {out}");
+    }
+
+    #[test]
+    fn a_claim_with_no_session_renders_without_a_dangling_pointer() {
+        // Imported conventions and `memory_propose` claims can legitimately carry no
+        // session. An empty "from session " would be worse than saying nothing.
+        let c = ClaimRecord {
+            claim: "prefers terse output".into(),
+            claim_type: "preference".into(),
+            subject: Some("style".into()),
+            observed_by: "human".into(),
+            observed_at: "2026-09-12".into(),
+            independent_count: 1,
+            confidence: 0.9,
+            status: "promoted".into(),
+            sessions: vec![],
+        };
+        let out = render(&c);
+        assert!(!out.contains("from session"), "got: {out}");
+        assert!(out.contains("prefers terse output"));
+    }
     use super::*;
     use crate::snapshot::test_support::{write_snapshot, FixtureClaim};
 
@@ -479,6 +546,7 @@ mod tests {
             independent_count: 2,
             confidence: 0.81,
             status: "promoted".into(),
+            sessions: vec![],
         };
         let out = render(&c);
         assert!(out.contains("[cc-03, 2026-09-09, 2 independent sessions, conf 0.81]"));
@@ -496,6 +564,7 @@ mod tests {
             independent_count: 1,
             confidence: 0.55,
             status: "contested".into(),
+            sessions: vec![],
         };
         let out = render(&c);
         assert!(out.starts_with("[cc-01, 2026-09-10, 1 independent session, conf 0.55, CONTESTED]"));
@@ -522,6 +591,7 @@ mod tests {
             independent_count: 3,
             confidence: 0.7,
             status: "contested".into(),
+            sessions: vec![],
         };
         assert!(render(&c).contains("CONTESTED"));
     }
@@ -537,6 +607,7 @@ mod tests {
             independent_count: 1,
             confidence: 0.5,
             status: "promoted".into(),
+            sessions: vec![],
         };
         let out = render(&c);
         assert!(!out.contains('\u{200B}'));
@@ -568,6 +639,7 @@ mod tests {
             independent_count: 1,
             confidence: 0.5,
             status: "promoted".into(),
+            sessions: vec![],
         };
         let out = render(&c);
         // Exactly one line break: the one `render`'s own format string writes
@@ -614,6 +686,7 @@ mod tests {
             independent_count: 5,
             confidence: 0.7,
             status: "promoted".into(),
+            sessions: vec![],
         };
         assert!(!render(&c).contains("evidence_count"));
     }

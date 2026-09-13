@@ -552,16 +552,23 @@ pub async fn install(
         Manager::Launchd => {
             let domain = gui_domain();
             let unit = unit_path.display().to_string();
-            // bootout first so a re-install replaces a loaded job rather than failing.
-            // A never-loaded job makes this fail, which is why its status is ignored.
-            let _ = run("launchctl", &["bootout", &domain, &unit]);
             if start {
+                // `launchd_replace` rather than a bare bootout + bootstrap: `bootout`
+                // is asynchronous, and bootstrapping before it lands makes
+                // `launchd_bootstrap` observe a job still mid-teardown and skip its
+                // own work. See that function.
+                //
                 // `bootstrap` alone starts it: the plist sets `RunAtLoad`. An earlier
                 // version also ran `kickstart -k`, which killed the process launchd
                 // had just spawned and so tripped `ThrottleInterval` — making
                 // `ctxlake init --daemon` block for 33 seconds on a clean install,
                 // measured.
-                launchd_bootstrap(&unit)?;
+                launchd_replace(&unit)?;
+            } else {
+                // bootout so a re-install with --no-start leaves nothing running from
+                // the previous unit. A never-loaded job makes this fail, which is why
+                // its status is ignored.
+                let _ = run("launchctl", &["bootout", &domain, &unit]);
             }
             // With `--no-start`, the plist is deliberately left un-bootstrapped:
             // bootstrapping it would honour `RunAtLoad` and start the daemon anyway.
@@ -673,6 +680,53 @@ fn launchd_bootstrap(unit: &str) -> Result<()> {
 }
 
 /// Whether launchd currently has the agent in this user's GUI domain.
+/// How long to wait for a booted-out job to actually disappear.
+///
+/// `launchctl bootout` returns before the job is gone. A tenth of a second per poll
+/// over two seconds is far more than the teardown has ever taken, and the cost of
+/// waiting slightly too long is nothing — whereas not waiting cost a real machine its
+/// daemon for twenty minutes, with `ctxlake update` reporting a successful restart.
+const BOOTOUT_SETTLE: Duration = Duration::from_secs(2);
+
+/// Replace a loaded launchd job: boot it out, wait for that to take effect, bootstrap.
+///
+/// **The wait is the whole point.** `bootout` is asynchronous, and
+/// [`launchd_bootstrap`] deliberately early-returns when the job is already loaded —
+/// a check that is right for `install` (bootstrapping a loaded job reports a
+/// misleading `Bootstrap failed: 5: Input/output error`) and exactly wrong here.
+/// Called immediately after a bootout, it observed the job still mid-teardown,
+/// concluded there was nothing to do, and returned success. The teardown then
+/// finished, leaving the job booted out and never bootstrapped.
+///
+/// Observed on a real Mac: plist on disk, `launchctl` reporting no such job, no
+/// process, no heartbeat for twenty minutes — after `ctxlake update` printed
+/// "restarted".
+fn launchd_replace(unit: &str) -> Result<()> {
+    let _ = run("launchctl", &["bootout", &gui_domain(), unit]);
+    wait_until_unloaded(BOOTOUT_SETTLE, launchd_is_loaded);
+    launchd_bootstrap(unit)
+}
+
+/// Poll `is_loaded` until it reports false, or `timeout` elapses.
+///
+/// Returns whether the job actually went away. A timeout is not fatal on its own:
+/// [`launchd_bootstrap`] still runs, and its own error is the one worth surfacing —
+/// this only exists to stop that call being skipped by a stale observation.
+///
+/// `is_loaded` is injected so the polling logic is testable without launchd.
+fn wait_until_unloaded(timeout: Duration, mut is_loaded: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !is_loaded() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn launchd_is_loaded() -> bool {
     run(
         "launchctl",
@@ -812,8 +866,7 @@ pub fn restart(
                 .unit_path(&home_dir())
                 .display()
                 .to_string();
-            let _ = run("launchctl", &["bootout", &gui_domain(), &unit]);
-            launchd_bootstrap(&unit)?
+            launchd_replace(&unit)?
         }
     }
     report_started(cfg, "ctxlake sync restarted (service)");
@@ -836,8 +889,7 @@ pub fn restart_installed() -> Result<()> {
                 .unit_path(&home_dir())
                 .display()
                 .to_string();
-            let _ = run("launchctl", &["bootout", &gui_domain(), &unit]);
-            launchd_bootstrap(&unit)?
+            launchd_replace(&unit)?
         }
     }
     Ok(())

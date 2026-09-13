@@ -93,7 +93,24 @@ fn capture(runtime_arg: &str, event: &str, raw: &str) -> Result<(), String> {
         // Claude Code shares a 1.5s budget across *every* hook it runs for
         // `SessionEnd` — this sentinel write is the only extra work done here, and
         // it is a single local file create, not a scan of anything.
-        spool::mark_session_done(runtime.as_str(), &envelope.session_id)?;
+        //
+        // `transcript_path` rides along because this is the last moment anything knows
+        // it: the daemon seals the session later, from the spool alone, and needs it to
+        // attach results and usage. Parsed straight out of the raw payload rather than
+        // carried on the envelope — it is a local filesystem path and has no business in
+        // the lake.
+        let transcript_path = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| {
+                v.get("transcript_path")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            });
+        spool::mark_session_done(
+            runtime.as_str(),
+            &envelope.session_id,
+            transcript_path.as_deref(),
+        )?;
     }
     Ok(())
 }

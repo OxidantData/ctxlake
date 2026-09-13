@@ -1099,37 +1099,69 @@ fn excerpt(raw: &str) -> String {
     }
 }
 
-/// Whether a rendered transcript carries anything a model could extract from.
+/// Whether a rendered transcript carries enough for a claim to be grounded in.
 ///
-/// "Nothing but the `session_id:` header" rather than "empty string": the header is
-/// always emitted when there is at least one envelope, so a literal emptiness check
-/// would never fire on exactly the sessions this exists for.
+/// Three rounds of real failures shaped this, each one the model telling us plainly
+/// that we had sent it nothing:
+///
+/// 1. Sessions rendering to the `session_id:` header alone.
+/// 2. Sessions rendering to a page of `[toolu_x] tool:Read` — ids and tool names, no
+///    inputs, no results, no evidence of anything.
+/// 3. A session whose entire content was one prompt reading `ok`.
+///
+/// The third is why this counts characters rather than lines. "Is there any text" is
+/// the wrong question; "is there enough text that a claim could cite it" is the right
+/// one, and `ok` answers no. A model handed that replies, correctly and at length,
+/// that it cannot see a transcript — then fails to parse as JSON.
+///
+/// The threshold errs toward attempting. A skipped session is revisitable, since
+/// `EXTRACTOR_VERSION` makes every already-marked session eligible again on the next
+/// bump; a wasted model call is spent for good. [`MIN_SUBSTANTIVE_CHARS`] is set below
+/// the length of a single real shell command, so "one `cargo test --workspace` and
+/// nothing else" is still extracted.
 fn transcript_is_empty(prompt: &str) -> bool {
-    prompt.lines().all(|l| {
-        let l = l.trim();
-        if l.is_empty() || l.starts_with("session_id:") {
-            return true;
-        }
-        // A line that is only an id marker carries nothing either. `[toolu_x] tool:Read`
-        // with no input, exit code or result is the id and the tool's name and no
-        // evidence of anything — and a model handed a page of those answers, correctly,
-        // that it was "given a session ID and message ID, but not the actual
-        // conversation". Three such sessions in one real pass, after the header-only
-        // case was already handled.
-        let after_id = l.split_once("] ").map(|(_, rest)| rest).unwrap_or(l);
-        substance_is_absent(after_id)
-    })
+    substantive_chars(prompt) < MIN_SUBSTANTIVE_CHARS
 }
 
-/// Whether a rendered line says anything beyond naming a tool.
-fn substance_is_absent(rest: &str) -> bool {
-    match rest.strip_prefix("tool:") {
-        // `tool:Read` alone; anything real appends ` input=`, ` exit=` or ` result=`.
-        Some(tail) => {
-            !tail.contains(" input=") && !tail.contains(" exit=") && !tail.contains(" result=")
-        }
-        None => rest.trim().is_empty(),
-    }
+/// Below this much actual content, there is nothing for a claim to cite.
+///
+/// Calibrated against real content at both ends, not chosen round:
+///
+/// - The session that failed on the live lake contained one prompt reading `ok`. It
+///   scores **2**, along with every other acknowledgement token — `yes`, `go`,
+///   `thanks`, `continue` — which is what these sessions are made of.
+/// - `staging listens on port 2222` scores **28**, and is `docs/memory.md`'s own
+///   example of a good `environment` claim. Anything that states something clears this
+///   comfortably.
+///
+/// A first attempt used 40 and would have skipped that example. This module's existing
+/// tests caught it, which is the argument for the threshold living beside them.
+///
+/// The asymmetry favours attempting: a skipped session becomes eligible again on the
+/// next `EXTRACTOR_VERSION` bump, while a wasted model call is spent for good.
+const MIN_SUBSTANTIVE_CHARS: usize = 12;
+
+/// Characters of real content in a rendered transcript.
+///
+/// Structure does not count: the `session_id:` header, the `[id]` markers and a bare
+/// `tool:NAME` are scaffolding the renderer adds, and a page of them is still an empty
+/// session.
+fn substantive_chars(prompt: &str) -> usize {
+    prompt
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("session_id:"))
+        .map(|l| {
+            let after_id = l.split_once("] ").map(|(_, rest)| rest).unwrap_or(l);
+            match after_id.strip_prefix("tool:") {
+                // The tool's name is scaffolding; its input and output are evidence.
+                Some(tail) => tail
+                    .split_once(' ')
+                    .map(|(_, args)| args.trim().len())
+                    .unwrap_or(0),
+                None => after_id.trim().len(),
+            }
+        })
+        .sum()
 }
 
 /// Pull the JSON object out of a response that may have been dressed up.
@@ -3348,26 +3380,38 @@ mod tests {
     }
 
     #[test]
-    fn transcript_emptiness_looks_past_the_session_header() {
-        // The header is always present, so a literal `is_empty()` would never fire on
-        // exactly the sessions this exists for.
+    fn transcript_emptiness_is_measured_in_content_not_lines() {
+        // Each case below is a real failing session from the live lake, in the order
+        // they were found. Every one of them made the model reply, correctly, that it
+        // had been sent no transcript — and then fail to parse as JSON.
+
+        // Round 1: the header alone.
         assert!(transcript_is_empty("session_id: s1\n"));
         assert!(transcript_is_empty(""));
-        assert!(!transcript_is_empty("session_id: s1\n[m1] did a thing\n"));
-        assert!(!transcript_is_empty(
-            "session_id: s1\n[m1] tool:Bash input=cargo test\n"
-        ));
-        // Only id markers and tool names: a model handed this replies that it was
-        // given ids but not a conversation. Three such sessions in one real pass.
+
+        // Round 2: ids and tool names, no inputs, no results.
         assert!(transcript_is_empty(
-            "session_id: s1\n[toolu_a] tool:Read\n[toolu_b] tool:Glob\n"
+            "session_id: s1\n[toolu_a] tool:Read\n[toolu_b] tool:Glob\n[toolu_c] tool:Read\n"
         ));
-        // But a result alone is substance, even with no input.
+
+        // Round 3: one prompt reading `ok`. This is why the check counts characters —
+        // "is there any text" says yes, and there is still nothing to cite.
+        assert!(transcript_is_empty("session_id: s1\n[01M2B] ok\n"));
+
+        // And what must still be attempted. `staging listens on port 2222` is
+        // docs/memory.md's own example of a good environment claim and scores 28; an
+        // earlier threshold of 40 would have skipped it, and this suite caught that.
         assert!(!transcript_is_empty(
-            "session_id: s1\n[toolu_a] tool:Read result=hello\n"
+            "session_id: s1\n[toolu_a] tool:Bash input={\"command\":\"cargo test --workspace\"}\n"
         ));
+        // A real prompt, with no tool call at all, can still carry a preference or a
+        // convention.
         assert!(!transcript_is_empty(
-            "session_id: s1\n[toolu_a] tool:Bash exit=1\n"
+            "session_id: s1\n[m1] always run the full workspace test suite before pushing\n"
+        ));
+        // A failure with output and no input is exactly the session worth extracting.
+        assert!(!transcript_is_empty(
+            "session_id: s1\n[toolu_a] tool:Bash exit=1 result=error: could not compile ctxlake-maint\n"
         ));
     }
 

@@ -1606,7 +1606,21 @@ pub async fn is_already_extracted(
 /// Not bumped for a provider swap or a model change — those are configuration, and
 /// re-extracting an entire lake because someone edited `ctxlake.toml` would be a
 /// surprising and expensive thing for a config edit to do.
-pub const EXTRACTOR_VERSION: u32 = 5;
+///
+/// **Deliberately NOT bumped for the citation and preamble fixes, on measurement.**
+/// Both are real defects and both change extraction — the textbook reason to bump. Two
+/// full 50-session re-extraction passes were run against a live lake to find out what
+/// revisiting actually buys, and the answer was +2 claims each and zero new
+/// corroboration, for the largest model spend of any pass so far.
+///
+/// The reason is structural, not a shortfall in the fixes: re-extracting a session
+/// re-reads a transcript whose claims are *already on file*, and this extractor is
+/// explicitly told to propose only what is not already recorded. It correctly returns
+/// almost nothing. Corroboration needs a **different** session observing the same fact,
+/// which no amount of re-extraction can manufacture. So these fixes earn their value on
+/// sessions yet to be sealed, and forcing a fleet-wide re-extraction to chase it would
+/// be paying real money for a result already measured at nearly zero.
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// Find every sealed session under `sessions/` by locating `_SEALED` markers.
 /// Whether a given one has already been extracted is [`mark_extracted_if_new`]'s

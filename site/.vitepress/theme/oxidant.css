@@ -1,17 +1,31 @@
 /*
- * Oxidant design tokens for the ctxlake docs.
+ * The Oxidant skin for VitePress — shared, byte-identical, by the Oxidant Platform docs
+ * (Oxidant-Platform/site) and the ctxlake docs (ctxlake/site).
  *
- * Source of truth: oxidant-website/src/styles/theme.css. Copied rather than imported,
- * per the workspace convention — the engine UI and the platform console each keep
- * their own annotated copy for the same reason (separate repos, no shared package).
- * If the palette changes there, change it here.
+ * Source of truth: oxidant-website/src/styles/theme.css (tokens), tailwind.config.js and
+ * global.css (the .oxidant-* components). Copied rather than imported, per the workspace
+ * convention — the engine UI and the platform console each keep their own annotated copy
+ * for the same reason (separate repos, no shared package). If the palette or a component
+ * changes there, change it here, then copy this file to the other docs site unchanged.
+ * The goal is that a reader cannot tell they left oxidantdata.com.
  *
  * One deliberate inversion: the website is dark-first on a bare :root with light
  * opt-in via [data-theme="light"]. VitePress is the opposite — :root is light and
  * `.dark` is the toggle. So the token values are assigned the way VitePress expects
  * while the rendered result matches the website exactly. `appearance: 'dark'` in
  * config.mts keeps dark as the default a first-time reader sees.
+ *
+ * Geist and JetBrains Mono come from the config's `head` links, as on the website.
+ *
+ * Layout of this file:
+ *   1. Tokens (light, then dark)
+ *   2. VitePress variables mapped onto the tokens
+ *   3. Chrome — nav bar, sidebar, outline, footer
+ *   4. Home — hero, actions, feature cards
+ *   5. Doc content — headings, links, code, custom blocks, tables
  */
+
+/* ── 1. Tokens ───────────────────────────────────────────────────────────────────── */
 
 :root {
   /* --- Oxidant tokens: LIGHT --- */
@@ -33,13 +47,23 @@
   --oxidant-success-tint: rgba(34, 197, 94, 0.12);
   --oxidant-warning: #eab308;
   --oxidant-warning-tint: rgba(234, 179, 8, 0.12);
+  --oxidant-warning-line: rgba(234, 179, 8, 0.35);
   --oxidant-code-bg: #0a0a0b;
   --oxidant-code-text: #e5e5e5;
   --oxidant-code-text-dim: #737373;
+  /* Hairlines ON the code surface. It is dark in both themes, so these are white-alpha
+     in both — the page's light-theme #e5e5e5 border would glare against it. */
+  --oxidant-code-border: rgba(255, 255, 255, 0.1);
+  --oxidant-code-raised: rgba(255, 255, 255, 0.06);
 
   --oxidant-font-ui: Geist, Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
   --oxidant-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --oxidant-radius: 8px;
+  --oxidant-radius-sm: 6px;
+
+  /* The loom mark (oxidant-website/src/components/Logo.tsx, same geometry), as a mask so
+     it takes `currentColor` like the website's inline SVG. A data URI: no request. */
+  --oxidant-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 72 72'%3E%3Cpath fill='none' stroke='%23000' stroke-width='8' stroke-linecap='round' d='M12 19.2V36.8M12 51.2V64M28 8V20.8M28 35.2V52.8M44 19.2V36.8M44 51.2V64M60 8V20.8M60 35.2V52.8M8 12H20.8M35.2 12H52.8M19.2 28H36.8M51.2 28H64M8 44H20.8M35.2 44H52.8M19.2 60H36.8M51.2 60H64'/%3E%3C/svg%3E");
 }
 
 .dark {
@@ -58,16 +82,19 @@
   --oxidant-on-solid: #111112;
 }
 
-/* --- Map VitePress's variables onto the tokens above --- *
+/* ── 2. VitePress variables ──────────────────────────────────────────────────────── *
  * There is deliberately no decorative accent hue: emphasis comes from contrast and
  * weight. So VitePress's "brand" color resolves to the monochrome solid slab rather
- * than the default green.
+ * than the default indigo, and every status that is not success or caution is gray.
+ * Variables that reference other --vp-c-* values are redeclared on .dark too, because
+ * VitePress's own .dark block would otherwise re-point them at its palette.
  */
-:root {
+:root,
+.dark {
   --vp-c-bg: var(--oxidant-bg);
-  --vp-c-bg-alt: var(--oxidant-bg-subtle);
+  --vp-c-bg-alt: var(--oxidant-bg);
   --vp-c-bg-soft: var(--oxidant-surface);
-  --vp-c-bg-elv: var(--oxidant-raised);
+  --vp-c-bg-elv: var(--oxidant-bg-subtle);
 
   --vp-c-divider: var(--oxidant-border);
   --vp-c-border: var(--oxidant-border);
@@ -77,38 +104,591 @@
   --vp-c-text-2: var(--oxidant-text-secondary);
   --vp-c-text-3: var(--oxidant-text-muted);
 
-  --vp-c-brand-1: var(--oxidant-text);
-  --vp-c-brand-2: var(--oxidant-text-secondary);
-  --vp-c-brand-3: var(--oxidant-border-strong);
+  /* The accent is the inverted slab, never a hue. */
+  --vp-c-brand-1: var(--oxidant-solid);
+  --vp-c-brand-2: var(--oxidant-solid-hover);
+  --vp-c-brand-3: var(--oxidant-solid);
   --vp-c-brand-soft: var(--oxidant-raised);
 
-  --vp-button-brand-bg: var(--oxidant-solid);
-  --vp-button-brand-hover-bg: var(--oxidant-solid-hover);
-  --vp-button-brand-text: var(--oxidant-on-solid);
-  --vp-button-brand-border: transparent;
+  --vp-c-default-1: var(--oxidant-border-strong);
+  --vp-c-default-2: var(--oxidant-raised);
+  --vp-c-default-3: var(--oxidant-surface);
+  --vp-c-default-soft: var(--oxidant-raised);
 
   --vp-c-tip-1: var(--oxidant-text);
+  --vp-c-tip-2: var(--oxidant-text-secondary);
+  --vp-c-tip-3: var(--oxidant-text-muted);
   --vp-c-tip-soft: var(--oxidant-raised);
+  --vp-c-note-1: var(--oxidant-text);
+  --vp-c-note-2: var(--oxidant-text-secondary);
+  --vp-c-note-3: var(--oxidant-text-muted);
+  --vp-c-note-soft: var(--oxidant-raised);
+  --vp-c-important-1: var(--oxidant-text);
+  --vp-c-important-2: var(--oxidant-text-secondary);
+  --vp-c-important-3: var(--oxidant-text-muted);
+  --vp-c-important-soft: var(--oxidant-raised);
+  /* The two semantic hues the website uses: green = win, amber = caution. A danger
+     block is a caution the website would also draw in amber — there is no red. */
+  --vp-c-success-1: var(--oxidant-success);
+  --vp-c-success-2: var(--oxidant-success);
+  --vp-c-success-3: var(--oxidant-success);
+  --vp-c-success-soft: var(--oxidant-success-tint);
   --vp-c-warning-1: var(--oxidant-warning);
+  --vp-c-warning-2: var(--oxidant-warning);
+  --vp-c-warning-3: var(--oxidant-warning);
   --vp-c-warning-soft: var(--oxidant-warning-tint);
+  --vp-c-danger-1: var(--oxidant-warning);
+  --vp-c-danger-2: var(--oxidant-warning);
+  --vp-c-danger-3: var(--oxidant-warning);
+  --vp-c-danger-soft: var(--oxidant-warning-tint);
 
   --vp-font-family-base: var(--oxidant-font-ui);
   --vp-font-family-mono: var(--oxidant-font-mono);
 
-  /* The code surface stays dark in both themes — one step below the page. */
+  /* Buttons: .oxidant-btn-primary (brand) and .oxidant-btn-ghost (alt). */
+  --vp-button-brand-border: transparent;
+  --vp-button-brand-text: var(--oxidant-on-solid);
+  --vp-button-brand-bg: var(--oxidant-solid);
+  --vp-button-brand-hover-border: transparent;
+  --vp-button-brand-hover-text: var(--oxidant-on-solid);
+  --vp-button-brand-hover-bg: var(--oxidant-solid-hover);
+  --vp-button-brand-active-border: transparent;
+  --vp-button-brand-active-text: var(--oxidant-on-solid);
+  --vp-button-brand-active-bg: var(--oxidant-solid-hover);
+  --vp-button-alt-border: var(--oxidant-border);
+  --vp-button-alt-text: var(--oxidant-text);
+  --vp-button-alt-bg: var(--oxidant-surface);
+  --vp-button-alt-hover-border: var(--oxidant-border-strong);
+  --vp-button-alt-hover-text: var(--oxidant-text);
+  --vp-button-alt-hover-bg: var(--oxidant-raised);
+  --vp-button-alt-active-border: var(--oxidant-border-strong);
+  --vp-button-alt-active-text: var(--oxidant-text);
+  --vp-button-alt-active-bg: var(--oxidant-raised);
+
+  /* Custom blocks: hairline cards; only warning/danger carry a hue. */
+  --vp-custom-block-info-border: var(--oxidant-border);
+  --vp-custom-block-info-text: var(--oxidant-text);
+  --vp-custom-block-info-bg: var(--oxidant-bg-subtle);
+  --vp-custom-block-info-code-bg: var(--oxidant-raised);
+  --vp-custom-block-note-border: var(--oxidant-border);
+  --vp-custom-block-note-text: var(--oxidant-text);
+  --vp-custom-block-note-bg: var(--oxidant-bg-subtle);
+  --vp-custom-block-note-code-bg: var(--oxidant-raised);
+  --vp-custom-block-tip-border: var(--oxidant-border-strong);
+  --vp-custom-block-tip-text: var(--oxidant-text);
+  --vp-custom-block-tip-bg: var(--oxidant-bg-subtle);
+  --vp-custom-block-tip-code-bg: var(--oxidant-raised);
+  --vp-custom-block-important-border: var(--oxidant-border-strong);
+  --vp-custom-block-important-text: var(--oxidant-text);
+  --vp-custom-block-important-bg: var(--oxidant-bg-subtle);
+  --vp-custom-block-important-code-bg: var(--oxidant-raised);
+  --vp-custom-block-warning-border: var(--oxidant-warning-line);
+  --vp-custom-block-warning-text: var(--oxidant-text);
+  --vp-custom-block-warning-bg: var(--oxidant-warning-tint);
+  --vp-custom-block-warning-code-bg: var(--oxidant-warning-tint);
+  --vp-custom-block-danger-border: var(--oxidant-warning-line);
+  --vp-custom-block-danger-text: var(--oxidant-text);
+  --vp-custom-block-danger-bg: var(--oxidant-warning-tint);
+  --vp-custom-block-danger-code-bg: var(--oxidant-warning-tint);
+  --vp-custom-block-details-border: var(--oxidant-border);
+  --vp-custom-block-details-text: var(--oxidant-text);
+  --vp-custom-block-details-bg: var(--oxidant-bg-subtle);
+  --vp-custom-block-details-code-bg: var(--oxidant-raised);
+
+  /* Code: the surface stays dark in both themes — one step below the page. */
+  --vp-code-color: var(--oxidant-text);
+  --vp-code-bg: var(--oxidant-raised);
+  --vp-code-link-color: var(--oxidant-text);
+  --vp-code-link-hover-color: var(--oxidant-text-secondary);
   --vp-code-block-bg: var(--oxidant-code-bg);
   --vp-code-block-color: var(--oxidant-code-text);
-  --vp-code-line-highlight-color: rgba(255, 255, 255, 0.06);
+  --vp-code-block-divider-color: var(--oxidant-code-border);
+  --vp-code-lang-color: var(--oxidant-code-text-dim);
+  --vp-code-line-number-color: var(--oxidant-code-text-dim);
+  --vp-code-line-highlight-color: var(--oxidant-code-raised);
+  --vp-code-copy-code-border-color: var(--oxidant-code-border);
+  --vp-code-copy-code-bg: var(--oxidant-code-bg);
+  --vp-code-copy-code-hover-border-color: var(--oxidant-code-border);
+  --vp-code-copy-code-hover-bg: #1a1a1c;
+  --vp-code-copy-code-active-text: var(--oxidant-code-text-dim);
+  --vp-code-tab-divider: var(--oxidant-code-border);
+  --vp-code-tab-text-color: var(--oxidant-code-text-dim);
+  --vp-code-tab-bg: var(--oxidant-code-bg);
+  --vp-code-tab-hover-text-color: var(--oxidant-code-text);
+  --vp-code-tab-active-text-color: var(--oxidant-code-text);
+  --vp-code-tab-active-bar-color: var(--oxidant-code-text);
 
+  --vp-input-border-color: var(--oxidant-border);
+  --vp-input-bg-color: var(--oxidant-surface);
+  --vp-input-switch-bg-color: var(--oxidant-raised);
+
+  --vp-badge-info-border: var(--oxidant-border);
+  --vp-badge-info-text: var(--oxidant-text-secondary);
+  --vp-badge-info-bg: var(--oxidant-raised);
+  --vp-badge-tip-border: var(--oxidant-border);
+  --vp-badge-tip-text: var(--oxidant-text);
+  --vp-badge-tip-bg: var(--oxidant-raised);
+  --vp-badge-warning-border: var(--oxidant-warning-line);
+  --vp-badge-warning-text: var(--oxidant-warning);
+  --vp-badge-warning-bg: var(--oxidant-warning-tint);
+  --vp-badge-danger-border: var(--oxidant-warning-line);
+  --vp-badge-danger-text: var(--oxidant-warning);
+  --vp-badge-danger-bg: var(--oxidant-warning-tint);
+
+  --vp-nav-bg-color: var(--oxidant-bg);
+  --vp-nav-screen-bg-color: var(--oxidant-bg);
+  --vp-local-nav-bg-color: var(--oxidant-bg);
+  --vp-sidebar-bg-color: var(--oxidant-bg);
+  --vp-backdrop-bg-color: rgba(0, 0, 0, 0.6);
+
+  --vp-home-hero-name-color: var(--oxidant-text);
+  --vp-home-hero-name-background: transparent;
+
+  --vp-local-search-bg: var(--oxidant-bg);
+  --vp-local-search-result-bg: var(--oxidant-bg-subtle);
+  --vp-local-search-result-border: var(--oxidant-border);
+  --vp-local-search-result-selected-bg: var(--oxidant-raised);
+  --vp-local-search-result-selected-border: var(--oxidant-border-strong);
+  --vp-local-search-highlight-bg: var(--oxidant-solid);
+  --vp-local-search-highlight-text: var(--oxidant-on-solid);
+
+  /* The website's header is h-14. */
+  --vp-nav-height: 56px;
   --vp-layout-max-width: 1440px;
   --vp-sidebar-width: 260px;
 }
 
-/* Matches the website's `h1,h2,h3 { letter-spacing: -0.02em }`. */
+/* Matches the website's `body` and `::selection` in global.css. */
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+::selection {
+  background: var(--oxidant-solid);
+  color: var(--oxidant-on-solid);
+}
+
+/* ── 3. Chrome ───────────────────────────────────────────────────────────────────── */
+
+/* Nav bar: the website's sticky header — the page surface with a hairline under it,
+   at every scroll position (VitePress drops the rule and the fill at the top of home). */
+.VPNavBar,
+.VPNavBar.home.top,
+.VPNavBar:not(.home.top) .content-body {
+  background-color: color-mix(in srgb, var(--oxidant-bg) 80%, transparent);
+}
+.VPNavBar {
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+@media (min-width: 960px) {
+  .VPNavBar .divider,
+  .VPNavBar.home.top .divider,
+  .VPNavBar.has-sidebar .divider {
+    padding-left: 0;
+  }
+}
+.VPNavBar .divider-line,
+.VPNavBar.home.top .divider-line {
+  background-color: var(--oxidant-border);
+}
+.VPNavBar.has-sidebar .title {
+  border-bottom: 0;
+}
+
+/* Site title reads as the website's LogoLockup: loom mark + semibold, tight wordmark. */
+.VPNavBarTitle .title {
+  gap: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--oxidant-text);
+}
+.VPNavBarTitle .title::before {
+  content: "";
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  background-color: currentColor;
+  -webkit-mask: var(--oxidant-mark) center / contain no-repeat;
+  mask: var(--oxidant-mark) center / contain no-repeat;
+}
+
+/* Nav links: muted, medium weight; active is full-contrast text — never a hue. */
+.VPNavBarMenuLink.VPNavBarMenuLink,
+.VPNavBarMenuGroup .button {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--oxidant-text-muted);
+}
+.VPNavBarMenuLink.VPNavBarMenuLink:hover,
+.VPNavBarMenuGroup .button:hover,
+.VPNavBarMenuLink.VPNavBarMenuLink.active {
+  color: var(--oxidant-text);
+}
+
+/* Search trigger as an .oxidant-btn-ghost. */
+.DocSearch-Button,
+.VPNavBarSearch .DocSearch-Button {
+  border: 1px solid var(--oxidant-border);
+  border-radius: var(--oxidant-radius-sm);
+  background: var(--oxidant-surface);
+}
+.DocSearch-Button:hover {
+  border-color: var(--oxidant-border-strong);
+  background: var(--oxidant-raised);
+}
+.DocSearch-Button .DocSearch-Button-Key,
+.DocSearch-Button .DocSearch-Button-Keys {
+  border-color: var(--oxidant-border);
+  color: var(--oxidant-text-muted);
+}
+.DocSearch-Button .DocSearch-Button-Placeholder,
+.DocSearch-Button .DocSearch-Search-Icon {
+  color: var(--oxidant-text-muted);
+}
+
+/* Appearance switch and social icons: quiet, hairline. */
+.VPSwitch.VPSwitch {
+  border-color: var(--oxidant-border-strong);
+}
+.VPSwitch .check {
+  background-color: var(--oxidant-solid);
+  box-shadow: none;
+}
+.VPSwitch .check svg {
+  color: var(--oxidant-on-solid);
+  fill: var(--oxidant-on-solid);
+}
+.VPSocialLink.VPSocialLink {
+  color: var(--oxidant-text-muted);
+}
+.VPSocialLink.VPSocialLink:hover {
+  color: var(--oxidant-text);
+}
+
+/* Sidebar: the page surface behind a hairline, not a gray panel. */
+.VPSidebar {
+  border-right: 1px solid var(--oxidant-border);
+}
+.VPSidebar .group + .group {
+  border-top-color: var(--oxidant-border);
+}
+/* Group headings are the website's .oxidant-eyebrow. */
+.VPSidebarItem.level-0 > .item > .text,
+.VPSidebarItem.level-0 > .item > .link > .text {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--oxidant-text-muted);
+}
+.VPSidebarItem.level-1 .text,
+.VPSidebarItem.level-2 .text,
+.VPSidebarItem.level-3 .text {
+  font-weight: 400;
+  color: var(--oxidant-text-secondary);
+}
+.VPSidebarItem.is-link > .item > .link:hover .text {
+  color: var(--oxidant-text);
+}
+.VPSidebarItem.is-active > .item > .link > .text {
+  font-weight: 500;
+  color: var(--oxidant-text);
+}
+.VPSidebarItem.is-active > .item > .indicator {
+  background-color: var(--oxidant-solid);
+}
+
+.VPLocalNav {
+  border-bottom-color: var(--oxidant-border);
+}
+
+/* Right-hand outline. */
+.VPDocAsideOutline .outline-title {
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--oxidant-text-muted);
+}
+.VPDocAsideOutline .content {
+  border-left-color: var(--oxidant-border);
+}
+.VPDocOutlineItem .outline-link {
+  color: var(--oxidant-text-muted);
+  font-weight: 400;
+}
+.VPDocOutlineItem .outline-link:hover,
+.VPDocOutlineItem .outline-link.active {
+  color: var(--oxidant-text);
+}
+.VPDocAsideOutline .outline-marker {
+  background-color: var(--oxidant-solid);
+}
+
+/* Prev / next pager as hairline oxidant-cards. */
+.VPDocFooter .pager-link {
+  border-color: var(--oxidant-border);
+  border-radius: var(--oxidant-radius);
+  background-color: var(--oxidant-surface);
+}
+.VPDocFooter .pager-link:hover {
+  border-color: var(--oxidant-border-strong);
+}
+.VPDocFooter .pager-link .desc {
+  color: var(--oxidant-text-muted);
+}
+.VPDocFooter .pager-link .title {
+  color: var(--oxidant-text);
+}
+.VPDocFooter .edit-link-button,
+.VPLastUpdated {
+  color: var(--oxidant-text-muted);
+}
+
+/* Footer: the website's hairline-topped, muted text-sm row. */
+.VPFooter {
+  border-top: 1px solid var(--oxidant-border);
+  background-color: var(--oxidant-bg);
+}
+.VPFooter .message,
+.VPFooter .copyright {
+  font-size: 14px;
+  color: var(--oxidant-text-muted);
+}
+
+/* ── 4. Home ─────────────────────────────────────────────────────────────────────── */
+
+/* Hero: centered, display-weight headline, muted tagline — the website's masthead,
+   laid over the same near-invisible woven field (.woven-field in global.css). */
+.VPHero {
+  position: relative;
+  isolation: isolate;
+  padding-bottom: 80px;
+}
+.VPHero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    repeating-linear-gradient(90deg, var(--oxidant-border) 0 1px, transparent 1px 28px),
+    repeating-linear-gradient(0deg, var(--oxidant-border) 0 1px, transparent 1px 28px);
+  background-size: 28px 28px;
+  -webkit-mask-image: radial-gradient(120% 85% at 50% 0%, #000 28%, transparent 78%);
+  mask-image: radial-gradient(120% 85% at 50% 0%, #000 28%, transparent 78%);
+  opacity: 0.6;
+}
+.VPHero .container,
+.VPHero .main {
+  text-align: center;
+}
+.VPHero .heading {
+  align-items: center;
+}
+.VPHero .name,
+.VPHero .text,
+.VPHero .tagline {
+  margin-left: auto;
+  margin-right: auto;
+}
+/* `name` is the lockup: loom mark + wordmark, as the website's hero opens. */
+.VPHero .name {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  max-width: none;
+  font-size: 32px;
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--oxidant-text);
+}
+.VPHero .name::before {
+  content: "";
+  flex-shrink: 0;
+  width: 1.2em;
+  height: 1.2em;
+  background-color: currentColor;
+  -webkit-mask: var(--oxidant-mark) center / contain no-repeat;
+  mask: var(--oxidant-mark) center / contain no-repeat;
+}
+.VPHero .name .clip {
+  -webkit-text-fill-color: currentColor;
+}
+/* `text` is the .oxidant-display headline. */
+.VPHero .text {
+  margin-top: 28px;
+  max-width: 820px;
+  font-size: 40px;
+  line-height: 1.05;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--oxidant-text);
+}
+.VPHero .tagline {
+  margin-top: 8px;
+  max-width: 672px;
+  font-size: 18px;
+  line-height: 1.55;
+  font-weight: 400;
+  color: var(--oxidant-text-secondary);
+}
+.VPHero .actions {
+  justify-content: center;
+  padding-top: 36px;
+}
+.VPHero .action {
+  padding: 6px;
+}
+@media (min-width: 640px) {
+  .VPHero .name {
+    font-size: 44px;
+  }
+  .VPHero .text {
+    font-size: 60px;
+  }
+  .VPHero .tagline {
+    font-size: 20px;
+  }
+}
+@media (min-width: 960px) {
+  .VPHero {
+    padding-top: calc(var(--vp-nav-height) + 96px);
+    padding-bottom: 112px;
+  }
+  .VPHero .name,
+  .VPHero .text,
+  .VPHero .tagline {
+    max-width: none;
+  }
+  .VPHero .text {
+    max-width: 820px;
+  }
+  .VPHero .tagline {
+    max-width: 672px;
+  }
+}
+
+/* Every VitePress button is an .oxidant-btn: 6px radius, text-sm medium, 36px tall.
+   Component styles are scoped (`.VPButton.medium[data-v-…]`), so a repeated class is
+   how a rule here outranks them; the same trick recurs below. */
+.VPButton.VPButton.medium,
+.VPButton.VPButton.big {
+  border-radius: var(--oxidant-radius-sm);
+  padding: 0 16px;
+  line-height: 34px;
+  font-size: 14px;
+  font-weight: 500;
+  transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+
+/* Features: hairline .oxidant-card grid (both the frontmatter `features` and the
+   `.feature-card` markup the platform landing uses — .VPHome outranks its inline style). */
+.VPFeatures {
+  padding-top: 8px;
+}
+.VPFeature.VPFeature,
+.VPHome .feature-card {
+  border: 1px solid var(--oxidant-border);
+  border-radius: var(--oxidant-radius);
+  background-color: var(--oxidant-surface);
+  transition: border-color 0.15s, background-color 0.15s;
+}
+.VPFeature.VPFeature.link:hover,
+.VPHome .feature-card:hover {
+  border-color: var(--oxidant-border-strong);
+}
+.VPFeature .box {
+  padding: 24px;
+}
+.VPFeature .title,
+.VPHome .vp-doc .feature-card h3 {
+  margin: 0 0 8px;
+  padding: 0;
+  border: 0;
+  font-size: 16px;
+  line-height: 1.5;
+  font-weight: 600;
+  letter-spacing: normal;
+  color: var(--oxidant-text);
+}
+.VPFeature .details,
+.VPHome .vp-doc .feature-card p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.625;
+  font-weight: 400;
+  color: var(--oxidant-text-secondary);
+}
+.VPHome .feature-card {
+  padding: 24px;
+}
+.VPHome .feature-cards {
+  gap: 20px;
+}
+.VPFeature .link-text-value {
+  color: var(--oxidant-text);
+}
+
+/* ── 5. Doc content ──────────────────────────────────────────────────────────────── */
+
+/* Matches the website's `h1,h2,h3 { letter-spacing: -0.02em }` and display scale. */
 .vp-doc h1,
 .vp-doc h2,
 .vp-doc h3 {
   letter-spacing: -0.02em;
+  font-weight: 600;
+}
+.vp-doc h1 {
+  font-size: 36px;
+  line-height: 1.1;
+}
+@media (min-width: 768px) {
+  .vp-doc h1 {
+    font-size: 44px;
+    line-height: 1.08;
+  }
+}
+.vp-doc h2 {
+  border-top-color: var(--oxidant-border);
+  font-size: 24px;
+}
+.vp-doc h3 {
+  font-size: 20px;
+}
+.vp-doc p,
+.vp-doc li {
+  color: var(--oxidant-text);
+}
+.vp-doc strong {
+  font-weight: 600;
+}
+.vp-doc hr {
+  border-top-color: var(--oxidant-border);
+}
+
+/* Links are the website's .oxidant-link: the underline carries the emphasis, not hue. */
+.vp-doc a {
+  font-weight: 500;
+  color: var(--oxidant-text);
+  text-decoration: underline;
+  text-decoration-color: var(--oxidant-border-strong);
+  text-underline-offset: 4px;
+  transition: text-decoration-color 0.15s, color 0.15s;
+}
+.vp-doc a:hover {
+  color: var(--oxidant-text);
+  text-decoration-color: var(--oxidant-text);
+}
+.vp-doc .header-anchor {
+  text-decoration: none;
+  color: var(--oxidant-text-muted);
+}
+.VPHome .vp-doc a.feature-card {
+  text-decoration: none;
 }
 
 /* Inline code reads as a quiet chip rather than a second accent color. */
@@ -116,8 +696,99 @@
   background-color: var(--oxidant-raised);
   color: var(--oxidant-text);
   border: 1px solid var(--oxidant-border);
-  border-radius: var(--oxidant-radius-sm, 6px);
+  border-radius: var(--oxidant-radius-sm);
   font-size: 0.875em;
+}
+.vp-doc a > code {
+  color: inherit;
+}
+
+/* Code blocks: the website's CodeBlock — dark in both themes, hairline, 8px, 13px mono,
+   monochrome text with dimmed comments. Shiki's per-token hues are overridden: the
+   website has none, and its light palette would be illegible on the dark surface. */
+.vp-doc div[class*="language-"],
+.vp-block {
+  border: 1px solid var(--oxidant-code-border);
+  border-radius: var(--oxidant-radius);
+}
+.dark .vp-doc div[class*="language-"] {
+  border-color: var(--oxidant-border);
+}
+@media (max-width: 639px) {
+  .vp-doc div[class*="language-"] {
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+  }
+}
+.vp-doc div[class*="language-"] code {
+  font-size: 13px;
+}
+.vp-code span,
+.dark .vp-code span,
+html:not(.dark) .vp-code span {
+  color: var(--oxidant-code-text);
+}
+.vp-code span[style*="--shiki-dark:#6A737D"],
+.dark .vp-code span[style*="--shiki-dark:#6A737D"],
+html:not(.dark) .vp-code span[style*="--shiki-dark:#6A737D"] {
+  color: var(--oxidant-code-text-dim);
+}
+.vp-doc [class*="language-"] > button.copy {
+  border-radius: var(--oxidant-radius-sm);
+}
+.vp-doc [class*="language-"] > span.lang {
+  font-family: var(--oxidant-font-mono);
+}
+
+/* Code groups: the tab strip sits on the same dark surface, with the hairline shared. */
+.vp-code-group .tabs {
+  border: 1px solid var(--oxidant-code-border);
+  border-bottom: 0;
+  border-radius: var(--oxidant-radius) var(--oxidant-radius) 0 0;
+}
+.dark .vp-code-group .tabs {
+  border-color: var(--oxidant-border);
+}
+.vp-code-group .tabs label {
+  font-weight: 500;
+}
+.vp-code-group div[class*="language-"] {
+  border-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+@media (max-width: 639px) {
+  .vp-code-group .tabs {
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+  }
+}
+
+/* Custom blocks (::: tip / warning / …): hairline cards; titles weight, not hue. */
+.vp-doc .custom-block {
+  border-radius: var(--oxidant-radius);
+}
+.vp-doc .custom-block .custom-block-title {
+  font-weight: 600;
+}
+.vp-doc .custom-block.tip .custom-block-title,
+.vp-doc .custom-block.info .custom-block-title,
+.vp-doc .custom-block.note .custom-block-title,
+.vp-doc .custom-block.important .custom-block-title {
+  color: var(--oxidant-text);
+}
+.vp-doc .custom-block.warning .custom-block-title,
+.vp-doc .custom-block.danger .custom-block-title,
+.vp-doc .custom-block.caution .custom-block-title {
+  color: var(--oxidant-warning);
+}
+.vp-doc .custom-block a {
+  color: var(--oxidant-text);
+}
+.vp-doc .custom-block :not(pre) > code {
+  background-color: var(--oxidant-raised);
 }
 
 /* Tables carry most of the reference material in these docs, so they get real
@@ -132,6 +803,12 @@
   color: var(--oxidant-text);
   background-color: var(--oxidant-bg-subtle);
 }
+.vp-doc tr {
+  border-top-color: var(--oxidant-border);
+}
+.vp-doc tr:nth-child(2n) {
+  background-color: transparent;
+}
 .vp-doc td,
 .vp-doc th {
   border-color: var(--oxidant-border);
@@ -144,14 +821,23 @@
   padding-left: 1rem;
   color: var(--oxidant-text-secondary);
 }
+.vp-doc blockquote > p {
+  color: var(--oxidant-text-secondary);
+}
 .vp-doc blockquote strong {
   color: var(--oxidant-text);
+}
+
+/* Images (screenshots) take the website's corner radius. */
+.vp-doc img {
+  border-radius: var(--oxidant-radius);
 }
 
 /* Mermaid diagrams render on a light card in both themes; the generated SVG bakes in
    dark strokes, so a dark page background would make them unreadable. */
 .vp-doc .mermaid {
   background: #ffffff;
+  border: 1px solid var(--oxidant-border);
   border-radius: var(--oxidant-radius);
   padding: 1rem;
   overflow-x: auto;

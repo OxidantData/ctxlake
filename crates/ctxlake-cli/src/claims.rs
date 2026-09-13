@@ -566,8 +566,154 @@ fn demote_cached_claims(cache_dir: &std::path::Path, agent_id: &str) -> Result<u
     Ok(demoted)
 }
 
+/// How much word overlap makes two claims worth a human look.
+///
+/// Low on purpose. This reports rather than acts, so a false positive costs one line
+/// of output and a false negative hides a duplicate that nothing else will catch.
+/// Measured on a real lake, the true duplicates sit between 35% and 73% and the true
+/// distinctions sit in the same band — which is exactly why this cannot decide for you.
+const DUPLICATE_REVIEW_THRESHOLD: f32 = 0.35;
+
+/// One promoted claim as this report reads it: `(claim_id, claim_type, subject, claim)`.
+type ClaimRow = (String, String, String, String);
+
+/// Symmetric word overlap (Jaccard).
+///
+/// Deliberately not `gate::lexical_overlap`, which divides by the *first* claim's word
+/// count and so scores a short claim inside a long one very differently depending on
+/// which is passed first. For "are these the same thing" the measure has to be
+/// symmetric, or the answer depends on iteration order.
+fn word_overlap(a: &str, b: &str) -> f32 {
+    let words = |s: &str| -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    let (wa, wb) = (words(a), words(b));
+    if wa.is_empty() || wb.is_empty() {
+        return 0.0;
+    }
+    wa.intersection(&wb).count() as f32 / wa.union(&wb).count() as f32
+}
+
+/// `ctxlake claims --duplicates` — promoted claims that may be saying the same thing.
+pub async fn run_duplicates(cfg: &Config) -> Result<()> {
+    // `snapshot::open` joins the fleet id itself, so it takes the cache ROOT. Passing
+    // `paths::cache_dir` (which already ends in the fleet id) looked for
+    // `<cache>/<fleet>/<fleet>/snapshot.bin` and reported "no snapshot synced yet"
+    // against a lake that had one — the same shape of path bug `paths.rs`'s module doc
+    // warns about, caught here only by running it.
+    let Some(conn) = ctxlake_mcp::snapshot::open(&ctxlake_core::paths::cache_root(), &cfg.fleet_id)
+    else {
+        println!("no snapshot synced locally yet for this fleet.");
+        return Ok(());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT claim_id, claim_type, subject, claim FROM claims \
+         WHERE status = 'promoted' ORDER BY claim_id",
+    )?;
+    let rows: Vec<ClaimRow> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .filter_map(Result::ok)
+        .collect();
+
+    let mut pairs: Vec<(f32, &ClaimRow, &ClaimRow)> = Vec::new();
+    for (i, a) in rows.iter().enumerate() {
+        for b in rows.iter().skip(i + 1) {
+            let o = word_overlap(&a.3, &b.3);
+            if o >= DUPLICATE_REVIEW_THRESHOLD {
+                pairs.push((o, a, b));
+            }
+        }
+    }
+    pairs.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if pairs.is_empty() {
+        println!(
+            "no likely duplicates among {} promoted claim(s).",
+            rows.len()
+        );
+        return Ok(());
+    }
+    println!(
+        "{} possible duplicate pair(s) among {} promoted claims.\n\
+         Reported, not merged: at this overlap a real duplicate and a real distinction \
+         look the same,\nso the call is yours. Retire one side with `ctxlake quarantine` \
+         or leave both.\n",
+        pairs.len(),
+        rows.len()
+    );
+    for (o, a, b) in pairs {
+        let same_subject = if a.2 == b.2 { " · same subject" } else { "" };
+        let same_type = if a.1 == b.1 {
+            ""
+        } else {
+            " · DIFFERENT TYPES"
+        };
+        println!("  [{:.0}% overlap{same_subject}{same_type}]", o * 100.0);
+        println!("    {} [{}] {}", &a.0[..8.min(a.0.len())], a.1, a.3);
+        println!("    {} [{}] {}", &b.0[..8.min(b.0.len())], b.1, b.3);
+        println!();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn word_overlap_is_symmetric() {
+        // `gate::lexical_overlap` divides by the first claim's word count, so a short
+        // claim inside a long one scores very differently depending on argument order.
+        // For "are these the same thing" that makes the answer depend on iteration
+        // order, which is not an answer.
+        let a = "the theme stylesheet must be byte-identical across both repos";
+        let b = "stylesheet must be byte-identical";
+        assert!((super::word_overlap(a, b) - super::word_overlap(b, a)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_duplicate_report_separates_nothing_it_cannot_separate() {
+        // Verbatim from a live lake — not paraphrased, because the whole point is the
+        // measured numbers, and an abbreviated version scores differently. The first
+        // pair is two genuinely different TLS facts; the second is one stylesheet fact
+        // stated twice. Any rule that merged the second would merge the first.
+        let tls_a = "In manual mode, the TLS Secret is mounted read-only at \
+                     /etc/oxidant-platform/tls; OXIDANT_PLATFORM_TLS_CERT points to \
+                     tls.crt and OXIDANT_PLATFORM_TLS_KEY points to tls.key";
+        let tls_b = "TLS certificate mounting for manual mode uses a kubernetes.io/tls \
+                     Secret type with tls.crt and tls.key mounted read-only at \
+                     /etc/oxidant-platform/tls";
+        let css_a = "The shared theme stylesheet (site/.vitepress/theme/oxidant.css) \
+                     must be byte-identical in both the Oxidant Platform (soapfish) and \
+                     ctxlake repos";
+        let css_b = "oxidantdata.css theme stylesheet must be byte-identical across \
+                     ctxlake and Oxidant Platform docs repos to maintain unified brand";
+
+        let distinct = super::word_overlap(tls_a, tls_b);
+        let duplicate = super::word_overlap(css_a, css_b);
+
+        assert!(
+            distinct >= super::DUPLICATE_REVIEW_THRESHOLD
+                && duplicate >= super::DUPLICATE_REVIEW_THRESHOLD,
+            "both must surface for review: distinct={distinct} duplicate={duplicate}"
+        );
+        assert!(
+            distinct >= duplicate,
+            "the DISTINCT pair scores at least as high as the duplicate one \
+             ({distinct} vs {duplicate}) — which is precisely why this reports instead \
+             of merging. If that ever inverts durably, revisit automating it."
+        );
+    }
+
+    #[test]
+    fn identical_claims_score_one_and_unrelated_ones_score_low() {
+        assert!((super::word_overlap("a b c", "a b c") - 1.0).abs() < f32::EPSILON);
+        assert!(super::word_overlap("cargo test workspace", "nginx tls certificate") < 0.1);
+        assert_eq!(super::word_overlap("", "anything"), 0.0);
+    }
     use super::*;
     use ctxlake_store::clock::SystemClock;
     use std::sync::Arc;

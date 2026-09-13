@@ -17,7 +17,7 @@ exceptions are flagged inline — `ctxlake install hermes` wires hooks but not M
 | `ctxlake config` | Print the resolved config |
 | `ctxlake sync` | Run the daemon, or install it as a service so it survives a reboot |
 | `ctxlake maint` | Run the maintenance chain — safe from any number of hosts at once |
-| `ctxlake claims` | Review candidate / contested / promoted claims |
+| `ctxlake claims` | Review candidate / contested / promoted claims, or `--duplicates` |
 | `ctxlake quarantine` | Stop one agent's claims from promoting |
 | `ctxlake briefing` | Render the session briefing, or write it to the cache the hook reads |
 | `ctxlake mcp` | The stdio MCP server; `ctxlake install` registers it with each runtime |
@@ -344,6 +344,26 @@ auto-promote beyond agent scope"*.
 > the gate. The contradiction and independence checks need data it does not carry, and it
 > says so rather than guessing. `--status promoted`/`contested` read the local cache
 > mirror, the same file `memory_search` reads.
+
+### `ctxlake claims --duplicates`
+
+```sh
+ctxlake claims --duplicates
+```
+
+Promoted claims that may be saying the same thing, most-similar first.
+
+**Reported, not merged, and that is the finding rather than a limitation.** Measured on
+a real lake: two claims about TLS sharing 48% of their words are different facts (one
+names the Secret *type*, the other the *mount path*); two about a stylesheet sharing 46%
+are one fact stated twice. The distinctions score at least as high as the duplicates, so
+no threshold separates them and any automatic merge fuses things that are not the same.
+Retire one side with `ctxlake quarantine`, or leave both.
+
+New duplicates are prevented at extraction time instead — the extractor is shown what
+the fleet already believes and asked to repeat a known claim verbatim rather than reword
+it, so the second observation merges onto the existing claim as corroboration. This
+command is for the backlog that predates that.
 
 ### `ctxlake quarantine`
 

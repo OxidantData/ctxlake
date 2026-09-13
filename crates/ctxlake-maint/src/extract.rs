@@ -1721,6 +1721,14 @@ RULES.
 pub struct ExtractOutcome {
     pub session_id: String,
     pub claims_proposed: usize,
+    /// Dropped for a `claim_type` this build does not recognize.
+    ///
+    /// Split from [`Self::dropped_unresolvable`] because the two call for opposite
+    /// fixes — a prompt that names the types versus a bug in how evidence resolves —
+    /// and a single "dropped" count cannot tell an operator which they are looking at.
+    pub dropped_bad_type: usize,
+    /// Dropped because no citation resolved against a captured envelope.
+    pub dropped_unresolvable: usize,
     /// How many claims the model returned, before any were dropped.
     ///
     /// Reported separately from `claims_proposed` because the two failures look
@@ -1787,6 +1795,10 @@ pub async fn extract_session(
             session_id: session.session_id.clone(),
             claims_proposed: 0,
             claims_returned: 0,
+            // An empty transcript reaches no model, so nothing was dropped — it was
+            // never proposed. Zero here means "no claims lost", not "not measured".
+            dropped_bad_type: 0,
+            dropped_unresolvable: 0,
             skipped_already_extracted: false,
         });
     }
@@ -1901,6 +1913,8 @@ pub async fn extract_session(
         session_id: session.session_id.clone(),
         claims_proposed: proposed,
         claims_returned: returned,
+        dropped_bad_type,
+        dropped_unresolvable,
         skipped_already_extracted: false,
     })
 }
@@ -1919,6 +1933,13 @@ pub struct ExtractRunSummary {
     /// maintenance chain, taking compaction, digests, the gate and the snapshot with
     /// it — none of which involve a model.
     pub sessions_failed: usize,
+    /// Why claims were dropped, split by cause. These reach the operator through the
+    /// cycle summary, not through `tracing` — **nothing in this workspace installs a
+    /// `tracing_subscriber`**, so every `tracing::warn!` here is written to a
+    /// subscriber that does not exist. A diagnostic nobody can read is not a
+    /// diagnostic, so the counts travel on the value that actually gets printed.
+    pub dropped_bad_type: usize,
+    pub dropped_unresolvable: usize,
     /// The most recent failure, for the cycle summary. One example beats a count with
     /// no detail, and the full list belongs in the log rather than in one line.
     pub last_error: Option<String>,
@@ -1997,6 +2018,8 @@ pub async fn run(
                 }
                 summary.claims_proposed += outcome.claims_proposed;
                 summary.claims_returned += outcome.claims_returned;
+                summary.dropped_bad_type += outcome.dropped_bad_type;
+                summary.dropped_unresolvable += outcome.dropped_unresolvable;
             }
             Err(e) => {
                 summary.sessions_failed += 1;

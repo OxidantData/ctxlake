@@ -234,12 +234,18 @@ fn describe_extraction(o: &Option<ctxlake_maint::extract::ExtractRunSummary>) ->
             e.sessions_failed,
             e.last_error.as_deref().unwrap_or("unknown"),
         ),
+        // Name the cause. "7 DROPPED" sent me reading source to find out whether the
+        // model had named a type we do not have or cited something we could not
+        // resolve; they are different bugs, and the line now says which.
         Some(e) if e.claims_returned != e.claims_proposed => format!(
-            "tier 2: {} session(s) extracted, {} of {} claim(s) kept ({} DROPPED)",
+            "tier 2: {} session(s) extracted, {} of {} claim(s) kept ({} DROPPED: {} \
+             unresolvable citation, {} bad claim_type)",
             e.sessions_processed,
             e.claims_proposed,
             e.claims_returned,
             e.claims_returned.saturating_sub(e.claims_proposed),
+            e.dropped_unresolvable,
+            e.dropped_bad_type,
         ),
         Some(e) => format!(
             "tier 2: {} session(s) extracted, {} claim(s) proposed",
@@ -335,11 +341,33 @@ mod tests {
             last_error: None,
             sessions_processed: 3,
             claims_proposed: 5,
+            ..Default::default()
         };
         let text = describe_extraction(&Some(summary));
         assert!(text.contains('3'), "{text}");
         assert!(text.contains('5'), "{text}");
         assert!(!text.contains("disabled"), "{text}");
+    }
+
+    /// A drop count with no cause is what sent an operator reading source to find out
+    /// whether the model had named an unknown type or cited an unresolvable message.
+    #[test]
+    fn a_dropped_claim_is_reported_with_the_cause_that_dropped_it() {
+        let summary = ctxlake_maint::extract::ExtractRunSummary {
+            sessions_processed: 4,
+            claims_returned: 27,
+            claims_proposed: 20,
+            dropped_unresolvable: 7,
+            dropped_bad_type: 0,
+            ..Default::default()
+        };
+        let text = describe_extraction(&Some(summary));
+        assert!(text.contains("7 DROPPED"), "{text}");
+        assert!(
+            text.contains("7 unresolvable citation"),
+            "the cause must be named, not left to a source read: {text}"
+        );
+        assert!(text.contains("0 bad claim_type"), "{text}");
     }
 
     #[test]

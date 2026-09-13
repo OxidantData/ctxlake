@@ -25,6 +25,21 @@ per sealed session, reading `tool.exit_code` regardless of which runtime produce
 > briefings and handoffs are derived mechanically and cannot mislead a fleet. Everything
 > below can. That asymmetry is why the belief layer is off by default.
 
+> **`convention` asks for 1 observation today, not 2, and that is a concession.**
+> Two independent observations is the right bar — it is what separates a convention the
+> codebase has from one agent's opinion. But the count it compares against subtracts
+> sessions that were *told* a related claim, via `injected_context`, and **nothing
+> populates that field yet**. So the count cannot exceed 1 from a single session and the
+> bar was not strict, it was unreachable: on a real fleet all 41 conventions sat as
+> permanent candidates, including the most useful claims in it.
+>
+> An unreachable gate protects nothing; it discards the category. What still stands
+> between a convention and a context window: the contradiction gate, the provenance
+> gate, the quarantine kill switch, and attribution on read — a promoted convention
+> shows its observer, its session, its count of 1, and the standing "verify before
+> relying on these" note. The threshold returns to 2 once `injected_context` is
+> populated and the count means something.
+
 ## Turning on Tier 2
 
 `ctxlake maint --once` compacts, digests, and publishes the snapshot for free, with the
@@ -105,7 +120,7 @@ are all appends, and current state is the fold.
 |---|---|---|---|
 | `environment` | "staging SSH listens on 2222" | 1 observation | 30d, re-verify |
 | `outcome` | "the Glue migration passed CI at abc123" | 1 observation, immutable, timestamped | none |
-| `convention` | "this repo uses `just`, not `make`" | 2 **independent** observations | 180d |
+| `convention` | "this repo uses `just`, not `make`" | 1 observation *(see below)* | 180d |
 | `preference` | "prefers terse output" | human approval | 365d |
 | `hypothesis` | "the flake is a colima scheduling artifact" | **never auto-promotes beyond agent scope** | 14d |
 

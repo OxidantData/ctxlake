@@ -3661,18 +3661,27 @@ third line";
         .await
         .unwrap();
 
+        // The half that still holds: extraction reuses the SAME `claim_id` across both
+        // sessions rather than filing two claims, so the echo is recognised as one
+        // claim with two reporters instead of two independent agreements. That is what
+        // makes `compute_independent_count` able to see through it at all.
         assert_eq!(
-            summary.promoted, 0,
-            "one observation wearing two reporters must not promote a convention \
-             (which requires 2 INDEPENDENT sessions)"
+            summary.promoted + summary.sent_to_review,
+            1,
+            "both sessions must land on one claim, not two"
         );
-        assert_eq!(summary.sent_to_review, 1);
-        assert!(
-            crate::claims::list_fleet_claims(&store)
-                .await
-                .unwrap()
-                .is_empty(),
-            "the echoed claim must never reach fleet scope"
+
+        // The half that changed: `Convention`'s independence threshold is now 1, so
+        // that single independent observation promotes. This used to assert
+        // `promoted == 0` and that the claim never reached fleet scope.
+        //
+        // The concession is documented on `gate::independent_threshold`: a bar of 2 was
+        // unreachable while nothing populates `injected_context`, so it discarded every
+        // convention rather than protecting against echoes. **Restore this assertion
+        // when `injected_context` is populated and the threshold goes back to 2.**
+        assert_eq!(
+            summary.promoted, 1,
+            "with the threshold at 1, the claim promotes; see independent_threshold"
         );
     }
 }

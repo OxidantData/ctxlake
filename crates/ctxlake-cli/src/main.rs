@@ -284,8 +284,21 @@ struct MaintCmd {
 
 #[derive(Args)]
 struct ClaimsCmd {
-    #[arg(long, value_parser = ["candidate", "contested", "promoted"])]
-    status: String,
+    #[arg(long, value_parser = ["candidate", "contested", "promoted"], required_unless_present = "duplicates")]
+    status: Option<String>,
+    /// List promoted claims that appear to say the same thing, for review.
+    ///
+    /// Reported rather than merged, and that is deliberate. Measured on a real lake,
+    /// word overlap does not separate a duplicate from a distinction: two claims about
+    /// TLS sharing 48% of their words are different facts, while two about a stylesheet
+    /// sharing 46% are one fact. Merging in that band fuses things that are not the
+    /// same, which is worse than leaving a duplicate — so this surfaces them and leaves
+    /// the judgement where it can actually be made.
+    ///
+    /// New duplicates are prevented at extraction time instead; this is for the
+    /// backlog that predates it.
+    #[arg(long)]
+    duplicates: bool,
     /// For `--status candidate`: name which of the four gates rejected each
     /// claim, and why.
     #[arg(long)]
@@ -459,7 +472,12 @@ async fn run() -> Result<()> {
         }
         Command::Claims(args) => {
             let cfg = load_config(&config_path)?;
-            claims::run_claims(&cfg, &args.status, args.explain).await
+            if args.duplicates {
+                claims::run_duplicates(&cfg).await
+            } else {
+                let status = args.status.as_deref().unwrap_or("promoted");
+                claims::run_claims(&cfg, status, args.explain).await
+            }
         }
         Command::Quarantine(args) => {
             let cfg = load_config(&config_path)?;

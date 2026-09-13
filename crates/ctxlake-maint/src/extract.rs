@@ -1104,10 +1104,27 @@ fn excerpt(raw: &str) -> String {
 /// Bounded because this rides in front of every transcript and a fleet's claim count
 /// only grows. Newest first, so a growing lake keeps showing what is most likely to be
 /// re-observed rather than what happened first.
-const MAX_KNOWN_CLAIMS_SHOWN: usize = 60;
+const MAX_KNOWN_CLAIMS_SHOWN: usize = 400;
 
-/// And how much of each, so one verbose claim cannot crowd out fifty others.
-const MAX_KNOWN_CLAIM_CHARS: usize = 240;
+/// How many bytes of claim text the preamble may spend, in total.
+///
+/// The preamble is bounded by **size**, not by a claim count, and an individual claim
+/// is either shown whole or not at all. Those two rules go together, and the second is
+/// the important one:
+///
+/// This block tells the model to repeat a known claim CHARACTER FOR CHARACTER, because
+/// an exact match is what merges a second observation onto the existing claim
+/// (`find_existing_claim_id`). Showing a *truncated* claim makes that instruction
+/// impossible to obey — the full text is not in the context — and the failure is worse
+/// than silence: a model that dutifully repeats the truncated text produces something
+/// that no longer matches, so it mints a brand-new claim. Truncation here manufactures
+/// exactly the duplicates this preamble exists to prevent.
+///
+/// Measured on a real fleet at the old caps: 75 of 135 known claims were never shown at
+/// all, and 14 more were shown cut off. Corroboration could only happen for a claim that
+/// was both recent enough and short enough, which is why `independent_count` sat at 1
+/// across the entire lake.
+const MAX_KNOWN_CLAIMS_BYTES: usize = 64 * 1024;
 
 /// The "already recorded" block prefixed to a transcript, or `None` when the fleet
 /// believes nothing yet.
@@ -1130,7 +1147,6 @@ fn known_claims_preamble(existing: &BTreeMap<String, ClaimState>) -> Option<Stri
     }
     // Newest first: `claim_id` is a ULID, so lexicographic order is chronological.
     rows.sort_by(|a, b| b.claim_id.cmp(&a.claim_id));
-    rows.truncate(MAX_KNOWN_CLAIMS_SHOWN);
 
     let mut out = String::from(
         "ALREADY RECORDED — the fleet has these claims.\n\
@@ -1142,21 +1158,20 @@ fn known_claims_preamble(existing: &BTreeMap<String, ClaimState>) -> Option<Stri
          creates a duplicate; omitting throws the corroboration away.\n\
          Propose a new claim only for something not already listed here.\n",
     );
-    for c in rows {
-        let text = truncate_chars(&c.claim, MAX_KNOWN_CLAIM_CHARS);
-        out.push_str(&format!("- [{}] {}\n", c.claim_type.as_str(), text));
+    // Whole claims only, until the budget is spent. A claim too long to fit is skipped
+    // rather than cut down — see `MAX_KNOWN_CLAIMS_BYTES`. `MAX_KNOWN_CLAIMS_SHOWN` is
+    // the backstop for a lake far larger than the budget would ever admit.
+    let mut spent = 0usize;
+    for c in rows.iter().take(MAX_KNOWN_CLAIMS_SHOWN) {
+        let line = format!("- [{}] {}\n", c.claim_type.as_str(), c.claim);
+        if spent + line.len() > MAX_KNOWN_CLAIMS_BYTES {
+            continue;
+        }
+        spent += line.len();
+        out.push_str(&line);
     }
     out.push_str("\nTRANSCRIPT:\n");
     Some(out)
-}
-
-/// Truncate on a character boundary, marking that it happened.
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max).collect();
-    format!("{cut}…")
 }
 
 /// Whether a rendered transcript carries enough for a claim to be grounded in.
@@ -2610,6 +2625,62 @@ mod tests {
         assert!(
             preamble.contains("TRANSCRIPT:"),
             "must separate the two sections"
+        );
+    }
+
+    /// **"Repeat it character for character" and a truncated claim cannot both be
+    /// true.** The preamble used to cut every known claim at 240 characters while
+    /// asking the model to reproduce it exactly. A model that obeys produces text that
+    /// no longer matches, so `find_existing_claim_id` finds nothing and mints a fresh
+    /// claim — truncation manufactured the duplicates this block exists to prevent.
+    /// Whole claim or no claim; there is no third option that is safe.
+    #[test]
+    fn a_known_claim_is_shown_whole_or_not_at_all_never_cut_short() {
+        let long = "x".repeat(600);
+        let mut existing = BTreeMap::new();
+        existing.insert(
+            "c1".to_string(),
+            claim_state("c1", ClaimType::Convention, "ci", &long),
+        );
+        let preamble = known_claims_preamble(&existing).expect("something is known");
+        assert!(
+            preamble.contains(&long),
+            "a claim the model is told to repeat exactly must appear in full"
+        );
+        assert!(
+            !preamble.contains('…'),
+            "no ellipsis: a cut-off claim cannot be repeated character for character"
+        );
+    }
+
+    /// The budget is bytes, not a claim count — and it drops whole claims to stay under
+    /// it. At the old count-based cap, 75 of a real fleet's 135 known claims were never
+    /// shown, so a session re-observing one of them could not corroborate it.
+    #[test]
+    fn the_preamble_is_bounded_by_bytes_and_still_shows_far_more_than_sixty_claims() {
+        let mut existing = BTreeMap::new();
+        for i in 0..200 {
+            let id = format!("c{i:04}");
+            existing.insert(
+                id.clone(),
+                claim_state(
+                    &id,
+                    ClaimType::Convention,
+                    "s",
+                    &format!("claim number {i}"),
+                ),
+            );
+        }
+        let preamble = known_claims_preamble(&existing).expect("something is known");
+        let shown = preamble.lines().filter(|l| l.starts_with("- [")).count();
+        assert!(
+            shown > 60,
+            "the old count cap hid everything past 60; showed {shown}"
+        );
+        assert!(
+            preamble.len() <= MAX_KNOWN_CLAIMS_BYTES + 1024,
+            "still bounded: {} bytes",
+            preamble.len()
         );
     }
 

@@ -226,6 +226,14 @@ fn describe_extraction(o: &Option<ctxlake_maint::extract::ExtractRunSummary>) ->
         // answered and `claim_from_raw` discarded it — an unparseable claim_type, or a
         // citation resolving to no captured message. One number made a prompt problem
         // and a parser bug indistinguishable.
+        Some(e) if e.sessions_failed > 0 => format!(
+            "tier 2: {} session(s) extracted, {} claim(s) proposed, {} FAILED (retried \
+             next pass; last: {})",
+            e.sessions_processed,
+            e.claims_proposed,
+            e.sessions_failed,
+            e.last_error.as_deref().unwrap_or("unknown"),
+        ),
         Some(e) if e.claims_returned != e.claims_proposed => format!(
             "tier 2: {} session(s) extracted, {} of {} claim(s) kept ({} DROPPED)",
             e.sessions_processed,
@@ -323,6 +331,8 @@ mod tests {
         assert_eq!(describe_extraction(&None), "tier 2: disabled");
         let summary = ctxlake_maint::extract::ExtractRunSummary {
             claims_returned: 0,
+            sessions_failed: 0,
+            last_error: None,
             sessions_processed: 3,
             claims_proposed: 5,
         };

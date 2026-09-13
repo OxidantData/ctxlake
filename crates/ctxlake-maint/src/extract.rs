@@ -1068,9 +1068,35 @@ struct RawExtraction {
 /// silently stored — docs/memory.md's "structured output" rule.
 pub fn parse_claims_response(raw: &str) -> Result<Vec<RawClaim>, ExtractError> {
     let candidate = unwrap_json_payload(raw);
-    let parsed: RawExtraction = serde_json::from_str(candidate)
-        .map_err(|e| ExtractError::MalformedResponse(e.to_string()))?;
-    Ok(parsed.claims)
+    serde_json::from_str::<RawExtraction>(candidate)
+        .map(|p| p.claims)
+        .map_err(|e| {
+            // The parser error alone said "expected value at line 1 column 1" and
+            // nothing about what arrived — which on a real lake meant a failing
+            // extraction that could not be diagnosed without reproducing it by hand.
+            // A bounded excerpt of the actual response is the difference between
+            // "the model refused" and "the envelope shape changed".
+            ExtractError::MalformedResponse(format!("{e}; response began: {}", excerpt(raw)))
+        })
+}
+
+/// A short, single-line, quoted excerpt of a model response, for an error message.
+///
+/// Bounded and flattened because this lands in a log an operator reads: a full
+/// response can be kilobytes, and a raw newline turns one error into forty lines.
+fn excerpt(raw: &str) -> String {
+    const MAX: usize = 200;
+    let flat: String = raw
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX)
+        .collect();
+    if raw.trim().chars().count() > MAX {
+        format!("{flat:?}…")
+    } else {
+        format!("{flat:?}")
+    }
 }
 
 /// Pull the JSON object out of a response that may have been dressed up.
@@ -1641,6 +1667,15 @@ pub struct ExtractRunSummary {
     /// [`ExtractOutcome::claims_returned`] — without it, a prompt that produces nothing
     /// and a parser that discards everything report the same number.
     pub claims_returned: usize,
+    /// Sessions whose extraction failed and will be retried next pass.
+    ///
+    /// Counted rather than propagated: a failure here used to abort the whole
+    /// maintenance chain, taking compaction, digests, the gate and the snapshot with
+    /// it — none of which involve a model.
+    pub sessions_failed: usize,
+    /// The most recent failure, for the cycle summary. One example beats a count with
+    /// no detail, and the full list belongs in the log rather than in one line.
+    pub last_error: Option<String>,
 }
 
 /// The full Tier 2 pass: find sealed, not-yet-extracted sessions and extract
@@ -1679,19 +1714,51 @@ pub async fn run(
         if is_already_extracted(store, fleet_id, &session_ref.session_id).await? {
             continue;
         }
-        let transcript = load_transcript(store, &session_ref).await?;
+        let transcript = match load_transcript(store, &session_ref).await {
+            Ok(t) => t,
+            Err(e) => {
+                summary.sessions_failed += 1;
+                tracing::warn!(session_id = %session_ref.session_id, error = %e,
+                    "could not load a session for extraction; continuing");
+                continue;
+            }
+        };
         let date = transcript
             .envelopes
             .first()
             .and_then(|e| e.emitted_at.get(0..10))
             .unwrap_or("1970-01-01")
             .to_string();
-        let outcome = extract_session(store, cfg, provider, &transcript, &date, fleet_id).await?;
-        if !outcome.skipped_already_extracted {
-            summary.sessions_processed += 1;
+
+        // **One session's failure must not end the pass.**
+        //
+        // This was `?`, and a single malformed model response therefore aborted not
+        // just extraction but the entire maintenance chain — `run::run` propagates it
+        // before compaction's siblings, the gate and the snapshot ever run. Seen the
+        // first time retry was enabled: 37 sessions became eligible again, the second
+        // one came back as something that was not JSON, and the whole cycle died with
+        // it. Every session after it stayed unextracted, and the digests and snapshot
+        // that had nothing to do with a model were skipped too.
+        //
+        // Exactly the shape already fixed twice at the daemon and cycle boundaries: an
+        // optional step taking mandatory ones down with it. `extract_session` releases
+        // its own marker on failure, so a session that fails here is retried next pass
+        // rather than being marked done.
+        match extract_session(store, cfg, provider, &transcript, &date, fleet_id).await {
+            Ok(outcome) => {
+                if !outcome.skipped_already_extracted {
+                    summary.sessions_processed += 1;
+                }
+                summary.claims_proposed += outcome.claims_proposed;
+                summary.claims_returned += outcome.claims_returned;
+            }
+            Err(e) => {
+                summary.sessions_failed += 1;
+                summary.last_error = Some(e.to_string());
+                tracing::warn!(session_id = %session_ref.session_id, error = %e,
+                    "extraction failed for one session; continuing with the rest");
+            }
         }
-        summary.claims_proposed += outcome.claims_proposed;
-        summary.claims_returned += outcome.claims_returned;
     }
     Ok(summary)
 }
@@ -3090,6 +3157,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_bad_session_does_not_stop_the_ones_after_it() {
+        // The exact production failure: 37 sessions became eligible for re-extraction,
+        // the second returned something that was not JSON, and the whole maintenance
+        // chain died with it — every later session unextracted, and the digests and
+        // snapshot skipped too.
+        struct OneBadApple;
+        impl Provider for OneBadApple {
+            fn complete<'a>(
+                &'a self,
+                req: &'a CompletionRequest,
+            ) -> futures::future::BoxFuture<'a, Result<String, ExtractError>> {
+                // Not an error — a *valid* response that is not JSON. That is the
+                // production failure: the model answered in prose.
+                let bad = req.user_prompt.contains("bad-1");
+                Box::pin(async move {
+                    if bad {
+                        Ok("I'm sorry, I can't help with that.".to_string())
+                    } else {
+                        Ok(r#"{"claims":[]}"#.to_string())
+                    }
+                })
+            }
+        }
+
+        let store = object_store::memory::InMemory::new();
+        for id in ["aaa-good-1", "bad-1", "zzz-good-2"] {
+            seal_one_session(&store, "2026-09-11", id).await;
+        }
+
+        let summary = run(&store, "oxidant", &shadow_cfg(), &OneBadApple)
+            .await
+            .expect("the pass must complete");
+
+        assert_eq!(summary.sessions_failed, 1, "{summary:?}");
+        assert_eq!(
+            summary.sessions_processed, 2,
+            "the sessions either side of the bad one must still be extracted: {summary:?}"
+        );
+        // And the bad one is retryable rather than marked done.
+        assert!(!is_already_extracted(&store, "oxidant", "bad-1")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_response_error_says_what_actually_came_back() {
+        // "expected value at line 1 column 1" and nothing else is what a real failing
+        // extraction reported. Undiagnosable without reproducing it by hand.
+        let err = parse_claims_response("I'm sorry, I can't help with that.").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("can't help"), "must quote the response: {msg}");
+
+        // Bounded and single-line: this lands in a log an operator reads.
+        let huge = format!("nonsense {}", "x".repeat(5000));
+        let msg = parse_claims_response(&huge).unwrap_err().to_string();
+        assert!(msg.len() < 400, "{} chars", msg.len());
+        let multiline = "not json
+second line
+third line";
+        let msg = parse_claims_response(multiline).unwrap_err().to_string();
+        assert_eq!(msg.lines().count(), 1, "must stay one line: {msg}");
+    }
+
+    #[tokio::test]
     async fn a_transient_provider_failure_does_not_discard_the_session_forever() {
         // The marker is written before the provider call so two hosts cannot both pay
         // for the same session. Nothing used to release it on failure, so one 503
@@ -3104,11 +3235,22 @@ mod tests {
             session_id: "flaky-1",
         };
 
-        let first = run(&store, "oxidant", &cfg, &provider).await;
-        assert!(
-            first.is_err(),
-            "the first pass must surface the provider error"
+        // The pass *reports* the failure rather than returning `Err`. It used to
+        // propagate, and a single malformed response therefore aborted the entire
+        // maintenance chain — compaction, digests, the gate and the snapshot, none of
+        // which involve a model. Seen the first time retry was enabled on a real lake.
+        let first = run(&store, "oxidant", &cfg, &provider)
+            .await
+            .expect("one session's failure must not end the pass");
+        assert_eq!(
+            first.sessions_failed, 1,
+            "the failure must be counted, not swallowed"
         );
+        assert!(
+            first.last_error.is_some(),
+            "and it must carry something an operator can act on"
+        );
+        assert_eq!(first.sessions_processed, 0);
         assert!(
             !is_already_extracted(&store, "oxidant", "flaky-1")
                 .await

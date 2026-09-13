@@ -1099,6 +1099,17 @@ fn excerpt(raw: &str) -> String {
     }
 }
 
+/// Whether a rendered transcript carries anything a model could extract from.
+///
+/// "Nothing but the `session_id:` header" rather than "empty string": the header is
+/// always emitted when there is at least one envelope, so a literal emptiness check
+/// would never fire on exactly the sessions this exists for.
+fn transcript_is_empty(prompt: &str) -> bool {
+    prompt
+        .lines()
+        .all(|l| l.trim().is_empty() || l.starts_with("session_id:"))
+}
+
 /// Pull the JSON object out of a response that may have been dressed up.
 ///
 /// Found against a live endpoint, not a fixture: asked for nothing but JSON and given
@@ -1585,6 +1596,31 @@ pub async fn extract_session(
         .as_ref()
         .expect("tier2_enabled just confirmed cfg.batch.is_some()");
     let transcript_text = build_fenced_transcript(&session.envelopes);
+
+    // **A session with nothing in it is not worth a model call.**
+    //
+    // `build_fenced_transcript` renders `content` and tool calls; a session that
+    // produced neither — a window opened and closed, a `--resume` that never ran
+    // anything — renders to the `session_id:` header and nothing else. Sending that
+    // asks a model to extract claims from an empty document, and it answers, at
+    // length, that it cannot see a transcript. Ten of those in one pass on a real
+    // lake: ten paid calls, ten parse failures, and a summary line dominated by a
+    // failure that was never the model's fault.
+    //
+    // Left marked extracted rather than released, because there is nothing a later
+    // pass would do differently — the session is sealed and its content is final.
+    if transcript_is_empty(&transcript_text) {
+        tracing::debug!(
+            session_id = %session.session_id,
+            "no transcript content to extract from; skipping the model call"
+        );
+        return Ok(ExtractOutcome {
+            session_id: session.session_id.clone(),
+            claims_proposed: 0,
+            claims_returned: 0,
+            skipped_already_extracted: false,
+        });
+    }
     let request = CompletionRequest {
         system_prompt: EXTRACTION_SYSTEM_PROMPT.to_string(),
         user_prompt: transcript_text,
@@ -3154,6 +3190,86 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn an_empty_session_costs_no_model_call() {
+        // Ten of these in one real pass: a window opened and closed with no prompt and
+        // no tool call. Each was a paid call that came back, at length, explaining the
+        // model could not see a transcript — then failed to parse. The failure was
+        // never the model's.
+        struct MustNotBeCalled(std::sync::atomic::AtomicUsize);
+        impl Provider for MustNotBeCalled {
+            fn complete<'a>(
+                &'a self,
+                _req: &'a CompletionRequest,
+            ) -> futures::future::BoxFuture<'a, Result<String, ExtractError>> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(r#"{"claims":[]}"#.to_string()) })
+            }
+        }
+
+        let store = object_store::memory::InMemory::new();
+        let provider = MustNotBeCalled(std::sync::atomic::AtomicUsize::new(0));
+        // Session lifecycle only: no content, no tool.
+        let session = SessionTranscript {
+            session_id: "empty-1".into(),
+            agent_id: "cc-01".into(),
+            envelopes: vec![
+                Envelope::new(
+                    "oxidant",
+                    "cc-01",
+                    Runtime::ClaudeCode,
+                    "empty-1",
+                    EventType::SessionStart,
+                    "2026-09-11T10:00:00.000Z",
+                ),
+                Envelope::new(
+                    "oxidant",
+                    "cc-01",
+                    Runtime::ClaudeCode,
+                    "empty-1",
+                    EventType::SessionEnd,
+                    "2026-09-11T10:05:00.000Z",
+                ),
+            ],
+        };
+
+        let out = extract_session(
+            &store,
+            &shadow_cfg(),
+            &provider,
+            &session,
+            "2026-09-11",
+            "oxidant",
+        )
+        .await
+        .expect("an empty session is not an error");
+
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the model must not be called with an empty transcript"
+        );
+        assert_eq!(out.claims_proposed, 0);
+        assert!(
+            is_already_extracted(&store, "oxidant", "empty-1")
+                .await
+                .unwrap(),
+            "and it must stay marked done — a later pass would do nothing different"
+        );
+    }
+
+    #[test]
+    fn transcript_emptiness_looks_past_the_session_header() {
+        // The header is always present, so a literal `is_empty()` would never fire on
+        // exactly the sessions this exists for.
+        assert!(transcript_is_empty("session_id: s1\n"));
+        assert!(transcript_is_empty(""));
+        assert!(!transcript_is_empty("session_id: s1\n[m1] did a thing\n"));
+        assert!(!transcript_is_empty(
+            "session_id: s1\n[m1] tool:Bash input=cargo test\n"
+        ));
     }
 
     #[tokio::test]

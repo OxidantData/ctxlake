@@ -1105,9 +1105,31 @@ fn excerpt(raw: &str) -> String {
 /// always emitted when there is at least one envelope, so a literal emptiness check
 /// would never fire on exactly the sessions this exists for.
 fn transcript_is_empty(prompt: &str) -> bool {
-    prompt
-        .lines()
-        .all(|l| l.trim().is_empty() || l.starts_with("session_id:"))
+    prompt.lines().all(|l| {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with("session_id:") {
+            return true;
+        }
+        // A line that is only an id marker carries nothing either. `[toolu_x] tool:Read`
+        // with no input, exit code or result is the id and the tool's name and no
+        // evidence of anything — and a model handed a page of those answers, correctly,
+        // that it was "given a session ID and message ID, but not the actual
+        // conversation". Three such sessions in one real pass, after the header-only
+        // case was already handled.
+        let after_id = l.split_once("] ").map(|(_, rest)| rest).unwrap_or(l);
+        substance_is_absent(after_id)
+    })
+}
+
+/// Whether a rendered line says anything beyond naming a tool.
+fn substance_is_absent(rest: &str) -> bool {
+    match rest.strip_prefix("tool:") {
+        // `tool:Read` alone; anything real appends ` input=`, ` exit=` or ` result=`.
+        Some(tail) => {
+            !tail.contains(" input=") && !tail.contains(" exit=") && !tail.contains(" result=")
+        }
+        None => rest.trim().is_empty(),
+    }
 }
 
 /// Pull the JSON object out of a response that may have been dressed up.
@@ -3269,6 +3291,18 @@ mod tests {
         assert!(!transcript_is_empty("session_id: s1\n[m1] did a thing\n"));
         assert!(!transcript_is_empty(
             "session_id: s1\n[m1] tool:Bash input=cargo test\n"
+        ));
+        // Only id markers and tool names: a model handed this replies that it was
+        // given ids but not a conversation. Three such sessions in one real pass.
+        assert!(transcript_is_empty(
+            "session_id: s1\n[toolu_a] tool:Read\n[toolu_b] tool:Glob\n"
+        ));
+        // But a result alone is substance, even with no input.
+        assert!(!transcript_is_empty(
+            "session_id: s1\n[toolu_a] tool:Read result=hello\n"
+        ));
+        assert!(!transcript_is_empty(
+            "session_id: s1\n[toolu_a] tool:Bash exit=1\n"
         ));
     }
 

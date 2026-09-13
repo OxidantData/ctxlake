@@ -96,6 +96,7 @@ export default withMermaid(
         text: 'Using it',
         items: [
           { text: 'Memory', link: '/memory' },
+          { text: 'Inspecting memory', link: '/inspecting-memory' },
           { text: 'Runtimes', link: '/runtimes' },
           { text: 'Storage', link: '/storage' },
         ],

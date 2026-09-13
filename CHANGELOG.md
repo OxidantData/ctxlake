@@ -1,5 +1,89 @@
 # Changelog
 
+## v0.1.9
+
+The memory layer produced nothing and delivered nothing. Measured on a live lake
+before this release: 26 sessions sealed, 26 digests, **0 claims**, and a briefing
+containing three agent names. `docs/memory.md` advertised seven Tier 0 outputs and
+delivered one.
+
+Five independent breaks, in a chain where **every component passed its own tests** —
+each was tested against fixtures that populated the fields the next stage read.
+
+> **Upgrading:** run `ctxlake update`, then **`ctxlake install <runtime>` on every
+> host**, even where hooks are already current — that step now also registers the MCP
+> server, which was never wired anywhere. Flip `[summarize] mode` from `shadow` on all
+> hosts together: the flag is baked into the published snapshot, so a host left on
+> `shadow` serves the fleet a withheld one.
+
+### Capture could not see what the digest reads
+
+No hook payload carries token usage, git branch, or an exit code — and 842 real
+envelopes proved none carried tool output under the key the adapter read. The fixture
+that "verified" that key was hand-written from documentation, so fixture and code agreed
+with each other and disagreed with the runtime.
+
+Fixed by reading the **session transcript** instead of chasing a field name. It carries
+tool output, the `is_error` failure flag, `message.usage`, `gitBranch`, and —
+decisively — `bashEditDiff`, the file edits made through a shell command, which are most
+real edits and which no hook can attribute. The join key already existed: the hook writes
+`message_id` from the runtime's tool-use id.
+
+### Digests reached nobody
+
+`fleet_history` read a `history.json` that **nothing in the repository ever wrote**.
+Every reference to it was a reader or a test. The snapshot now carries a `sessions`
+table, and `fleet_history` reads it — deleting the orphan rather than inventing a
+producer.
+
+### An agent could be told things but not ask
+
+`ctxlake mcp` served six working tools and `install` never registered it. `mcpServers`
+was empty on a live machine while 38 promoted claims sat in the lake. `install` now wires
+it, merged into `~/.claude.json` — 112 KB of live state — with everything outside
+`mcpServers.ctxlake` verified untouched: 2,298 leaf values before, 2,302 after, 0 lost.
+
+### Extraction was unmeasurable
+
+A successful `{"claims": []}` marked a session done forever, so no prompt or parser fix
+could be evaluated against existing history. Markers now record an extractor version and
+are fleet-scoped. `0 claim(s) proposed` no longer means both "found nothing" and
+"discarded everything" — the summary reports kept versus returned.
+
+Three rounds of real failures then showed the model was right each time: it was being
+sent empty transcripts. Sessions that render to a header, to a page of bare id markers,
+or to a single prompt reading `ok` are now skipped before the call rather than paid for.
+
+### The five claim types had no definitions
+
+Every promoted claim came back `outcome` — episodic, restating what the digest already
+records. The prompt named the types in a schema line and defined none of them. With
+definitions, examples, and a warning that an `outcome` restating the digest is duplicate
+noise, `convention` became the plurality of new claims. Claims also now carry the session
+they came from, so a memory can be followed rather than only read.
+
+### `convention` promotion, and an honest concession
+
+The independence threshold for `convention` drops from 2 to 1. Two is the right bar, but
+it is compared against a count that subtracts sessions carrying `injected_context` — a
+field **nothing populates** — so it was unreachable, and all 41 conventions on a live
+fleet sat as permanent candidates. An unreachable gate discards a category rather than
+protecting it. The contradiction gate, provenance gate, quarantine switch and
+attribution-on-read all still apply. Restore the 2 once `injected_context` is populated;
+both echo-case tests and the threshold's own doc say so in place.
+
+### Other fixes
+
+- `SubagentStop` was wired by the installer and rejected by the adapter — 39 events
+  dropped to a log nothing reads. A test now calls the adapter with every wired event.
+- One session's extraction failure ended the whole maintenance chain, skipping
+  compaction, digests, the gate and the snapshot.
+- The snapshot pointer is fleet-scoped; two fleets publishing in turn each served the
+  other's artifact half the time.
+- Digests are recomputed on a schema bump instead of skipped on existence.
+- `MAX_FIELD_BYTES` 32 KiB → 1 MiB on the hook path (measured: the cap was never the
+  binding cost; process spawn is).
+
 ## v0.1.8
 
 ### `sync install` did not replace a running daemon on Linux

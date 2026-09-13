@@ -343,14 +343,17 @@ mod tests {
         let (dir, ctx) = test_ctx();
         let fleet_dir = dir.path().join("cache").join("test-fleet");
         std::fs::create_dir_all(&fleet_dir).unwrap();
-        let sessions: Vec<Value> = (0..10)
-            .map(|i| json!({"repo": "r", "ended_at": "2026-09-09", "summary": format!("s{i}")}))
+        let sessions: Vec<_> = (0..10)
+            .map(|i| {
+                let id: &'static str = Box::leak(format!("sess-{i}").into_boxed_str());
+                crate::snapshot::test_support::FixtureSession::new(id, "s")
+            })
             .collect();
-        std::fs::write(
-            fleet_dir.join("history.json"),
-            serde_json::to_vec(&sessions).unwrap(),
-        )
-        .unwrap();
+        crate::snapshot::test_support::write_snapshot_with(
+            &fleet_dir.join("snapshot.bin"),
+            &[],
+            &sessions,
+        );
 
         let result = tools_call(
             &json!({"name": "fleet_history", "arguments": {"limit": 2}}),

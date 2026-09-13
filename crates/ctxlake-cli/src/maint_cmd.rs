@@ -70,7 +70,7 @@ pub(crate) async fn run_prune(cfg: &Config, dry_run: bool) -> Result<()> {
     let ctx = store_ctx::connect(cfg, &cfg.agent_id)?;
     let store = store_ctx::prefixed_store(&ctx);
 
-    let report = ctxlake_maint::prune::run(store.as_ref(), dry_run)
+    let report = ctxlake_maint::prune::run(store.as_ref(), &cfg.fleet_id, dry_run)
         .await
         .context("pruning the lake")?;
 

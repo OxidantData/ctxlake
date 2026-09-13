@@ -270,7 +270,21 @@ pub fn snapshot(content_hash: &str) -> Path {
 /// The CAS pointer to the current snapshot. This is the one object in `snapshot/`
 /// that is ever overwritten, and it is overwritten via CAS — publish is
 /// write-then-swap, never swap-then-write.
-pub fn snapshot_latest() -> Path {
+pub fn snapshot_latest(fleet_id: &str) -> Path {
+    Path::from("snapshot")
+        .join("fleets")
+        .join(fleet_id)
+        .join("latest.json")
+}
+
+/// The pre-fleet-scoping pointer, for `ctxlake maint --prune` to clean up.
+///
+/// Scoped once the snapshot started carrying session history: the blob is
+/// content-addressed and shared harmlessly, but a single global pointer meant two
+/// fleets publishing in turn each served the other's artifact half the time. That was
+/// tolerable while the snapshot held only claims — which are still fleet-global, a
+/// separate and older leak — and is not once it holds one fleet's sessions.
+pub fn legacy_snapshot_latest() -> Path {
     Path::from("snapshot").join("latest.json")
 }
 
@@ -350,7 +364,11 @@ mod tests {
             snapshot("deadbeef1234").as_ref(),
             "snapshot/deadbeef1234.sqlite"
         );
-        assert_eq!(snapshot_latest().as_ref(), "snapshot/latest.json");
+        assert_eq!(
+            snapshot_latest("myteam").as_ref(),
+            "snapshot/fleets/myteam/latest.json"
+        );
+        assert_eq!(legacy_snapshot_latest().as_ref(), "snapshot/latest.json");
         assert_eq!(quarantine_prefix().as_ref(), "quarantine");
         assert_eq!(
             session_digest("2026-09-11", "oxidant", Runtime::ClaudeCode, "cc-01", "sess-1")

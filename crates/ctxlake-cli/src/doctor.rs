@@ -496,7 +496,8 @@ pub async fn run(cfg: &Config) -> Result<Report> {
                     // case for now (see `MaintReport::last_snapshot_age`'s doc) and
                     // any other error just leaves this `None` rather than failing
                     // the whole report over a display-only field.
-                    let snapshot_key = full_path(ctx, &ctxlake_store::layout::snapshot_latest());
+                    let snapshot_key =
+                        full_path(ctx, &ctxlake_store::layout::snapshot_latest(&cfg.fleet_id));
                     if let Ok(meta) = ctx.store.head(&snapshot_key).await {
                         if let Ok(age) =
                             SystemTime::now().duration_since(SystemTime::from(meta.last_modified))

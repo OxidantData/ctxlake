@@ -122,6 +122,38 @@ CREATE TABLE claims (
 -- FTS5's content-sync triggers to track — a plain INSERT ... SELECT after the
 -- `claims` table is populated is the entire "index maintenance" this needs.
 CREATE VIRTUAL TABLE claims_fts USING fts5(claim_id UNINDEXED, claim, subject);
+
+-- The episodic half of memory, and the half that needs no model and cannot
+-- hallucinate. One row per sealed session, folded from the `digest.json` objects
+-- `ctxlake_maint::digest` has been writing all along.
+--
+-- These reached no agent before this table existed: `fleet::history` read a
+-- `history.json` that nothing in the repository produced, so the briefing's "recent
+-- sessions" block was empty on every machine, forever. Carrying them in the snapshot
+-- reuses the artifact that is already content-addressed, CAS-published and mirrored
+-- to every agent's cache, rather than inventing a second thing to sync.
+CREATE TABLE sessions (
+    session_id     TEXT PRIMARY KEY,
+    agent_id       TEXT NOT NULL,
+    runtime        TEXT NOT NULL,
+    repo           TEXT,
+    branch         TEXT,
+    started_at     TEXT,
+    ended_at       TEXT,
+    duration_ms    INTEGER,
+    turn_count     INTEGER NOT NULL,
+    outcome        TEXT NOT NULL,
+    -- The one-line summary an agent actually reads. Derived, never model-written.
+    summary        TEXT NOT NULL,
+    files_json     TEXT NOT NULL,
+    commands_json  TEXT NOT NULL,
+    friction_json  TEXT NOT NULL,
+    input_tokens   INTEGER NOT NULL,
+    output_tokens  INTEGER NOT NULL,
+    cost_usd       REAL NOT NULL
+);
+
+CREATE INDEX sessions_by_end ON sessions(ended_at DESC);
 "#;
 
 /// The literal number of dimensions the `embedding` column is sized for — matches
@@ -316,6 +348,47 @@ fn apply_event(folded: &mut BTreeMap<String, FoldedClaim>, record: ClaimEventRec
 /// groups by `dt=`/`agent=` before the ULID tail, not by true cross-agent wall
 /// time — a faithful match to the existing, already-relied-upon behavior this
 /// module mirrors, not an independent "better" ordering this module invented.
+/// Every sealed session's digest for this fleet.
+///
+/// Fleet-scoped by prefix, unlike `fold_claim_events` above — the claims fold is
+/// fleet-global and has been since it was written, which is a real (older, separate)
+/// leak. Sessions must not join it: a briefing is supposed to describe *this* fleet's
+/// recent work, and `docs/getting-started.md` calls `--fleet` the boundary of who sees
+/// whom.
+///
+/// Best-effort per object, matching the tolerance of every other fold in this design: a
+/// digest written by a future schema, or caught mid-write, costs one row rather than
+/// the whole snapshot.
+async fn collect_session_digests(
+    store: &dyn ObjectStore,
+    fleet_id: &str,
+) -> Result<Vec<crate::digest::SessionDigest>, MaintError> {
+    use futures::StreamExt;
+    let prefix = Path::from("sessions");
+    let mut stream = store.list(Some(&prefix));
+    let mut out = Vec::new();
+    let want = format!("/fleet={fleet_id}/");
+    while let Some(meta) = stream.next().await {
+        let Ok(meta) = meta else { continue };
+        let key = meta.location.as_ref();
+        if !key.ends_with("/digest.json") || !key.contains(&want) {
+            continue;
+        }
+        let Ok(res) = store.get(&meta.location).await else {
+            continue;
+        };
+        let Ok(bytes) = res.bytes().await else {
+            continue;
+        };
+        if let Ok(d) = serde_json::from_slice::<crate::digest::SessionDigest>(&bytes) {
+            out.push(d);
+        }
+    }
+    // Newest last so a bounded reader taking the tail gets the most recent work.
+    out.sort_by(|a, b| a.ended_at.cmp(&b.ended_at));
+    Ok(out)
+}
+
 async fn fold_claim_events(store: &dyn ObjectStore) -> Result<Vec<FoldedClaim>, MaintError> {
     use futures::StreamExt;
     let prefix = Path::from("claims").join("events");
@@ -376,6 +449,7 @@ fn embedding_to_blob(v: &[f32]) -> Vec<u8> {
 /// either way, so "file-shaped from the start" costs nothing.
 fn build_sqlite_bytes(
     claims: &[FoldedClaim],
+    sessions: &[crate::digest::SessionDigest],
     agent_reads_enabled: bool,
 ) -> Result<Vec<u8>, MaintError> {
     let file =
@@ -450,9 +524,138 @@ fn build_sqlite_bytes(
              SELECT claim_id, claim, subject FROM claims \
              WHERE visible_to_agents = 1 ORDER BY claim_id;",
         )?;
+
+        // Sessions are **not** gated by `agent_reads_enabled`. That flag governs the
+        // belief layer — claims a model proposed and a gate promoted, which can be
+        // wrong and which `docs/memory.md` says to watch in shadow mode before trusting.
+        // A session digest is arithmetic over captured events: it cannot hallucinate,
+        // and withholding it buys nothing. Shadow mode is about beliefs, not history.
+        {
+            let mut stmt = conn.prepare(
+                "INSERT INTO sessions (session_id, agent_id, runtime, repo, branch, \
+                 started_at, ended_at, duration_ms, turn_count, outcome, summary, \
+                 files_json, commands_json, friction_json, input_tokens, output_tokens, \
+                 cost_usd) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                 ?15, ?16, ?17)",
+            )?;
+            for d in sessions {
+                stmt.execute(rusqlite::params![
+                    d.session_id,
+                    d.agent_id,
+                    d.runtime.as_str(),
+                    d.repo.as_deref().map(short_path),
+                    d.branch,
+                    d.started_at,
+                    d.ended_at,
+                    d.duration_ms,
+                    d.turn_count,
+                    format!("{:?}", d.outcome).to_lowercase(),
+                    summarize(d),
+                    serde_json::to_string(&d.files_touched)?,
+                    serde_json::to_string(&d.commands)?,
+                    serde_json::to_string(&d.friction)?,
+                    d.usage.input_tokens,
+                    d.usage.output_tokens,
+                    d.usage.cost_usd,
+                ])?;
+            }
+        }
     } // conn dropped and file closed before we read its bytes back.
 
     std::fs::read(&path).map_err(|e| MaintError::Other(format!("read sqlite bytes: {e}")))
+}
+
+/// The one line about a session that an agent actually reads.
+///
+/// Built from the digest, never from a model — this is the episodic half, and its whole
+/// value is that it cannot be wrong. `docs/memory.md` singles out the friction line as
+/// "often the most useful in a briefing", so it leads when there is one.
+fn summarize(d: &crate::digest::SessionDigest) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(f) = d.friction.first() {
+        parts.push(describe_friction(f));
+    }
+    if !d.files_touched.is_empty() {
+        let shown: Vec<String> = d
+            .files_touched
+            .iter()
+            .take(3)
+            .map(|p| short_path(p))
+            .collect();
+        let more = d.files_touched.len().saturating_sub(shown.len());
+        parts.push(match more {
+            0 => format!("touched {}", shown.join(", ")),
+            n => format!("touched {} +{n} more", shown.join(", ")),
+        });
+    }
+    let failed = d.commands.iter().filter(|c| c.exit_code != Some(0)).count();
+    if !d.commands.is_empty() {
+        parts.push(match failed {
+            0 => format!("{} command(s), all clean", d.commands.len()),
+            n => format!("{} command(s), {n} failed", d.commands.len()),
+        });
+    }
+    if !d.commits.is_empty() {
+        parts.push(format!("{} commit(s)", d.commits.len()));
+    }
+    if parts.is_empty() {
+        // Honest rather than invented: a session really can do nothing observable, and
+        // saying so beats a confident-sounding line assembled from no evidence.
+        return format!("{} turn(s), nothing recorded", d.turn_count);
+    }
+    // Bounded because this rides in the context window of every session in the fleet,
+    // and a briefing that costs more than it informs is a tax on every agent forever.
+    let joined = parts.join(" · ");
+    if joined.chars().count() <= MAX_SUMMARY_CHARS {
+        return joined;
+    }
+    let cut: String = joined.chars().take(MAX_SUMMARY_CHARS - 1).collect();
+    format!("{cut}…")
+}
+
+/// How long one session's summary line may be.
+///
+/// Roughly a terminal width. The briefing shows several of these, inside an 8 KB total
+/// cap enforced at read time by `ctxlake-hook::briefing`.
+const MAX_SUMMARY_CHARS: usize = 160;
+
+/// The last two segments of a path.
+///
+/// A briefing line rides in every session's context window, and an absolute path is
+/// mostly the same prefix repeated — `/home/alice/projects/acme/src/lib.rs` costs a
+/// dozen tokens to say `src/lib.rs`. It also keeps a home directory out of a record that
+/// every agent in the fleet reads, which matters more once a fleet spans people.
+fn short_path(p: &str) -> String {
+    let parts: Vec<&str> = p.rsplit('/').take(2).collect();
+    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+/// A friction signal as a sentence, without pretending to more precision than the
+/// counter carries.
+fn describe_friction(f: &crate::digest::Friction) -> String {
+    use crate::digest::Friction;
+    match f {
+        Friction::RepeatedFailure { command, count } => {
+            format!("`{}` failed {count}x", truncate_cmd(command))
+        }
+        Friction::HotFile { path, edit_count } => {
+            format!("edited {} {edit_count}x", short_path(path))
+        }
+        Friction::AbandonedAfterFailures { command, count } => {
+            format!("abandoned after {count} failed `{}`", truncate_cmd(command))
+        }
+    }
+}
+
+fn truncate_cmd(c: &str) -> String {
+    let one_line = c.lines().next().unwrap_or(c).trim();
+    if one_line.chars().count() <= 60 {
+        return one_line.to_string();
+    }
+    let cut: String = one_line.chars().take(57).collect();
+    format!("{cut}...")
 }
 
 /// What one [`publish`] call actually did.
@@ -478,11 +681,17 @@ pub struct SnapshotOutcome {
 /// what `agent_reads_enabled` does and does not gate.
 pub async fn publish(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     agent_reads_enabled: bool,
 ) -> Result<SnapshotOutcome, MaintError> {
     let claims = fold_claim_events(store).await?;
     let claim_count = claims.len();
-    let bytes = build_sqlite_bytes(&claims, agent_reads_enabled)?;
+    // The episodic half. These are the `digest.json` objects the chain has been
+    // writing all along, which until now reached nobody: `fleet::history` read a
+    // `history.json` that no code anywhere produced, so the briefing's "recent
+    // sessions" block was permanently empty on every machine.
+    let sessions = collect_session_digests(store, fleet_id).await?;
+    let bytes = build_sqlite_bytes(&claims, &sessions, agent_reads_enabled)?;
     let full_hash = hash::content_hash(&bytes);
     let content_hash = full_hash.trim_start_matches("sha256:").to_string();
 
@@ -496,7 +705,7 @@ pub async fn publish(
         Err(e) => return Err(e.into()),
     };
 
-    let pointer_path = ctxlake_store::layout::snapshot_latest();
+    let pointer_path = ctxlake_store::layout::snapshot_latest(fleet_id);
     let new_pointer = serde_json::json!({ "content_hash": content_hash });
     let pointer_payload = || PutPayload::from(serde_json::to_vec(&new_pointer).expect("json"));
 
@@ -620,10 +829,192 @@ mod tests {
         (file, conn)
     }
 
+    #[test]
+    fn a_summary_stays_short_enough_to_ride_in_every_session() {
+        // Measured against the live lake before this bound existed: a single line ran
+        // to 300+ characters of absolute paths, and the briefing shows several.
+        use crate::digest::{Friction, SessionDigest};
+        let d = SessionDigest {
+            schema_version: 1,
+            session_id: "s".into(),
+            fleet_id: "f".into(),
+            agent_id: "a".into(),
+            runtime: ctxlake_core::Runtime::ClaudeCode,
+            started_at: None,
+            ended_at: None,
+            duration_ms: None,
+            turn_count: 1,
+            files_touched: (0..40)
+                .map(|i| format!("/home/alice/projects/acme/very/deep/path/file{i}.rs"))
+                .collect(),
+            commands: vec![],
+            tests_run: vec![],
+            commits: vec![],
+            git_sha_before: None,
+            git_sha_after: None,
+            branch: None,
+            repo: None,
+            usage: Default::default(),
+            outcome: crate::digest::Outcome::Clean,
+            friction: vec![Friction::HotFile {
+                path: "/home/alice/projects/acme/src/lib.rs".into(),
+                edit_count: 9,
+            }],
+        };
+        let got = summarize(&d);
+        assert!(
+            got.chars().count() <= MAX_SUMMARY_CHARS,
+            "{} chars: {got}",
+            got.chars().count()
+        );
+        assert!(
+            !got.contains("/home/alice"),
+            "a home directory must not ride in every agent's context: {got}"
+        );
+        assert!(got.contains("path/file0.rs"), "got: {got}");
+    }
+
+    #[tokio::test]
+    async fn a_sealed_sessions_digest_reaches_the_published_snapshot() {
+        // The link that did not exist. 26 digests sat in a live lake reaching nobody,
+        // because `fleet::history` read a `history.json` nothing produced and the
+        // snapshot had no sessions table at all.
+        use crate::digest::{CommandRun, Friction, SessionDigest};
+        let store = InMemory::new();
+
+        let digest = SessionDigest {
+            schema_version: 1,
+            session_id: "sess-1".into(),
+            fleet_id: "oxidant".into(),
+            agent_id: "cc-01".into(),
+            runtime: ctxlake_core::Runtime::ClaudeCode,
+            started_at: Some("2026-09-12T10:00:00Z".into()),
+            ended_at: Some("2026-09-12T10:30:00Z".into()),
+            duration_ms: Some(1_800_000),
+            turn_count: 4,
+            files_touched: vec!["src/lib.rs".into()],
+            commands: vec![CommandRun {
+                tool: "Bash".into(),
+                command: "cargo test".into(),
+                exit_code: Some(1),
+                is_test: true,
+            }],
+            tests_run: vec![],
+            commits: vec![],
+            git_sha_before: None,
+            git_sha_after: None,
+            branch: Some("main".into()),
+            repo: Some("/repo/acme".into()),
+            usage: Default::default(),
+            outcome: crate::digest::Outcome::Clean,
+            friction: vec![Friction::RepeatedFailure {
+                command: "cargo test".into(),
+                count: 3,
+            }],
+        };
+        let key = ctxlake_store::layout::session_digest(
+            "2026-09-12",
+            "oxidant",
+            ctxlake_core::Runtime::ClaudeCode,
+            "cc-01",
+            "sess-1",
+        );
+        store
+            .put(&key, PutPayload::from(serde_json::to_vec(&digest).unwrap()))
+            .await
+            .unwrap();
+
+        publish(&store, "oxidant", true).await.unwrap();
+
+        let pointer = store
+            .get(&ctxlake_store::layout::snapshot_latest("oxidant"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let hash = serde_json::from_slice::<serde_json::Value>(&pointer).unwrap()["content_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let blob = store
+            .get(&ctxlake_store::layout::snapshot(&hash))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &blob).unwrap();
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        let (id, summary, branch): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT session_id, summary, branch FROM sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("the session must be in the snapshot");
+
+        assert_eq!(id, "sess-1");
+        assert_eq!(branch.as_deref(), Some("main"));
+        assert!(
+            summary.contains("failed 3x"),
+            "the friction line docs call the most useful in a briefing: {summary}"
+        );
+        assert!(summary.contains("src/lib.rs"), "got: {summary}");
+    }
+
+    #[tokio::test]
+    async fn one_fleets_snapshot_never_carries_another_fleets_sessions() {
+        // `--fleet` is the boundary of who sees whom. Claims are still fleet-global (an
+        // older, separate leak); sessions must not join them.
+        let store = InMemory::new();
+        for (fleet, session) in [("ours", "s-ours"), ("theirs", "s-theirs")] {
+            let d = crate::digest::SessionDigest {
+                schema_version: 1,
+                session_id: session.into(),
+                fleet_id: fleet.into(),
+                agent_id: "cc-01".into(),
+                runtime: ctxlake_core::Runtime::ClaudeCode,
+                started_at: None,
+                ended_at: Some("2026-09-12T10:00:00Z".into()),
+                duration_ms: None,
+                turn_count: 0,
+                files_touched: vec![],
+                commands: vec![],
+                tests_run: vec![],
+                commits: vec![],
+                git_sha_before: None,
+                git_sha_after: None,
+                branch: None,
+                repo: None,
+                usage: Default::default(),
+                outcome: crate::digest::Outcome::Clean,
+                friction: vec![],
+            };
+            let key = ctxlake_store::layout::session_digest(
+                "2026-09-12",
+                fleet,
+                ctxlake_core::Runtime::ClaudeCode,
+                "cc-01",
+                session,
+            );
+            store
+                .put(&key, PutPayload::from(serde_json::to_vec(&d).unwrap()))
+                .await
+                .unwrap();
+        }
+
+        let sessions = collect_session_digests(&store, "ours").await.unwrap();
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["s-ours"], "another fleet's session leaked in");
+    }
+
     #[tokio::test]
     async fn folding_an_empty_log_produces_a_valid_sqlite_file_with_the_right_shape() {
         let store = InMemory::new();
-        let outcome = publish(&store, true).await.unwrap();
+        let outcome = publish(&store, "oxidant", true).await.unwrap();
         assert_eq!(outcome.claim_count, 0);
         assert!(outcome.blob_written);
         assert!(outcome.pointer_updated);
@@ -695,7 +1086,7 @@ mod tests {
         )
         .await;
 
-        let outcome = publish(&store, true).await.unwrap();
+        let outcome = publish(&store, "oxidant", true).await.unwrap();
         assert_eq!(outcome.claim_count, 2);
 
         let blob = store
@@ -800,7 +1191,7 @@ mod tests {
             promoted("never-proposed", 1, 0.5),
         )
         .await;
-        let outcome = publish(&store, true).await.unwrap();
+        let outcome = publish(&store, "oxidant", true).await.unwrap();
         assert_eq!(outcome.claim_count, 0);
     }
 
@@ -819,7 +1210,7 @@ mod tests {
             serde_json::json!({"kind": "superseded", "claim_id": "claim-1", "at": "2026-09-11T00:00:00Z", "by": "claim-9"}),
         )
         .await;
-        let outcome = publish(&store, true).await.unwrap();
+        let outcome = publish(&store, "oxidant", true).await.unwrap();
         let blob = store
             .get(&ctxlake_store::layout::snapshot(&outcome.content_hash))
             .await
@@ -850,7 +1241,7 @@ mod tests {
             proposed("claim-1", "x", &["s1"], Some(vector.clone())),
         )
         .await;
-        let outcome = publish(&store, true).await.unwrap();
+        let outcome = publish(&store, "oxidant", true).await.unwrap();
         let blob = store
             .get(&ctxlake_store::layout::snapshot(&outcome.content_hash))
             .await
@@ -886,8 +1277,8 @@ mod tests {
             )
             .await;
         }
-        let outcome_a = publish(&store_a, true).await.unwrap();
-        let outcome_b = publish(&store_b, true).await.unwrap();
+        let outcome_a = publish(&store_a, "oxidant", true).await.unwrap();
+        let outcome_b = publish(&store_b, "oxidant", true).await.unwrap();
         assert_eq!(
             outcome_a.content_hash, outcome_b.content_hash,
             "identical logical claim state must hash identically — this is a \
@@ -904,11 +1295,11 @@ mod tests {
             proposed("claim-1", "x", &[], None),
         )
         .await;
-        let first = publish(&store, true).await.unwrap();
+        let first = publish(&store, "oxidant", true).await.unwrap();
         assert!(first.blob_written);
         assert!(first.pointer_updated);
 
-        let second = publish(&store, true).await.unwrap();
+        let second = publish(&store, "oxidant", true).await.unwrap();
         assert_eq!(second.content_hash, first.content_hash);
         assert!(
             !second.blob_written,
@@ -937,7 +1328,7 @@ mod tests {
         )
         .await;
 
-        let outcome = publish(&store, true).await.unwrap();
+        let outcome = publish(&store, "oxidant", true).await.unwrap();
         assert_eq!(
             outcome.claim_count, 1,
             "the one well-formed event must still fold"
@@ -966,7 +1357,7 @@ mod tests {
         )
         .await;
 
-        let outcome = publish(&store, false).await.unwrap();
+        let outcome = publish(&store, "oxidant", false).await.unwrap();
         assert_eq!(
             outcome.claim_count, 1,
             "the fold itself must not be gated by agent_reads_enabled"

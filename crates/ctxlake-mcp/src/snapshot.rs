@@ -437,7 +437,50 @@ pub mod test_support {
             embedding         BLOB
         );
         CREATE VIRTUAL TABLE claims_fts USING fts5(claim_id UNINDEXED, claim, subject);
+        CREATE TABLE sessions (
+            session_id     TEXT PRIMARY KEY,
+            agent_id       TEXT NOT NULL,
+            runtime        TEXT NOT NULL,
+            repo           TEXT,
+            branch         TEXT,
+            started_at     TEXT,
+            ended_at       TEXT,
+            duration_ms    INTEGER,
+            turn_count     INTEGER NOT NULL,
+            outcome        TEXT NOT NULL,
+            summary        TEXT NOT NULL,
+            files_json     TEXT NOT NULL,
+            commands_json  TEXT NOT NULL,
+            friction_json  TEXT NOT NULL,
+            input_tokens   INTEGER NOT NULL,
+            output_tokens  INTEGER NOT NULL,
+            cost_usd       REAL NOT NULL
+        );
     "#;
+
+    /// A session row, for tests of the episodic half.
+    #[derive(Clone)]
+    pub struct FixtureSession {
+        pub session_id: &'static str,
+        pub agent_id: &'static str,
+        pub repo: Option<&'static str>,
+        pub ended_at: &'static str,
+        pub summary: &'static str,
+        pub outcome: &'static str,
+    }
+
+    impl FixtureSession {
+        pub fn new(session_id: &'static str, summary: &'static str) -> Self {
+            Self {
+                session_id,
+                agent_id: "cc-01",
+                repo: Some("github.com/OxidantData/ctxlake"),
+                ended_at: "2026-09-12T18:00:00Z",
+                summary,
+                outcome: "clean",
+            }
+        }
+    }
 
     #[derive(Clone)]
     pub struct FixtureClaim {
@@ -493,6 +536,15 @@ pub mod test_support {
     /// fixture that populated `claims_fts` differently would validate nothing
     /// about the real artifact.
     pub fn write_snapshot(path: &std::path::Path, claims: &[FixtureClaim]) {
+        write_snapshot_with(path, claims, &[])
+    }
+
+    /// [`write_snapshot`], plus the `sessions` rows the episodic half reads.
+    pub fn write_snapshot_with(
+        path: &std::path::Path,
+        claims: &[FixtureClaim],
+        sessions: &[FixtureSession],
+    ) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -535,6 +587,35 @@ pub mod test_support {
                 )
                 .unwrap();
             }
+        }
+        for s in sessions {
+            conn.execute(
+                "INSERT INTO sessions (session_id, agent_id, runtime, repo, branch, \
+                 started_at, ended_at, duration_ms, turn_count, outcome, summary, \
+                 files_json, commands_json, friction_json, input_tokens, output_tokens, \
+                 cost_usd) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                rusqlite::params![
+                    s.session_id,
+                    s.agent_id,
+                    "claude_code",
+                    s.repo,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    s.ended_at,
+                    Option::<i64>::None,
+                    1_i64,
+                    s.outcome,
+                    s.summary,
+                    "[]",
+                    "[]",
+                    "[]",
+                    0_i64,
+                    0_i64,
+                    0.0_f64,
+                ],
+            )
+            .unwrap();
         }
     }
 }

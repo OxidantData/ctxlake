@@ -32,7 +32,7 @@ use crate::partition::{parse_session_partition, read_session_segments};
 /// `ctxlake_core::envelope::SCHEMA_VERSION`: never reinterpret an existing field,
 /// because a digest already written is exactly as immutable as the sealed session it
 /// was folded from.
-pub const DIGEST_SCHEMA_VERSION: u32 = 1;
+pub const DIGEST_SCHEMA_VERSION: u32 = 2;
 
 /// One tool call whose envelope carried an exit code — the operational definition of
 /// "a command" this module uses, deliberately independent of any specific tool name
@@ -141,6 +141,13 @@ pub struct SessionDigest {
     /// carries it, so this is `None` for any session sealed without enrichment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Where the work happened, from the envelopes' `cwd`.
+    ///
+    /// Every hook payload carries `cwd`, so unlike `branch` this needs no enrichment —
+    /// it was simply never read. Without it a briefing line says `[?, <time>]`, which
+    /// is the one field that tells an agent whether a session is relevant to it at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     pub usage: TokenUsage,
     pub outcome: Outcome,
     pub friction: Vec<Friction>,
@@ -482,6 +489,7 @@ pub fn compute_with(
         // per-envelope fold above — no hook event carries usage at all, and the
         // transcript reports it per assistant turn, already summed.
         branch: enrichment.and_then(|e| e.branch.clone()),
+        repo: dominant_cwd(&sorted),
         usage,
         outcome,
         friction,
@@ -546,8 +554,26 @@ pub async fn run_for_session(
         &partition.agent_id,
         &partition.session_id,
     );
-    if store.head(&digest_key).await.is_ok() {
-        return Ok(DigestOutcome::Skipped);
+    // A GET rather than a HEAD, because "does it exist" is the wrong question.
+    //
+    // Skipping on existence alone meant a digest written by an older build was never
+    // recomputed — and the 35 digests already in a live lake had no `repo`, no
+    // `branch`, no real `commands`, because they predate transcript enrichment. Every
+    // improvement to this function would have applied only to sessions not yet sealed,
+    // which is the least interesting half of any lake.
+    //
+    // A digest is a pure function of immutable sealed data, so recomputing is always
+    // safe and always converges. The version check is what makes it happen exactly
+    // once per schema bump rather than every cycle forever.
+    if let Ok(res) = store.get(&digest_key).await {
+        if let Ok(bytes) = res.bytes().await {
+            let current = serde_json::from_slice::<SessionDigest>(&bytes)
+                .map(|d| d.schema_version >= DIGEST_SCHEMA_VERSION)
+                .unwrap_or(false);
+            if current {
+                return Ok(DigestOutcome::Skipped);
+            }
+        }
     }
 
     let envelopes = read_session_segments(store, sealed_marker).await?;
@@ -596,6 +622,26 @@ pub async fn run_for_session(
     Ok(DigestOutcome::Written(Box::new(digest)))
 }
 
+/// The `cwd` most of this session's events happened in.
+///
+/// "Most" rather than "first": a session that starts in a home directory and then works
+/// in a repo should be filed under the repo. Ties break toward the earliest, which is
+/// arbitrary but stable, so the same session always digests to the same value.
+fn dominant_cwd(sorted: &[&Envelope]) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for e in sorted {
+        if let Some(c) = e.cwd.as_deref() {
+            if !c.is_empty() {
+                *counts.entry(c).or_default() += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(c, _)| c.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,6 +659,78 @@ mod tests {
             ..Default::default()
         });
         e
+    }
+
+    #[tokio::test]
+    async fn a_digest_from_an_older_schema_is_recomputed_not_skipped() {
+        // Skipping on existence alone froze every digest at the schema it was first
+        // written with. 35 of them in a live lake had no repo, no branch and no
+        // commands because they predate transcript enrichment, and nothing would ever
+        // have revisited them.
+        use object_store::{memory::InMemory, ObjectStoreExt, PutPayload};
+        let store = InMemory::new();
+        let sealed = ctxlake_store::layout::session_sealed(
+            "2026-09-12",
+            "f",
+            Runtime::ClaudeCode,
+            "a",
+            "s1",
+        );
+        store
+            .put(&sealed, PutPayload::from_static(b"{}"))
+            .await
+            .unwrap();
+        let seg = ctxlake_store::layout::session_segment(
+            "2026-09-12",
+            "f",
+            Runtime::ClaudeCode,
+            "a",
+            "s1",
+            0,
+        );
+        let env = base("s1", 1, EventType::Prompt, Runtime::ClaudeCode);
+        store
+            .put(
+                &seg,
+                PutPayload::from(ctxlake_sync::codec::encode(&[env]).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let key = ctxlake_store::layout::session_digest(
+            "2026-09-12",
+            "f",
+            Runtime::ClaudeCode,
+            "a",
+            "s1",
+        );
+        let stale = serde_json::json!({
+            "schema_version": 1, "session_id": "s1", "fleet_id": "f", "agent_id": "a",
+            "runtime": "claude_code", "turn_count": 0, "files_touched": [],
+            "commands": [], "tests_run": [], "commits": [],
+            "usage": {"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,
+                      "cache_write_tokens":0,"cost_usd":0.0},
+            "outcome": "clean", "friction": []
+        });
+        store
+            .put(&key, PutPayload::from(serde_json::to_vec(&stale).unwrap()))
+            .await
+            .unwrap();
+
+        let out = run_for_session(&store, &sealed, &FrictionThresholds::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, DigestOutcome::Written(_)),
+            "an older schema must be recomputed, got {out:?}"
+        );
+
+        // And a current one is still skipped — the version check must not turn into
+        // recomputing everything on every cycle forever.
+        let again = run_for_session(&store, &sealed, &FrictionThresholds::default())
+            .await
+            .unwrap();
+        assert!(matches!(again, DigestOutcome::Skipped), "got {again:?}");
     }
 
     #[test]

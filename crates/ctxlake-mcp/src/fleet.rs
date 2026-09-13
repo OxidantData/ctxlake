@@ -73,11 +73,23 @@ fn sanitize_agent_list(entries: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-/// `fleet_history(repo?, since?, limit?)`. Reads `history.json` from the local
-/// cache — a mirror of recent sealed sessions and their outcomes nothing writes
-/// yet. `limit` defaults to [`DEFAULT_ROW_LIMIT`] and is clamped to
-/// [`MAX_ROW_LIMIT`] regardless of what the caller asks for — see that constant's
-/// docs for why a row cap matters as much as the per-field length bound.
+/// `fleet_history(repo?, since?, limit?)` — recent sealed sessions and their outcomes.
+///
+/// Reads the `sessions` table of the local snapshot mirror. It used to read a
+/// `history.json` from the same directory, and **nothing in the repository ever wrote
+/// that file** — every reference to it was a reader or a test. So this tool reported
+/// "no session history has been synced locally yet" on every machine forever, and the
+/// briefing's recent-sessions block, which calls straight into here, was permanently
+/// empty. Twenty-six digests sat in the lake reaching nobody.
+///
+/// Pointing it at the snapshot deletes the orphan rather than inventing a producer for
+/// it: the snapshot is already content-addressed, CAS-published and mirrored into this
+/// exact directory, and SQLite serves the `repo`/`since`/`limit` filtering better than
+/// a JSON array scanned in memory.
+///
+/// `limit` defaults to [`DEFAULT_ROW_LIMIT`] and is clamped to [`MAX_ROW_LIMIT`]
+/// regardless of what the caller asks for — see that constant's docs for why a row cap
+/// matters as much as the per-field length bound.
 pub fn history(
     cache_root: &Path,
     fleet_id: &str,
@@ -86,42 +98,70 @@ pub fn history(
     limit: usize,
 ) -> Value {
     let limit = limit.clamp(1, MAX_ROW_LIMIT);
-    let dir = fleet_cache_dir(cache_root, fleet_id);
-    let Ok(bytes) = std::fs::read(dir.join("history.json")) else {
+    let Some(conn) = crate::snapshot::open(cache_root, fleet_id) else {
         return json!({
             "enabled": false,
             "sessions": [],
-            "note": "no session history has been synced locally yet for this fleet.",
+            "note": "no snapshot has been synced locally yet for this fleet.",
         });
     };
-    let Ok(all) = serde_json::from_slice::<Vec<Value>>(&bytes) else {
+
+    // One extra row is asked for so `truncated` reports whether more exist without a
+    // second COUNT query.
+    let sql = "SELECT session_id, agent_id, runtime, repo, branch, started_at, ended_at,                duration_ms, turn_count, outcome, summary, files_json, friction_json                FROM sessions                WHERE (?1 IS NULL OR repo = ?1) AND (?2 IS NULL OR ended_at >= ?2)                ORDER BY ended_at DESC LIMIT ?3";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        // An older snapshot, published before the `sessions` table existed. Honest
+        // absence, not an error: the fleet simply has not published a new one yet.
         return json!({
             "enabled": false,
             "sessions": [],
-            "note": "the local history cache exists but could not be read as valid \
-                      session records.",
+            "note": "this fleet's snapshot predates session history; it will appear                      after the next `ctxlake maint` run.",
         });
     };
-    let matched: Vec<Value> = all
-        .into_iter()
-        .filter(|s| {
-            let matches_repo =
-                repo.is_none_or(|r| s.get("repo").and_then(Value::as_str) == Some(r));
-            let matches_since = since.is_none_or(|since_val| {
-                s.get("ended_at")
-                    .and_then(Value::as_str)
-                    .is_some_and(|at| at >= since_val)
-            });
-            matches_repo && matches_since
-        })
-        .collect();
-    let truncated = matched.len() > limit;
-    let sessions: Vec<Value> = matched
+    let rows = stmt.query_map(rusqlite::params![repo, since, (limit + 1) as i64], |row| {
+        Ok(json!({
+            "session_id":  row.get::<_, String>(0)?,
+            "agent_id":    row.get::<_, String>(1)?,
+            "runtime":     row.get::<_, String>(2)?,
+            "repo":        row.get::<_, Option<String>>(3)?,
+            "branch":      row.get::<_, Option<String>>(4)?,
+            "started_at":  row.get::<_, Option<String>>(5)?,
+            "ended_at":    row.get::<_, Option<String>>(6)?,
+            "duration_ms": row.get::<_, Option<i64>>(7)?,
+            "turn_count":  row.get::<_, i64>(8)?,
+            "outcome":     row.get::<_, String>(9)?,
+            "summary":     row.get::<_, String>(10)?,
+            "files":       parse_json_array(&row.get::<_, String>(11)?),
+            "friction":    parse_json_array(&row.get::<_, String>(12)?),
+        }))
+    });
+    let Ok(rows) = rows else {
+        return json!({ "enabled": true, "sessions": [], "truncated": false });
+    };
+    let all: Vec<Value> = rows.filter_map(Result::ok).collect();
+
+    let truncated = all.len() > limit;
+    let sessions: Vec<Value> = all
         .into_iter()
         .take(limit)
+        // Every field still goes through the same scrubber the JSON path used. These
+        // rows carry agent-authored command text and file paths — untrusted by
+        // AGENTS.md's house rules no matter which storage engine they arrived in.
         .map(|s| sanitize::clean_value(&s, sanitize::MAX_LONG_FIELD))
         .collect();
     json!({ "enabled": true, "sessions": sessions, "truncated": truncated })
+}
+
+/// A JSON array column, or an empty array when it cannot be read.
+///
+/// The column is written by `ctxlake_maint::snapshot` from a `Vec`, so a parse failure
+/// means a corrupt or future-schema snapshot — worth one empty field, not a failed tool
+/// call.
+fn parse_json_array(raw: &str) -> Value {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .filter(Value::is_array)
+        .unwrap_or_else(|| json!([]))
 }
 
 /// `fleet_handoff(summary, status, next?)`. Queues a handoff note to the local
@@ -248,14 +288,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fleet_dir = dir.path().join("oxidant");
         std::fs::create_dir_all(&fleet_dir).unwrap();
-        let sessions: Vec<Value> = (0..10)
-            .map(|i| json!({"repo": "ctxlake", "ended_at": "2026-09-09", "summary": format!("session {i}")}))
+        let sessions: Vec<_> = (0..10)
+            .map(|i| {
+                let id: &'static str = Box::leak(format!("sess-{i}").into_boxed_str());
+                let sum: &'static str = Box::leak(format!("session {i}").into_boxed_str());
+                crate::snapshot::test_support::FixtureSession::new(id, sum)
+            })
             .collect();
-        std::fs::write(
-            fleet_dir.join("history.json"),
-            serde_json::to_vec(&sessions).unwrap(),
-        )
-        .unwrap();
+        crate::snapshot::test_support::write_snapshot_with(
+            &fleet_dir.join("snapshot.bin"),
+            &[],
+            &sessions,
+        );
 
         let out = history(dir.path(), "oxidant", None, None, 3);
         assert_eq!(out["sessions"].as_array().unwrap().len(), 3);
@@ -271,14 +315,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fleet_dir = dir.path().join("oxidant");
         std::fs::create_dir_all(&fleet_dir).unwrap();
-        let sessions: Vec<Value> = (0..(MAX_ROW_LIMIT + 10))
-            .map(|i| json!({"repo": "ctxlake", "ended_at": "2026-09-09", "summary": format!("session {i}")}))
+        let sessions: Vec<_> = (0..(MAX_ROW_LIMIT + 10))
+            .map(|i| {
+                let id: &'static str = Box::leak(format!("sess-{i}").into_boxed_str());
+                crate::snapshot::test_support::FixtureSession::new(id, "x")
+            })
             .collect();
-        std::fs::write(
-            fleet_dir.join("history.json"),
-            serde_json::to_vec(&sessions).unwrap(),
-        )
-        .unwrap();
+        crate::snapshot::test_support::write_snapshot_with(
+            &fleet_dir.join("snapshot.bin"),
+            &[],
+            &sessions,
+        );
 
         // Ask for far more than the ceiling; the ceiling wins regardless.
         let out = history(dir.path(), "oxidant", None, None, MAX_ROW_LIMIT * 100);
@@ -288,23 +335,24 @@ mod tests {
 
     #[test]
     fn history_recursively_cleans_a_field_no_allowlist_named() {
-        // Regression for the fixed-allowlist bug: a field this crate never named
-        // (`note`, nested inside the session record) must still be cleaned.
+        // Regression for the fixed-allowlist bug: a field this crate never named must
+        // still be cleaned. The carrier moved from a JSON blob to a SQLite column, and
+        // the scrubber must still run over whatever comes back — these rows carry
+        // agent-authored command text and file paths.
         let dir = tempfile::tempdir().unwrap();
         let fleet_dir = dir.path().join("oxidant");
         std::fs::create_dir_all(&fleet_dir).unwrap();
-        std::fs::write(
-            fleet_dir.join("history.json"),
-            serde_json::to_vec(&json!([
-                {"repo": "ctxlake", "note": "hidden\u{200B}text"}
-            ]))
-            .unwrap(),
-        )
-        .unwrap();
+        let mut s = crate::snapshot::test_support::FixtureSession::new("sess-1", "x");
+        s.summary = "hidden\u{200B}text";
+        crate::snapshot::test_support::write_snapshot_with(
+            &fleet_dir.join("snapshot.bin"),
+            &[],
+            &[s],
+        );
         let out = history(dir.path(), "oxidant", None, None, DEFAULT_ROW_LIMIT);
-        let note = out["sessions"][0]["note"].as_str().unwrap();
-        assert!(!note.contains('\u{200B}'));
-        assert_eq!(note, "hiddentext");
+        let summary = out["sessions"][0]["summary"].as_str().unwrap();
+        assert!(!summary.contains('\u{200B}'));
+        assert_eq!(summary, "hiddentext");
     }
 
     #[test]

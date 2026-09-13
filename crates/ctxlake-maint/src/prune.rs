@@ -54,6 +54,7 @@ impl PruneReport {
 /// Prune what is safe to prune. `dry_run` reports without deleting.
 pub async fn run(
     store: &dyn ObjectStore,
+    fleet_id: &str,
     dry_run: bool,
 ) -> Result<PruneReport, ctxlake_store::StoreError> {
     let mut report = PruneReport::default();
@@ -62,7 +63,7 @@ pub async fn run(
     // treated as fatal if unreadable: pruning snapshots without knowing which one is
     // current could delete the live one, and "the pointer is unreadable" is not a
     // state in which to start guessing.
-    let current = current_snapshot_hash(store).await?;
+    let current = current_snapshot_hash(store, fleet_id).await?;
     // Unix seconds on both sides rather than naming `chrono`'s types. `object_store`
     // exposes `last_modified` as a `chrono::DateTime`, but this workspace uses `time`
     // everywhere else and adding a second date library as a declared dependency to
@@ -128,8 +129,9 @@ pub async fn run(
 /// The content hash `snapshot/latest.json` currently points at.
 async fn current_snapshot_hash(
     store: &dyn ObjectStore,
+    fleet_id: &str,
 ) -> Result<Option<String>, ctxlake_store::StoreError> {
-    match store.get(&layout::snapshot_latest()).await {
+    match store.get(&layout::snapshot_latest(fleet_id)).await {
         Ok(res) => {
             let bytes = res.bytes().await?;
             let v: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -174,9 +176,14 @@ mod tests {
         // The one object in `snapshot/` that a reader is guaranteed to want.
         let store = InMemory::new();
         put(&store, "snapshot/aaa.sqlite", "current").await;
-        put(&store, "snapshot/latest.json", r#"{"content_hash":"aaa"}"#).await;
+        put(
+            &store,
+            "snapshot/fleets/myteam/latest.json",
+            r#"{"content_hash":"aaa"}"#,
+        )
+        .await;
 
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert!(report.snapshots.is_empty(), "{report:?}");
         assert!(keys(&store).await.contains(&"snapshot/aaa.sqlite".into()));
     }
@@ -189,9 +196,14 @@ mod tests {
         let store = InMemory::new();
         put(&store, "snapshot/old.sqlite", "superseded").await;
         put(&store, "snapshot/new.sqlite", "current").await;
-        put(&store, "snapshot/latest.json", r#"{"content_hash":"new"}"#).await;
+        put(
+            &store,
+            "snapshot/fleets/myteam/latest.json",
+            r#"{"content_hash":"new"}"#,
+        )
+        .await;
 
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert!(report.snapshots.is_empty(), "{report:?}");
         assert_eq!(report.snapshots_within_grace, 1);
         assert!(keys(&store).await.contains(&"snapshot/old.sqlite".into()));
@@ -209,7 +221,7 @@ mod tests {
         put(&store, "live/fleets/myteam/agents/cc-01.json", "{}").await;
         put(&store, "live/fleets/myteam/roster.json", "{}").await;
 
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert_eq!(
             report.legacy_live,
             vec![
@@ -236,11 +248,11 @@ mod tests {
         put(&store, "live/agents/cc-01.json", "{}").await;
 
         let before = keys(&store).await;
-        let dry = run(&store, true).await.unwrap();
+        let dry = run(&store, "myteam", true).await.unwrap();
         assert_eq!(dry.legacy_live.len(), 2);
         assert_eq!(keys(&store).await, before, "a dry run must delete nothing");
 
-        let wet = run(&store, false).await.unwrap();
+        let wet = run(&store, "myteam", false).await.unwrap();
         assert_eq!(
             wet.legacy_live, dry.legacy_live,
             "the dry run must predict the real one exactly"
@@ -263,7 +275,7 @@ mod tests {
         for k in protected {
             put(&store, k, "{}").await;
         }
-        let report = run(&store, false).await.unwrap();
+        let report = run(&store, "myteam", false).await.unwrap();
         assert_eq!(report.total(), 0, "{report:?}");
         assert_eq!(keys(&store).await.len(), protected.len());
     }

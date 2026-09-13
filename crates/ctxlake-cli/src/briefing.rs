@@ -229,20 +229,27 @@ mod tests {
 
     #[test]
     fn recent_sessions_block_lists_synced_history() {
+        // Seeded into the snapshot, which is where session history actually lives now.
+        // This test used to write a `history.json` — a file nothing in the repository
+        // ever produced, so it passed while the real briefing was empty on every
+        // machine in the fleet.
+        use ctxlake_mcp::snapshot::test_support::{write_snapshot_with, FixtureSession};
+
         let dir = tempfile::tempdir().unwrap();
         let fleet_dir = dir.path().join("oxidant");
         std::fs::create_dir_all(&fleet_dir).unwrap();
-        std::fs::write(
-            fleet_dir.join("history.json"),
-            serde_json::to_vec(&json!([
-                {"repo": "ctxlake", "ended_at": "2026-09-10", "summary": "shipped wave 3"}
-            ]))
-            .unwrap(),
-        )
-        .unwrap();
+        write_snapshot_with(
+            &fleet_dir.join("snapshot.bin"),
+            &[],
+            &[FixtureSession::new(
+                "sess-1",
+                "`cargo test` failed 3x · touched src/lib.rs",
+            )],
+        );
+
         let out = render_briefing(dir.path(), "oxidant");
-        assert!(out.contains("## Recent sessions"));
-        assert!(out.contains("shipped wave 3"));
+        assert!(out.contains("## Recent sessions"), "got: {out}");
+        assert!(out.contains("`cargo test` failed 3x"), "got: {out}");
     }
 
     /// The property this whole task exists to preserve, restated at the

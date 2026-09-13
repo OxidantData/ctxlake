@@ -246,7 +246,7 @@ pub fn build_fenced_transcript(envelopes: &[Envelope]) -> String {
         out.push_str(&format!("session_id: {session_id}\n"));
     }
     for e in envelopes {
-        let id = e.message_id.as_deref().unwrap_or(&e.event_id);
+        let id = citable_id(e);
 
         if let Some(content) = &e.content {
             let cleaned = strip_injected_context(content);
@@ -1272,18 +1272,32 @@ pub struct ResolvedCitation {
 /// allowed to come from. See [`claim_from_raw`].
 pub type ResolvableIndex = HashMap<(String, String), ResolvedCitation>;
 
+/// The id an envelope is citable by — the single source of truth for both the prompt
+/// the model reads and the index its citations resolve against.
+///
+/// **This exists because those two computed it separately and disagreed.**
+/// [`build_fenced_transcript`] labelled a prose line (a prompt or assistant envelope,
+/// which carries no `message_id`) with its `event_id`, while
+/// [`build_resolvable_index`] indexed `message_id` only. So the model was shown an id,
+/// cited it correctly, and every such claim was discarded as unresolvable — silently,
+/// and structurally, for every claim whose evidence was something a human or the agent
+/// *said* rather than a tool call. Measured on a live fleet: 7 of 27 claims in a single
+/// pass. Any change to how an envelope is addressed belongs here, in one place, or the
+/// two halves drift apart again.
+pub fn citable_id(e: &Envelope) -> &str {
+    e.message_id.as_deref().unwrap_or(&e.event_id)
+}
+
 pub fn build_resolvable_index(envelopes: &[Envelope]) -> ResolvableIndex {
     let mut idx = HashMap::new();
     for e in envelopes {
-        if let Some(message_id) = &e.message_id {
-            idx.insert(
-                (e.session_id.clone(), message_id.clone()),
-                ResolvedCitation {
-                    excerpt_hash: e.content_hash.clone(),
-                    observed_at: e.emitted_at.clone(),
-                },
-            );
-        }
+        idx.insert(
+            (e.session_id.clone(), citable_id(e).to_string()),
+            ResolvedCitation {
+                excerpt_hash: e.content_hash.clone(),
+                observed_at: e.emitted_at.clone(),
+            },
+        );
     }
     idx
 }
@@ -1577,7 +1591,7 @@ pub async fn is_already_extracted(
 /// Not bumped for a provider swap or a model change — those are configuration, and
 /// re-extracting an entire lake because someone edited `ctxlake.toml` would be a
 /// surprising and expensive thing for a config edit to do.
-pub const EXTRACTOR_VERSION: u32 = 4;
+pub const EXTRACTOR_VERSION: u32 = 5;
 
 /// Find every sealed session under `sessions/` by locating `_SEALED` markers.
 /// Whether a given one has already been extracted is [`mark_extracted_if_new`]'s
@@ -1852,12 +1866,25 @@ pub async fn extract_session(
     // `find_existing_claim_id` exists for.
     let mut proposed = 0usize;
     let returned = raw_claims.len();
+    // Counted apart, because "the model named a type we do not have" and "the model
+    // cited something we cannot find" are different problems with different fixes, and
+    // a warning naming both as possibilities tells an operator nothing. Diagnosing the
+    // prose-citation defect took a source read precisely because this line could not
+    // say which had happened.
+    let mut dropped_bad_type = 0usize;
+    let mut dropped_unresolvable = 0usize;
     for raw in raw_claims {
+        if ClaimType::parse(&raw.claim_type).is_none() {
+            dropped_bad_type += 1;
+            continue;
+        }
         if let Some(claim) =
             claim_from_raw(raw, &session.agent_id, &observed_at, &resolvable, &existing)
         {
             crate::claims::append_proposed(store, date, &claim).await?;
             proposed += 1;
+        } else {
+            dropped_unresolvable += 1;
         }
     }
     if returned > proposed {
@@ -1865,8 +1892,9 @@ pub async fn extract_session(
             session_id = %session.session_id,
             returned,
             kept = proposed,
-            "extraction dropped claims: an unparseable claim_type, or a citation that \
-             resolves to no captured message"
+            dropped_bad_type,
+            dropped_unresolvable,
+            "extraction dropped claims"
         );
     }
     Ok(ExtractOutcome {
@@ -2146,6 +2174,59 @@ mod tests {
 
     fn no_existing_claims() -> BTreeMap<String, ClaimState> {
         BTreeMap::new()
+    }
+
+    /// **A claim citing a prose line was structurally undroppable-proof: it always
+    /// dropped.** `build_fenced_transcript` labels an envelope with no `message_id`
+    /// using its `event_id`, so that is the only id the model can cite for a prompt or
+    /// an assistant line — and `build_resolvable_index` indexed `message_id` only, so
+    /// the citation resolved against nothing and the claim was discarded in silence.
+    ///
+    /// This test reads the id back out of the real rendered transcript rather than
+    /// assuming what the model is shown. Assuming is what let the defect survive: every
+    /// other citation test hands `claim_from_raw` a message id the index was built
+    /// with, so the two halves agreed with each other and disagreed with the prompt.
+    #[test]
+    fn a_claim_citing_a_prose_line_resolves_against_the_id_the_model_was_shown() {
+        let mut prose = env_with("s1", "ignored", "staging listens on port 2222", 0);
+        prose.message_id = None; // a prompt/assistant line, as Claude Code produces
+        let envelopes = vec![prose.clone()];
+
+        // Whatever the prompt builder prints is what the model can cite. Take it from
+        // there, not from what this test would like it to be.
+        let rendered = build_fenced_transcript(&envelopes);
+        let cited_id = rendered
+            .lines()
+            .find_map(|l| l.strip_prefix('[')?.split_once("] "))
+            .map(|(id, _)| id.to_string())
+            .expect("the prose line is rendered with an id");
+        assert_eq!(
+            cited_id, prose.event_id,
+            "a prose envelope is shown under its event id"
+        );
+
+        let raw = RawClaim {
+            claim: "staging listens on port 2222".into(),
+            claim_type: "environment".into(),
+            subject: "staging".into(),
+            evidence: vec![RawCitation {
+                session_id: "s1".into(),
+                message_id: cited_id,
+            }],
+        };
+        let claim = claim_from_raw(
+            raw,
+            "cc-01",
+            "2026-09-09T00:00:00Z",
+            &build_resolvable_index(&envelopes),
+            &no_existing_claims(),
+        )
+        .expect("a claim citing the id it was shown must not be dropped");
+        assert_eq!(claim.evidence.len(), 1);
+        assert_eq!(
+            claim.evidence[0].excerpt_hash, prose.content_hash,
+            "the hash must come from the cited envelope, not be invented"
+        );
     }
 
     #[test]

@@ -1133,10 +1133,14 @@ fn known_claims_preamble(existing: &BTreeMap<String, ClaimState>) -> Option<Stri
     rows.truncate(MAX_KNOWN_CLAIMS_SHOWN);
 
     let mut out = String::from(
-        "ALREADY RECORDED — the fleet has these claims. If this transcript supports one \
-         of them, DO NOT restate it in your own words: either omit it, or repeat its \
-         text character for character so it is recognised as the same claim rather than \
-         filed as a near-duplicate. Only propose a claim that is not already here.\n",
+        "ALREADY RECORDED — the fleet has these claims.\n\
+         If this transcript supports one of them, REPEAT ITS TEXT CHARACTER FOR \
+         CHARACTER as a claim, citing this transcript's own evidence. Do NOT omit it, \
+         and do NOT reword it.\n\
+         Repeating it is how a second, independent observation is recorded: an exactly \
+         matching claim is merged into the existing one and strengthens it. Rewording \
+         creates a duplicate; omitting throws the corroboration away.\n\
+         Propose a new claim only for something not already listed here.\n",
     );
     for c in rows {
         let text = truncate_chars(&c.claim, MAX_KNOWN_CLAIM_CHARS);
@@ -1573,7 +1577,7 @@ pub async fn is_already_extracted(
 /// Not bumped for a provider swap or a model change — those are configuration, and
 /// re-extracting an entire lake because someone edited `ctxlake.toml` would be a
 /// surprising and expensive thing for a config edit to do.
-pub const EXTRACTOR_VERSION: u32 = 3;
+pub const EXTRACTOR_VERSION: u32 = 4;
 
 /// Find every sealed session under `sessions/` by locating `_SEALED` markers.
 /// Whether a given one has already been extracted is [`mark_extracted_if_new`]'s
@@ -2480,8 +2484,20 @@ mod tests {
             "{preamble}"
         );
         assert!(
-            preamble.contains("character for character"),
+            preamble.contains("CHARACTER FOR CHARACTER"),
             "must ask for exact reuse, or the model rewords and the merge never fires"
+        );
+        // The instruction must not offer omission. Given the choice, a live model took
+        // it — returning `{"claims": []}` and explaining the transcript "adds no new
+        // information" — which throws the second observation away entirely. A
+        // convention seen in ten sessions would still read "1 independent session".
+        assert!(
+            preamble.contains("Do NOT omit"),
+            "omitting a known claim discards the corroboration: {preamble}"
+        );
+        assert!(
+            preamble.contains("strengthens it"),
+            "the model needs to know why repeating is worth doing: {preamble}"
         );
         assert!(
             !preamble.contains("a candidate claim"),

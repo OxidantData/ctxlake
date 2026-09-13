@@ -688,6 +688,72 @@ def check_documented_commands_exist() -> None:
         fail(f"`ctxlake {cmd}` exists but the reference.md command table omits it")
 
 
+# ---------------------------------------------------------------------------
+# Everything docs/memory.md says Tier 0 produces must actually be produced.
+#
+# The page advertised seven things — "files touched, commands and exit codes,
+# tests, commits, duration, cost, friction signals" — and called the tier one that
+# "costs nothing and is never wrong". Measured on a live lake, it produced one of
+# them: duration. Not because the digest was wrong, but because the fields it reads
+# were never captured, and nothing anywhere compared the promise to the artifact.
+#
+# This asserts the digest STRUCT can carry each promised thing. It cannot prove a
+# given session populated them — only a live run does that — but it does catch the
+# failure that actually happened: a field quietly disappearing from the shape while
+# the prose kept advertising it.
+# ---------------------------------------------------------------------------
+
+TIER0_PROMISES = {
+    "files touched": "files_touched",
+    "commands": "commands",
+    "exit codes": "exit_code",
+    "tests": "tests_run",
+    "commits": "commits",
+    "duration": "duration_ms",
+    "cost": "cost_usd",
+    "friction": "friction",
+}
+
+
+def check_tier0_delivers_what_the_docs_advertise() -> None:
+    memory = norm(read("memory.md"))
+    digest_rs = (ROOT / "crates/ctxlake-maint/src/digest.rs").read_text(encoding="utf-8")
+
+    for phrase, field in TIER0_PROMISES.items():
+        advertised = phrase in memory
+        carried = f"pub {field}" in digest_rs or f"{field}:" in digest_rs
+        if advertised and not carried:
+            fail(
+                f"docs/memory.md advertises Tier 0 produces '{phrase}', but "
+                f"SessionDigest has no `{field}` to carry it. This is the exact shape "
+                f"of the bug where seven promises decayed to one."
+            )
+
+    # The other half of the same bug: the digest is only as good as what capture
+    # provides, and for Claude Code that now comes from the transcript reader.
+    enrich = ROOT / "crates/ctxlake-cli/src/import/claude_code.rs"
+    if not enrich.exists():
+        fail(
+            "crates/ctxlake-cli/src/import/claude_code.rs is gone — it is the only "
+            "source of tool results, exit status, usage and branch for Claude Code. "
+            "Without it every digest falls back to duration alone."
+        )
+        return
+    enrich_src = enrich.read_text(encoding="utf-8")
+    for needed in ("is_error", "bashEditDiff", "gitBranch", "usage"):
+        if needed not in enrich_src:
+            fail(
+                f"the transcript reader no longer looks for `{needed}`; the digest "
+                f"field it feeds will silently go empty again"
+            )
+
+    # And the fixture must be a captured one. A hand-written fixture is precisely how
+    # the `tool_result` bug survived review: fixture and code agreed with each other.
+    fixture = ROOT / "crates/ctxlake-cli/tests/fixtures/claude-code-transcript/sample.jsonl"
+    if not fixture.exists():
+        fail(f"{fixture.relative_to(ROOT)} is missing — the reader's only real-data test")
+
+
 def main() -> int:
     check_scaling_arithmetic()
     check_runtime_verification_honesty()
@@ -696,6 +762,7 @@ def main() -> int:
     check_no_real_identities()
     check_units_pin_the_environment_the_docs_promise()
     check_documented_commands_exist()
+    check_tier0_delivers_what_the_docs_advertise()
 
     if failures:
         print(f"FAIL — {len(failures)} regression check(s) failed:\n")

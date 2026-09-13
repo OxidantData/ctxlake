@@ -578,12 +578,20 @@ fn summarize(d: &crate::digest::SessionDigest) -> String {
         parts.push(describe_friction(f));
     }
     if !d.files_touched.is_empty() {
-        let shown: Vec<String> = d
-            .files_touched
-            .iter()
-            .take(3)
-            .map(|p| short_path(p))
-            .collect();
+        // Shortened first, then deduplicated: two different files can share their last
+        // two segments — `site/.vitepress/theme/index.ts` in two repos both become
+        // `theme/index.ts` — and printing the same name twice reads as a bug in the
+        // briefing rather than as two files. Seen in the first real run.
+        let mut shown: Vec<String> = Vec::new();
+        for f in &d.files_touched {
+            let short = short_path(f);
+            if !shown.contains(&short) {
+                shown.push(short);
+            }
+            if shown.len() == 3 {
+                break;
+            }
+        }
         let more = d.files_touched.len().saturating_sub(shown.len());
         parts.push(match more {
             0 => format!("touched {}", shown.join(", ")),
@@ -827,6 +835,51 @@ mod tests {
         std::fs::write(file.path(), bytes).unwrap();
         let conn = rusqlite::Connection::open(file.path()).unwrap();
         (file, conn)
+    }
+
+    #[test]
+    fn two_files_sharing_a_short_name_are_not_listed_twice() {
+        // From the first real run: "touched theme/index.ts, theme/index.ts,
+        // theme/oxidant.css" — two genuinely different files in two repos, which reads
+        // as a bug in the briefing rather than as two files.
+        use crate::digest::SessionDigest;
+        let d = SessionDigest {
+            schema_version: 1,
+            session_id: "s".into(),
+            fleet_id: "f".into(),
+            agent_id: "a".into(),
+            runtime: ctxlake_core::Runtime::ClaudeCode,
+            started_at: None,
+            ended_at: None,
+            duration_ms: None,
+            turn_count: 1,
+            files_touched: vec![
+                "/a/site/.vitepress/theme/index.ts".into(),
+                "/b/site/.vitepress/theme/index.ts".into(),
+                "/b/site/.vitepress/theme/oxidant.css".into(),
+                "/b/src/main.rs".into(),
+            ],
+            commands: vec![],
+            tests_run: vec![],
+            commits: vec![],
+            git_sha_before: None,
+            git_sha_after: None,
+            branch: None,
+            repo: None,
+            usage: Default::default(),
+            outcome: crate::digest::Outcome::Clean,
+            friction: vec![],
+        };
+        let got = summarize(&d);
+        assert_eq!(
+            got.matches("theme/index.ts").count(),
+            1,
+            "a shortened name must appear once: {got}"
+        );
+        assert!(
+            got.contains("src/main.rs"),
+            "dedup must not drop distinct files: {got}"
+        );
     }
 
     #[test]

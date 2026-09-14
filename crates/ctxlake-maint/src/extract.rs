@@ -1195,7 +1195,21 @@ fn known_claims_preamble(existing: &BTreeMap<String, ClaimState>) -> Option<Stri
 /// the length of a single real shell command, so "one `cargo test --workspace` and
 /// nothing else" is still extracted.
 fn transcript_is_empty(prompt: &str) -> bool {
-    substantive_chars(prompt) < MIN_SUBSTANTIVE_CHARS
+    // **The bar is one citable message, not a total.**
+    //
+    // This compared a *sum*, and a sum of scraps clears any threshold given enough
+    // scraps: six lines reading `ok` score 12 and looked exactly like one line stating
+    // something. A live session made of acknowledgements — `ok`, `yes`, `go ahead`,
+    // `thanks` — passed the guard, reached the model, and got back a plain-English
+    // "there is no transcript here", which is not JSON, so the session failed and was
+    // retried on every pass thereafter. One model call per cycle, forever, for a
+    // session that can never produce a claim.
+    //
+    // Every claim has to cite a message. If no single message carries enough to be
+    // worth citing, there is nothing here regardless of how many messages there are.
+    substantive_line_lengths(prompt)
+        .max()
+        .is_none_or(|longest| longest < MIN_SUBSTANTIVE_CHARS)
 }
 
 /// Below this much actual content, there is nothing for a claim to cite.
@@ -1214,14 +1228,18 @@ fn transcript_is_empty(prompt: &str) -> bool {
 ///
 /// The asymmetry favours attempting: a skipped session becomes eligible again on the
 /// next `EXTRACTOR_VERSION` bump, while a wasted model call is spent for good.
+///
+/// Applied to the longest line, not the total — six lines reading `ok` also sum to 12.
+/// See [`transcript_is_empty`].
 const MIN_SUBSTANTIVE_CHARS: usize = 12;
 
-/// Characters of real content in a rendered transcript.
+/// Characters of real content in each line of a rendered transcript.
 ///
 /// Structure does not count: the `session_id:` header, the `[id]` markers and a bare
 /// `tool:NAME` are scaffolding the renderer adds, and a page of them is still an empty
-/// session.
-fn substantive_chars(prompt: &str) -> usize {
+/// session. Per line rather than totalled, because the question
+/// [`transcript_is_empty`] asks is whether any *one* message is worth citing.
+fn substantive_line_lengths(prompt: &str) -> impl Iterator<Item = usize> + '_ {
     prompt
         .lines()
         .filter(|l| !l.trim_start().starts_with("session_id:"))
@@ -1236,7 +1254,6 @@ fn substantive_chars(prompt: &str) -> usize {
                 None => after_id.trim().len(),
             }
         })
-        .sum()
 }
 
 /// Pull the JSON object out of a response that may have been dressed up.
@@ -2014,6 +2031,10 @@ pub async fn run(
             Ok(t) => t,
             Err(e) => {
                 summary.sessions_failed += 1;
+                // Same reasoning as the extraction failure below: a load failure that
+                // reported nothing at all was the quieter half of the same problem.
+                summary.last_error =
+                    Some(format!("session {} (load): {}", session_ref.session_id, e));
                 tracing::warn!(session_id = %session_ref.session_id, error = %e,
                     "could not load a session for extraction; continuing");
                 continue;
@@ -2052,7 +2073,11 @@ pub async fn run(
             }
             Err(e) => {
                 summary.sessions_failed += 1;
-                summary.last_error = Some(e.to_string());
+                // Name the session. A failure retried on every pass, forever, with no
+                // way to identify which session it is, is a bill with no address: the
+                // operator sees "1 FAILED" each cycle and has nothing to go and look
+                // at. `ctxlake sessions <id>` takes exactly this.
+                summary.last_error = Some(format!("session {}: {}", session_ref.session_id, e));
                 tracing::warn!(session_id = %session_ref.session_id, error = %e,
                     "extraction failed for one session; continuing with the rest");
             }
@@ -3828,6 +3853,14 @@ mod tests {
         // Round 3: one prompt reading `ok`. This is why the check counts characters —
         // "is there any text" says yes, and there is still nothing to cite.
         assert!(transcript_is_empty("session_id: s1\n[01M2B] ok\n"));
+
+        // Round 4: a session made entirely of acknowledgements. Six `ok`s sum to 12 and
+        // cleared a threshold meant to reject one `ok`, so this reached the model, came
+        // back as plain English rather than JSON, and was then retried on every pass
+        // forever — one model call per cycle for a session that cannot produce a claim.
+        assert!(transcript_is_empty(
+            "session_id: s1\n[a] ok\n[b] yes\n[c] go\n[d] thanks\n[e] sure\n[f] ok\n"
+        ));
 
         // And what must still be attempted. `staging listens on port 2222` is
         // docs/memory.md's own example of a good environment claim and scores 28; an

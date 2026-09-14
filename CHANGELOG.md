@@ -1,5 +1,95 @@
 # Changelog
 
+## v0.1.11
+
+Four extraction defects, all found by running the v0.1.10 inspection commands against a
+live lake rather than by reading the code.
+
+> **Upgrading:** `ctxlake update`. Nothing to reconfigure, and **no re-extraction is
+> forced** — see the last section.
+
+### Claims citing anything the agent said were always dropped
+
+`build_fenced_transcript` labels an envelope with no `message_id` — a prompt or an
+assistant line — with its `event_id`, because that is the only id it has.
+`build_resolvable_index` indexed `message_id` only. So the model was shown an id, cited
+it correctly, and the claim was discarded as unresolvable.
+
+This fired for **every claim whose evidence was something said rather than a tool call**,
+which is where conventions and preferences live. Not random loss — it selectively
+discarded the reflective claims and kept the mechanical ones.
+
+Two functions computing the same value separately and disagreeing, so the fix is one
+`citable_id()` that both call. **Measured on the live lake: 7 drops in a pass became 0.**
+
+The test reads the id back out of the real rendered transcript instead of asserting what
+the model is probably shown. That distinction is the whole point: every other citation
+test hands `claim_from_raw` a message id the index was built with, so both halves agreed
+with each other and disagreed with the prompt — the same shape as the hand-written
+`tool_result` fixture that hid the v0.1.9 capture bug.
+
+### A session of acknowledgements is empty, however many there are
+
+The emptiness guard compared a sum, and a sum of scraps clears any threshold given enough
+scraps: six lines reading `ok` score 12, exactly the bar meant to reject one line reading
+`ok`. Such a session reached the model, came back as plain English rather than JSON,
+failed, and was retried on every pass thereafter — one model call per cycle, forever, for
+a session that cannot produce a claim.
+
+Every claim has to cite a message, so the question is whether any *one* message is worth
+citing. The guard now takes the longest line, not the total.
+
+### Corroboration was capped at "recent enough and short enough"
+
+Two ceilings sat in front of the known-claims preamble, and the second is a correctness
+bug rather than a limit:
+
+- Only the newest **60** known claims were shown. On a 135-claim fleet, **75 were
+  invisible**, so a session re-observing one of them had nothing to match against.
+- Every claim shown was cut at 240 characters, under an instruction to **REPEAT ITS TEXT
+  CHARACTER FOR CHARACTER**. That is not a weaker instruction, it is an impossible one —
+  the full text is not in the context. A model that complies produces text that no longer
+  matches, so `find_existing_claim_id` finds nothing and mints a fresh claim. **Truncation
+  manufactured exactly the duplicates the preamble exists to prevent.**
+
+The preamble is now bounded by bytes (64 KiB) rather than by a claim count, and an
+individual claim is shown whole or dropped. Those two rules go together: a size budget is
+only safe if nothing inside it gets cut.
+
+### Diagnostics that could actually be read
+
+Following the drop rate to its cause meant reading source, because `7 DROPPED` named no
+cause — and the `tracing::warn!` that would have named one goes nowhere: **nothing in
+this workspace installs a `tracing_subscriber`**, so all four tracing calls in extraction
+write to a subscriber that does not exist.
+
+So the counts ride on the line that actually prints, and a failure now names its session:
+
+```text
+tier 2: 4 session(s) extracted, 20 of 27 claim(s) kept
+        (7 DROPPED: 7 unresolvable citation, 0 bad claim_type)
+```
+
+An unknown `claim_type` and an unresolvable citation call for opposite fixes. A failure
+retried every pass with no way to tell which session it is, is a bill with no address —
+`ctxlake sessions <id>` now takes what the summary prints.
+
+### No forced re-extraction, on measurement
+
+All of the above change extraction, which is the textbook reason to bump
+`EXTRACTOR_VERSION` and have every host re-extract its history. That was measured rather
+than assumed: **two full 50-session re-extraction passes produced +2 claims each and zero
+new corroboration**, for the largest model spend of any pass so far.
+
+The reason is structural. Re-extracting a session re-reads a transcript whose claims are
+already on file, and the extractor is explicitly told to propose only what is not already
+recorded — so it correctly returns almost nothing. Corroboration needs a **different**
+session observing the same fact, which re-extraction cannot manufacture by construction.
+
+So the version stays put and these fixes earn their keep on sessions yet to be sealed.
+The measurement lives at the constant, because the next person to change extraction will
+face the same question and deserves the data rather than the intuition.
+
 ## v0.1.10
 
 Two halves of the same problem: the fleet was accumulating duplicate beliefs, and there
